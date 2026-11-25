@@ -1,0 +1,326 @@
+From 2d60b26eec938662d64df17dc2505e6961aeb47b Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:44:29 +0900
+Subject: [PATCH] velox: fix ReadBuffer and RingStream snapshot safety under
+ active prefetch (patch 0027)
+
+---
+ host/address_space/sub_allocator.cpp | 19 +++++--
+ host/read_buffer.cpp                 | 70 +++++++++++++++++++++-----
+ host/render_thread.cpp               | 24 ++++-----
+ host/ring_stream.cpp                 | 74 +++++++++++++++++-----------
+ host/ring_stream.h                   |  6 ++-
+ 5 files changed, 137 insertions(+), 56 deletions(-)
+
+diff --git a/host/address_space/sub_allocator.cpp b/host/address_space/sub_allocator.cpp
+index 36eb749..329fe30 100644
+--- a/host/address_space/sub_allocator.cpp
++++ b/host/address_space/sub_allocator.cpp
+@@ -86,9 +86,22 @@ public:
+         address_space_allocator_iter_func_t allocatorLoader =
+             [](void* context, struct address_space_allocator* allocator) {
+                 Stream* stream = reinterpret_cast<Stream*>(context);
+-                allocator->size = stream->getBe32();
+-                allocator->capacity = stream->getBe32();
+-                allocator->total_bytes = stream->getBe64();
++                int savedSize = static_cast<int>(stream->getBe32());
++                int savedCapacity = static_cast<int>(stream->getBe32());
++                uint64_t savedTotalBytes = stream->getBe64();
++                if (savedCapacity < savedSize) {
++                    savedCapacity = savedSize;
++                }
++                if (savedCapacity > allocator->capacity) {
++                    allocator->blocks = static_cast<struct address_block*>(
++                        address_space_realloc(
++                            allocator->blocks,
++                            sizeof(struct address_block) * static_cast<size_t>(savedCapacity)));
++                    address_space_assert(allocator->blocks != nullptr);
++                }
++                allocator->size = savedSize;
++                allocator->capacity = savedCapacity;
++                allocator->total_bytes = savedTotalBytes;
+             };
+         address_block_iter_func_t allocatorBlockLoader =
+             [](void* context, struct address_block* block) {
+diff --git a/host/read_buffer.cpp b/host/read_buffer.cpp
+index d6135ee..5cbdb26 100644
+--- a/host/read_buffer.cpp
++++ b/host/read_buffer.cpp
+@@ -126,28 +126,74 @@ void ReadBuffer::consume(size_t amount) {
+     m_readPtr += amount;
+ }
+ 
++namespace {
++// Upper bound for snapshot-serialized ReadBuffer capacity/data (1 GiB, matching RingStream).
++constexpr size_t kMaxSnapshotReadBufferBytes = 1024ull * 1024ull * 1024ull;
++}  // namespace
++
+ void ReadBuffer::onSave(gfxstream::Stream* stream) {
+-    stream->putBe32(m_size);
+-    stream->putBe32(m_validData);
+-    stream->write(m_readPtr, m_validData);
++    size_t saveValid = m_validData;
++    if (saveValid > 0 && m_readPtr == nullptr) {
++        GFXSTREAM_ERROR("ReadBuffer::onSave: null m_readPtr with m_validData=%zu\n", saveValid);
++        saveValid = 0;
++    }
++    // Velox VELOX_ASG_PREFETCH: getPrefetchedData() points m_readPtr into a prefetch chunk
++    // whose view length (m_validData) may exceed the initial malloc capacity (m_size, 128 KiB).
++    // Serialize a capacity at least as large as saveValid so onLoad() never drops unconsumed
++    // bytes or desynchronizes the snapshot stream.
++    size_t saveSize = std::max(m_size, saveValid);
++    if (saveValid > kMaxSnapshotReadBufferBytes) {
++        GFXSTREAM_ERROR("ReadBuffer::onSave: m_validData=%zu exceeds limit %zu\n",
++                        saveValid, kMaxSnapshotReadBufferBytes);
++        saveValid = 0;
++        saveSize = std::min(m_size, kMaxSnapshotReadBufferBytes);
++    } else if (saveSize > kMaxSnapshotReadBufferBytes) {
++        saveSize = kMaxSnapshotReadBufferBytes;
++    }
++    stream->putBe32(static_cast<uint32_t>(saveSize));
++    stream->putBe32(static_cast<uint32_t>(saveValid));
++    if (saveValid > 0) {
++        stream->write(m_readPtr, saveValid);
++    }
+ }
+ 
+ void ReadBuffer::onLoad(gfxstream::Stream* stream) {
+-    const auto size = stream->getBe32();
+-    if (size > m_size) {
+-        m_size = size;
++    const uint32_t savedSize = stream->getBe32();
++    const uint32_t savedValid = stream->getBe32();
++    if (savedSize > kMaxSnapshotReadBufferBytes || savedValid > savedSize) {
++        GFXSTREAM_ERROR("ReadBuffer::onLoad: invalid savedValid=%u savedSize=%u\n",
++                        savedValid, savedSize);
++        m_readPtr = m_buf;
++        m_validData = 0;
++        return;
++    }
++    if (savedSize > m_size) {
++        unsigned char* newBuf = static_cast<unsigned char*>(malloc(savedSize));
++        if (!newBuf) {
++            GFXSTREAM_ERROR("ReadBuffer::onLoad: failed to alloc %u bytes\n", savedSize);
++            m_readPtr = m_buf;
++            m_validData = 0;
++            return;
++        }
+         free(m_buf);
+-        m_buf = (unsigned char*)malloc(m_size);
++        m_buf = newBuf;
++        m_size = savedSize;
+     }
+     m_readPtr = m_buf;
+-    m_validData = stream->getBe32();
+-    if (m_buf == nullptr || m_validData > m_size) {
+-        GFXSTREAM_ERROR("ReadBuffer::onLoad: invalid m_validData=%zu m_size=%zu\n",
+-                        m_validData, m_size);
++    if (m_buf == nullptr) {
++        GFXSTREAM_ERROR("ReadBuffer::onLoad: null m_buf (m_size=%zu)\n", m_size);
+         m_validData = 0;
+         return;
+     }
+-    stream->read(m_readPtr, m_validData);
++    if (savedValid > 0) {
++        const ssize_t got = stream->read(m_readPtr, savedValid);
++        if (got < 0 || static_cast<size_t>(got) != savedValid) {
++            GFXSTREAM_ERROR("ReadBuffer::onLoad: short read %zd / %u bytes\n", got, savedValid);
++            m_validData = 0;
++            return;
++        }
++    }
++    m_validData = savedValid;
+ }
+ 
+ }  // namespace host
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index 15c38b8..bd62450 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -460,19 +460,21 @@ intptr_t RenderThread::main() {
+                 } else {
+                     break;
+                 }
+-            } else if (needRestoreFromSnapshot) {
+-                // If we're using RingStream that might load before FrameBuffer
+-                // restores the contexts from the handles, so check again here.
+-
+-                tInfo->postLoadRefreshCurrentContextSurfacePtrs();
+-                needRestoreFromSnapshot = false;
+-            }
+-            if (mNeedReloadProcessResources) {
+-                processResources = nullptr;
+-                tInfo->setProcessResources(nullptr);
+-                mNeedReloadProcessResources = false;
+             }
+         }
++        if (needRestoreFromSnapshot) {
++            // If we're using RingStream that might load before FrameBuffer
++            // restores the contexts from the handles, so check again here.
++            // Run unconditionally before decoding because ReadBuffer saved
++            // under prefetch may already hold a complete packet (packetSize <= validData).
++            tInfo->postLoadRefreshCurrentContextSurfacePtrs();
++            needRestoreFromSnapshot = false;
++        }
++        if (mNeedReloadProcessResources) {
++            processResources = nullptr;
++            tInfo->setProcessResources(nullptr);
++            mNeedReloadProcessResources = false;
++        }
+ 
+         //
+         // log received bandwidth statistics
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index b5ffb86..02b705d 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -599,6 +599,9 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+             // set on the serial path).
+             if (mReaderIsProducer) {
+                 mProducerPolling.store(true, std::memory_order_relaxed);
++                if (mInSnapshotOperation.load(std::memory_order_acquire)) {
++                    return nullptr;
++                }
+                 if (producerShouldYield()) {
+                     *inout_len = 0;
+                     return static_cast<const unsigned char*>(buf);
+@@ -622,6 +625,7 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+                 }
+             }
+             if (!mDuplex && inLargeXfer &&
++                !mInSnapshotOperation.load(std::memory_order_acquire) &&
+                 __atomic_load_n(&mContext.ring_config->transfer_size, __ATOMIC_ACQUIRE)) {
+                 if (spins < maxSpins) {
+                     ++spins;
+@@ -649,7 +653,7 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+                 const uint64_t step = std::min<uint32_t>(mHotStreak - 3, 8);
+                 budget = baseBudget + ((adaptCap - baseBudget) * step) / 8;
+             }
+-            if (budget && mLastDataNs) {
++            if (budget && mLastDataNs && !mInSnapshotOperation.load(std::memory_order_acquire)) {
+                 const uint64_t elapsed = monotonicNs() - mLastDataNs;
+                 if (elapsed < budget) {
+                     spunInThisRead = true;
+@@ -855,6 +859,7 @@ bool RingStream::producerShouldYield() const {
+ // AHEAD=3 a large view also keeps the stream hot for the hold time, and a small view opens the
+ // gate while it is hot.
+ void RingStream::consumerBusy(size_t viewSize) {
++    if (mInSnapshotOperation.load(std::memory_order_acquire)) return;
+     if (mPrefetchAhead == 3) {
+         const uint64_t now = monotonicNs();
+         if (viewSize >= mPrefetchMinView) {
+@@ -1261,7 +1266,8 @@ bool RingStream::receiveDirect(uint64_t pos, size_t minSize) {
+     // Release chunks behind |pos| so that receiving never waits on this thread itself.
+     consumerChunkFor(pos);
+     bool ok = true;
+-    while (mPublishedEnd.load(std::memory_order_acquire) - pos < minSize) {
++    while (mInSnapshotOperation.load(std::memory_order_acquire) ||
++           mPublishedEnd.load(std::memory_order_acquire) - pos < minSize) {
+         if (pumpPrefetch(false) < 0) {
+             ok = false;
+             break;
+@@ -1319,34 +1325,39 @@ const unsigned char* RingStream::acquirePrefetched(size_t unconsumed, size_t min
+     trace(kTraceAcquire, pos, static_cast<uint32_t>(std::min<size_t>(minSize, UINT32_MAX)));
+     for (;;) {
+         if (exitRequested() || mPrefetchStop.load(std::memory_order_acquire)) return nullptr;
+-        if (PrefetchChunk* chunk = consumerChunkFor(pos)) {
+-            const uint64_t published = chunk->published.load(std::memory_order_acquire);
+-            if (pos < chunk->start) {
+-                protocolError();
+-                return nullptr;
+-            }
+-            const uint64_t available = published > pos ? published - pos : 0;
+-            if (available >= minSize) {
+-                mConsViewEnd = published;
+-                *outLen = static_cast<size_t>(available);
+-                trace(kTraceView, published, static_cast<uint32_t>(std::min<uint64_t>(available, UINT32_MAX)));
+-                consumerBusy(*outLen);
+-                return chunk->data.get() + (pos - chunk->start);
+-            }
+-            if (chunk->sealed.load(std::memory_order_acquire) &&
+-                mPublishedEnd.load(std::memory_order_acquire) - pos >= minSize) {
+-                if (const unsigned char* joined = joinPrefetched(pos, minSize)) {
+-                    *outLen = minSize;
+-                    consumerBusy(minSize);
+-                    return joined;
++        if (!mInSnapshotOperation.load(std::memory_order_acquire)) {
++            if (PrefetchChunk* chunk = consumerChunkFor(pos)) {
++                const uint64_t published = chunk->published.load(std::memory_order_acquire);
++                if (pos < chunk->start) {
++                    protocolError();
++                    return nullptr;
+                 }
+-                protocolError();
+-                return nullptr;
++                const uint64_t available = published > pos ? published - pos : 0;
++                if (available >= minSize) {
++                    mConsViewEnd = published;
++                    *outLen = static_cast<size_t>(available);
++                    trace(kTraceView, published, static_cast<uint32_t>(std::min<uint64_t>(available, UINT32_MAX)));
++                    consumerBusy(*outLen);
++                    return chunk->data.get() + (pos - chunk->start);
++                }
++                const uint64_t totalPublished = mPublishedEnd.load(std::memory_order_acquire);
++                if (chunk->sealed.load(std::memory_order_acquire) &&
++                    totalPublished >= pos && totalPublished - pos >= minSize) {
++                    const size_t take = static_cast<size_t>(std::min<uint64_t>(
++                        totalPublished - pos, static_cast<uint64_t>(INT_MAX)));
++                    if (const unsigned char* joined = joinPrefetched(pos, take)) {
++                        *outLen = take;
++                        consumerBusy(take);
++                        return joined;
++                    }
++                    protocolError();
++                    return nullptr;
++                }
++                if (totalPublished >= pos && totalPublished - pos >= minSize) continue;
+             }
+-            if (mPublishedEnd.load(std::memory_order_acquire) - pos >= minSize) continue;
++            ++mPrefetchMisses;
++            if (waitForInflightPacket(pos, minSize)) continue;
+         }
+-        ++mPrefetchMisses;
+-        if (waitForInflightPacket(pos, minSize)) continue;
+         if (!receiveDirect(pos, minSize)) return nullptr;
+     }
+ }
+@@ -1396,8 +1407,15 @@ void RingStream::onSave(gfxstream::Stream* stream) {
+             reinterpret_cast<const unsigned char*>(mReadBuffer.data()) +
+             (mReadBuffer.size() - mReadBufferLeft);
+         pending.insert(pending.end(), left, left + mReadBufferLeft);
++        if (pending.size() > kMaxPrefetchPacket) {
++            GFXSTREAM_ERROR("RingStream::onSave: pending bytes %zu exceed limit %llu",
++                            pending.size(), static_cast<unsigned long long>(kMaxPrefetchPacket));
++            pending.clear();
++        }
+         stream->putBe32(static_cast<uint32_t>(pending.size()));
+-        stream->write(pending.data(), pending.size());
++        if (!pending.empty()) {
++            stream->write(pending.data(), pending.size());
++        }
+     } else {
+         stream->putBe32(mReadBufferLeft);
+         stream->write(mReadBuffer.data() + mReadBuffer.size() - mReadBufferLeft,
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index d1b520a..3e76b31 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -54,11 +54,13 @@ class RingStream final : public IOStream {
+     const unsigned char *readFully( void *buf, size_t len) override;
+ 
+     void pausePreSnapshot() {
+-        mInSnapshotOperation = true;
++        mInSnapshotOperation.store(true, std::memory_order_release);
++        if (mPrefetchWanted) wakePrefetchWaiters();
+     }
+ 
+     void resume() {
+-        mInSnapshotOperation = false;
++        mInSnapshotOperation.store(false, std::memory_order_release);
++        if (mPrefetchWanted) wakePrefetchWaiters();
+     }
+ 
+     void reloadRingConfig();
+-- 
+2.50.1.windows.1
+

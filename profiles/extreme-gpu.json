@@ -1,0 +1,82 @@
+{
+  "avd": {
+    "name": "velox-main",
+    "sysdir": null,
+    "home": null,
+    "api_level": 37,
+    "abi": "x86_64",
+    "tag": "google_apis"
+  },
+  "cpu": {
+    "cores": 20,
+    "affinity": "PE",
+    "priority": "high",
+    "disable_power_throttling": true,
+    "smp_override": false,
+    "thread_placement": {
+      "render": "PE",
+      "prefetch": "P"
+    }
+  },
+  "memory": {
+    "ram_mb": 16384,
+    "vm_heap_mb": 512,
+    "data_partition_gb": 32,
+    "guest_thp": "always_nodefrag"
+  },
+  "gpu": {
+    "mode": "host",
+    "features": [
+      "VulkanBatchedDescriptorSetUpdate"
+    ],
+    "disable_implicit_vk_layers": true,
+    "vulkan_1_4": false,
+    "gfxstream_features": [],
+    "transport": "asg",
+    "host_env": {
+      "VELOX_ASG_SPIN_US": "50",
+      "VELOX_ASG_ADAPTIVE_SPIN_US": "500",
+      "VELOX_RENDER_PRIORITY": "above_normal",
+      "VELOX_VK_FLUSH_NO_COPY": "1",
+      "VELOX_VK_CACHED_UPLOAD": "1",
+      "VELOX_ASG_PREFETCH": "1",
+      "VELOX_FENCE_SHARED": "1",
+      "VELOX_DRIVE_AIO": "native",
+      "VELOX_VIRTIO_BLK_QUEUES": "4",
+      "VELOX_HIGHRES_POLL": "1",
+      "VELOX_HIGHRES_POLL_SLACK_US": "500",
+      "VELOX_WHPX_PRERUN_FAST": "1",
+      "VELOX_WIN32_AIO_POOL": "1"
+    },
+    "guest_props": {
+      "debug.velox.cmd_stream_kb": "128",
+      "debug.velox.cmd_stream_first_kb": "2",
+      "debug.velox.fence_shared": "1",
+      "debug.velox.ray_tracing": "1",
+      "debug.velox.ray_tracing_pipeline": "1",
+      "debug.velox.cooperative_matrix": "1"
+    },
+    "host_validation": null
+  },
+  "display": {
+    "width": 1920,
+    "height": 1080,
+    "density": 240,
+    "refresh_hz": 120,
+    "frame_rate_mode": "performance",
+    "fps_limit": 120
+  },
+  "boot": {
+    "snapshot": false,
+    "window": true,
+    "audio": true,
+    "kernel_params": "clocksource=tsc"
+  },
+  "emulator": {
+    "dir": null
+  },
+  "extra_args": [
+    "-no-snapstorage",
+    "-no-metrics"
+  ]
+}

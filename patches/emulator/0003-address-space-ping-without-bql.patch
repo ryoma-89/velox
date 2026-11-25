@@ -1,0 +1,28 @@
+diff --git a/hw/pci/goldfish_address_space.c b/hw/pci/goldfish_address_space.c
+index 636fa891..10591ddd 100644
+--- a/hw/pci/goldfish_address_space.c
++++ b/hw/pci/goldfish_address_space.c
+@@ -874,6 +874,23 @@ static void address_space_control_write(void *opaque,
+         return;
+     }
+ 
++    /*
++     * Velox: a ping runs the device's work synchronously, e.g. a whole H.264 frame decode for
++     * the goldfish codec. Holding the BQL for it stalls every other vCPU's MMIO, including the
++     * goldfish pipe that carries GPU commands. The ping handlers do not need the BQL (they use
++     * the device mutex, their own locks and the lock-free gpa2hva), so drop it for the ping.
++     * The BQL is released before the device mutex is taken and retaken after it is released,
++     * so no thread waits for the BQL while holding the device mutex.
++     */
++    if (offset == ADDRESS_SPACE_REGISTER_PING && qemu_mutex_iothread_locked()) {
++        qemu_mutex_unlock_iothread();
++        qemu_mutex_lock(&state->mutex);
++        address_space_control_write_locked(state, offset, val, size);
++        qemu_mutex_unlock(&state->mutex);
++        qemu_mutex_lock_iothread();
++        return;
++    }
++
+     qemu_mutex_lock(&state->mutex);
+     address_space_control_write_locked(state, offset, val, size);
+     qemu_mutex_unlock(&state->mutex);

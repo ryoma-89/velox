@@ -1,0 +1,388 @@
+From 72bdc49703f53674ae5ceb063018b46bf27f6336 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:16:17 +0900
+Subject: [PATCH] velox: skip unnecessary DeviceOpTracker waitable and yield on
+ fence submit/reset (patch 0026)
+
+---
+ host/vulkan/device_op_tracker.cpp       |  62 ++++++++------
+ host/vulkan/device_op_tracker.h         |   3 +
+ host/vulkan/vk_decoder_global_state.cpp | 104 +++++++++++++++---------
+ host/vulkan/vulkan_boxed_handles.cpp    |   8 ++
+ host/vulkan/vulkan_boxed_handles.h      |   2 +
+ 5 files changed, 115 insertions(+), 64 deletions(-)
+
+diff --git a/host/vulkan/device_op_tracker.cpp b/host/vulkan/device_op_tracker.cpp
+index f0df1bf..2622a73 100644
+--- a/host/vulkan/device_op_tracker.cpp
++++ b/host/vulkan/device_op_tracker.cpp
+@@ -45,6 +45,8 @@ void DeviceOpTracker::AddPendingGarbage(DeviceOpWaitable waitable, VkFence fence
+         .obj = fence,
+         .timepoint = std::chrono::system_clock::now(),
+     });
++    mPendingGarbageCount.store(static_cast<uint32_t>(mPendingGarbage.size()),
++                               std::memory_order_release);
+ 
+     if (mPendingGarbage.size() > kSizeLoggingThreshold) {
+         GFXSTREAM_WARNING("VkDevice:%p has %d pending garbage objects.", mDevice,
+@@ -60,6 +62,8 @@ void DeviceOpTracker::AddPendingGarbage(DeviceOpWaitable waitable, VkSemaphore s
+         .obj = semaphore,
+         .timepoint = std::chrono::system_clock::now(),
+     });
++    mPendingGarbageCount.store(static_cast<uint32_t>(mPendingGarbage.size()),
++                               std::memory_order_release);
+ 
+     if (mPendingGarbage.size() > kSizeLoggingThreshold) {
+         GFXSTREAM_WARNING("VkDevice:%p has %d pending garbage objects.", mDevice,
+@@ -68,34 +72,38 @@ void DeviceOpTracker::AddPendingGarbage(DeviceOpWaitable waitable, VkSemaphore s
+ }
+ 
+ void DeviceOpTracker::PollAndProcessGarbage() {
+-    std::lock_guard<std::mutex> pollFunctionsLock(mPollFunctionsMutex);
+-    mPollFunctions.erase(std::remove_if(mPollFunctions.begin(), mPollFunctions.end(),
+-                                        [](const PollFunction& pollingFunc) {
+-                                            DeviceOpStatus status = pollingFunc.func();
+-                                            return status != DeviceOpStatus::kPending;
+-                                        }),
+-                         mPollFunctions.end());
+-
+-    if (mPollFunctions.size() > kSizeLoggingThreshold) {
+-        // Only report old-enough objects to avoid reporting lots of pending waitables
+-        // when many requests have been done in a small amount of time.
+-        const auto now = std::chrono::system_clock::now();
+-        const auto old = now - kSizeLoggingTimeThreshold;
+-        size_t numOldFuncs = std::count_if(
+-            mPollFunctions.begin(), mPollFunctions.end(), [old](const PollFunction& pollingFunc) {
+-                return (pollingFunc.timepoint < old);
+-            });
+-        if (numOldFuncs > kSizeLoggingThreshold) {
+-            GFXSTREAM_WARNING(
+-                "VkDevice:%p has %d pending waitables, %d taking more than %d milliseconds.",
+-                mDevice, mPollFunctions.size(), numOldFuncs,
+-                std::chrono::duration_cast<std::chrono::milliseconds>(kSizeLoggingTimeThreshold));
++    if (mPendingOps.load(std::memory_order_acquire) != 0) {
++        std::lock_guard<std::mutex> pollFunctionsLock(mPollFunctionsMutex);
++        mPollFunctions.erase(std::remove_if(mPollFunctions.begin(), mPollFunctions.end(),
++                                            [](const PollFunction& pollingFunc) {
++                                                DeviceOpStatus status = pollingFunc.func();
++                                                return status != DeviceOpStatus::kPending;
++                                            }),
++                             mPollFunctions.end());
++        mPendingOps.store(static_cast<uint32_t>(mPollFunctions.size()),
++                          std::memory_order_release);
++
++        if (mPollFunctions.size() > kSizeLoggingThreshold) {
++            // Only report old-enough objects to avoid reporting lots of pending waitables
++            // when many requests have been done in a small amount of time.
++            const auto now = std::chrono::system_clock::now();
++            const auto old = now - kSizeLoggingTimeThreshold;
++            size_t numOldFuncs = std::count_if(
++                mPollFunctions.begin(), mPollFunctions.end(), [old](const PollFunction& pollingFunc) {
++                    return (pollingFunc.timepoint < old);
++                });
++            if (numOldFuncs > kSizeLoggingThreshold) {
++                GFXSTREAM_WARNING(
++                    "VkDevice:%p has %d pending waitables, %d taking more than %d milliseconds.",
++                    mDevice, mPollFunctions.size(), numOldFuncs,
++                    std::chrono::duration_cast<std::chrono::milliseconds>(kSizeLoggingTimeThreshold));
++            }
+         }
+     }
+ 
+-    const auto now = std::chrono::system_clock::now();
+-    const auto old = now - kAutoDeleteTimeThreshold;
+-    {
++    if (mPendingGarbageCount.load(std::memory_order_acquire) != 0) {
++        const auto now = std::chrono::system_clock::now();
++        const auto old = now - kAutoDeleteTimeThreshold;
+         std::lock_guard<std::mutex> pendingGarbageLock(mPendingGarbageMutex);
+ 
+         // Assuming that pending garbage is added to the queue in the roughly the order
+@@ -139,6 +147,8 @@ void DeviceOpTracker::PollAndProcessGarbage() {
+         }
+ 
+         mPendingGarbage.erase(mPendingGarbage.begin(), firstPendingIt);
++        mPendingGarbageCount.store(static_cast<uint32_t>(mPendingGarbage.size()),
++                                   std::memory_order_release);
+ 
+         if (mPendingGarbage.size() > kSizeLoggingThreshold) {
+             GFXSTREAM_WARNING("VkDevice:%p has %d pending garbage objects.", mDevice,
+@@ -159,6 +169,7 @@ void DeviceOpTracker::OnDestroyDevice() {
+             GFXSTREAM_WARNING("VkDevice:%p has %d pending polling functions.", mDevice,
+                                 mPollFunctions.size());
+             mPollFunctions.clear();
++            mPendingOps.store(0, std::memory_order_release);
+         }
+     }
+ 
+@@ -177,6 +188,7 @@ void DeviceOpTracker::AddPendingDeviceOp(std::function<DeviceOpStatus()> pollFun
+         .func = std::move(pollFunction),
+         .timepoint = std::chrono::system_clock::now(),
+     });
++    mPendingOps.store(static_cast<uint32_t>(mPollFunctions.size()), std::memory_order_release);
+ }
+ 
+ DeviceOpBuilder::DeviceOpBuilder(DeviceOpTracker& tracker) : mTracker(tracker) {}
+diff --git a/host/vulkan/device_op_tracker.h b/host/vulkan/device_op_tracker.h
+index bebd0fe..9433b1d 100644
+--- a/host/vulkan/device_op_tracker.h
++++ b/host/vulkan/device_op_tracker.h
+@@ -16,6 +16,7 @@
+ 
+ #include <vulkan/vulkan.h>
+ 
++#include <atomic>
+ #include <chrono>
+ #include <deque>
+ #include <functional>
+@@ -80,6 +81,7 @@ class DeviceOpTracker {
+         OpPollingFunction func;
+         std::chrono::time_point<std::chrono::system_clock> timepoint;
+     };
++    std::atomic<uint32_t> mPendingOps{0};
+     std::mutex mPollFunctionsMutex;
+     std::deque<PollFunction> mPollFunctions GUARDED_BY(mPollFunctionsMutex);
+ 
+@@ -88,6 +90,7 @@ class DeviceOpTracker {
+         std::variant<VkFence, VkSemaphore> obj;
+         std::chrono::time_point<std::chrono::system_clock> timepoint;
+     };
++    std::atomic<uint32_t> mPendingGarbageCount{0};
+     std::mutex mPendingGarbageMutex;
+     std::deque<PendingGarbage> mPendingGarbage GUARDED_BY(mPendingGarbageMutex);
+ };
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 40c7aa5..55db363 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -4762,7 +4762,9 @@ class VkDecoderGlobalState::Impl {
+                                }),
+                 pendingUses.end());
+ 
+-            std::this_thread::yield();
++            if (!pendingUses.empty()) {
++                std::this_thread::yield();
++            }
+         }
+ 
+         if (!cleanedFences.empty()) {
+@@ -8598,13 +8600,30 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
++        bool hasAnySemaphore = false;
++        for (uint32_t i = 0; i < submitCount; ++i) {
++            if (getWaitSemaphoreCount(pSubmits[i]) > 0 ||
++                getSignalSemaphoreCount(pSubmits[i]) > 0) {
++                hasAnySemaphore = true;
++                break;
++            }
++        }
++
++        // Only allocate a DeviceOpTracker promise/future/poll closure when an internal fence
++        // needs deferred destruction (fence == VK_NULL_HANDLE) or semaphores need latestUse
++        // lifetime tracking. When an application fence is provided with no semaphores, nothing
++        // outside DeviceOpTracker consumes the waitable.
++        const bool needDeviceOpTracker = (fence == VK_NULL_HANDLE) || hasAnySemaphore;
+         VkFence usedFence = fence;
+-        DeviceOpBuilder builder(*deviceOpTracker);
+-        if (VK_NULL_HANDLE == usedFence) {
+-            // Note: This fence will be managed by the DeviceOpTracker after the
+-            // OnQueueSubmittedWithFence call, so it does not need to be destroyed in the scope
+-            // of this queueSubmit
+-            usedFence = builder.CreateFenceForOp();
++        std::optional<DeviceOpBuilder> builder;
++        if (needDeviceOpTracker) {
++            builder.emplace(*deviceOpTracker);
++            if (VK_NULL_HANDLE == usedFence) {
++                // Note: This fence will be managed by the DeviceOpTracker after the
++                // OnQueueSubmittedWithFence call, so it does not need to be destroyed in the scope
++                // of this queueSubmit
++                usedFence = builder->CreateFenceForOp();
++            }
+         }
+ 
+         // Dispatch only if it's safe
+@@ -8617,7 +8636,7 @@ class VkDecoderGlobalState::Impl {
+                 if (result != VK_SUCCESS) {
+                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
+                                     result);
+-                    builder.OnQueueSubmissionAborted(usedFence);
++                    if (builder) builder->OnQueueSubmissionAborted(usedFence);
+                     return result;
+                 }
+             } else {
+@@ -8655,32 +8674,34 @@ class VkDecoderGlobalState::Impl {
+                 if (result != VK_SUCCESS) {
+                     GFXSTREAM_WARNING("dispatchVkQueueSubmit failed: %s [%d]", string_VkResult(result),
+                                     result);
+-                    builder.OnQueueSubmissionAborted(usedFence);
++                    if (builder) builder->OnQueueSubmissionAborted(usedFence);
+                     return result;
+                 }
+             }
+         }
+ 
+-        DeviceOpWaitable queueCompletedWaitable = builder.OnQueueSubmittedWithFence(usedFence);
++        std::optional<DeviceOpWaitable> queueCompletedWaitable;
++        if (builder) {
++            queueCompletedWaitable = builder->OnQueueSubmittedWithFence(usedFence);
++        }
+ 
+         {
+             std::lock_guard<std::mutex> lock(mMutex);
++            auto* fenceInfo =
++                (fence != VK_NULL_HANDLE) ? gfxstream::base::find(mFenceInfo, fence) : nullptr;
+             // Velox: watch the application's fence and publish its native completion into the
+             // submitting context's table (VELOX_FENCE_SHARED=1).
+-            if (fence != VK_NULL_HANDLE && tVeloxCurrentFenceTable) {
+-                auto* fenceInfo = gfxstream::base::find(mFenceInfo, fence);
+-                if (fenceInfo && !fenceInfo->external && fenceInfo->vk &&
+-                    fenceInfo->vk->vkWaitForFences && fenceInfo->vk->vkGetFenceStatus) {
+-                    fenceInfo->veloxTable = tVeloxCurrentFenceTable;
+-                    auto& watcher = mVeloxFenceWatchers[device];
+-                    if (!watcher) {
+-                        watcher = std::make_shared<VeloxFenceWatcher>(
+-                            device, fenceInfo->vk->vkWaitForFences,
+-                            fenceInfo->vk->vkGetFenceStatus, veloxFenceWatchDelay());
+-                    }
+-                    watcher->add({fence, reinterpret_cast<uint64_t>(fenceInfo->boxed),
+-                                  fenceInfo->veloxEpoch, fenceInfo->veloxTable});
+-                }
++            if (fenceInfo && tVeloxCurrentFenceTable && !fenceInfo->external && fenceInfo->vk &&
++                fenceInfo->vk->vkWaitForFences && fenceInfo->vk->vkGetFenceStatus) {
++                fenceInfo->veloxTable = tVeloxCurrentFenceTable;
++                auto& watcher = mVeloxFenceWatchers[device];
++                if (!watcher) {
++                    watcher = std::make_shared<VeloxFenceWatcher>(
++                        device, fenceInfo->vk->vkWaitForFences,
++                        fenceInfo->vk->vkGetFenceStatus, veloxFenceWatchDelay());
++                }
++                watcher->add({fence, reinterpret_cast<uint64_t>(fenceInfo->boxed),
++                              fenceInfo->veloxEpoch, fenceInfo->veloxTable});
+             }
+             // Update image layouts
+             for (uint32_t i = 0; i < submitCount; i++) {
+@@ -8688,7 +8709,7 @@ class VkDecoderGlobalState::Impl {
+                     VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
+                     CommandBufferInfo* cmdBufferInfo =
+                         gfxstream::base::find(mCommandBufferInfo, cmdBuffer);
+-                    if (!cmdBufferInfo) {
++                    if (!cmdBufferInfo || cmdBufferInfo->imageLayouts.empty()) {
+                         continue;
+                     }
+                     for (const auto& ite : cmdBufferInfo->imageLayouts) {
+@@ -8703,19 +8724,21 @@ class VkDecoderGlobalState::Impl {
+             // Update latestUse for all wait/signal semaphores, to ensure that they
+             // are never asynchronously destroyed before the queue submissions referencing
+             // them have completed
+-            for (uint32_t i = 0; i < submitCount; i++) {
+-                for (uint32_t j = 0; j < getWaitSemaphoreCount(pSubmits[i]); j++) {
+-                    SemaphoreInfo* semaphoreInfo =
+-                        gfxstream::base::find(mSemaphoreInfo, getWaitSemaphore(pSubmits[i], j));
+-                    if (semaphoreInfo) {
+-                        semaphoreInfo->latestUse = queueCompletedWaitable;
++            if (hasAnySemaphore && queueCompletedWaitable) {
++                for (uint32_t i = 0; i < submitCount; i++) {
++                    for (uint32_t j = 0; j < getWaitSemaphoreCount(pSubmits[i]); j++) {
++                        SemaphoreInfo* semaphoreInfo =
++                            gfxstream::base::find(mSemaphoreInfo, getWaitSemaphore(pSubmits[i], j));
++                        if (semaphoreInfo) {
++                            semaphoreInfo->latestUse = *queueCompletedWaitable;
++                        }
+                     }
+-                }
+-                for (uint32_t j = 0; j < getSignalSemaphoreCount(pSubmits[i]); j++) {
+-                    SemaphoreInfo* semaphoreInfo =
+-                        gfxstream::base::find(mSemaphoreInfo, getSignalSemaphore(pSubmits[i], j));
+-                    if (semaphoreInfo) {
+-                        semaphoreInfo->latestUse = queueCompletedWaitable;
++                    for (uint32_t j = 0; j < getSignalSemaphoreCount(pSubmits[i]); j++) {
++                        SemaphoreInfo* semaphoreInfo =
++                            gfxstream::base::find(mSemaphoreInfo, getSignalSemaphore(pSubmits[i], j));
++                        if (semaphoreInfo) {
++                            semaphoreInfo->latestUse = *queueCompletedWaitable;
++                        }
+                     }
+                 }
+             }
+@@ -8723,7 +8746,6 @@ class VkDecoderGlobalState::Impl {
+             // After vkQueueSubmit is called, we can signal the conditional variable
+             // in FenceInfo, so that other threads (e.g. SyncThread) can call
+             // waitForFence() on this fence.
+-            auto* fenceInfo = gfxstream::base::find(mFenceInfo, fence);
+             if (fenceInfo) {
+                 {
+                     std::unique_lock<std::mutex> fenceLock(fenceInfo->mutex);
+@@ -8733,7 +8755,11 @@ class VkDecoderGlobalState::Impl {
+                 // Also update the latestUse waitable for this fence, to ensure
+                 // it is not asynchronously destroyed before all the waitables
+                 // referencing it
+-                fenceInfo->latestUse = queueCompletedWaitable;
++                if (queueCompletedWaitable) {
++                    fenceInfo->latestUse = *queueCompletedWaitable;
++                } else {
++                    fenceInfo->latestUse.reset();
++                }
+             }
+         }
+ 
+diff --git a/host/vulkan/vulkan_boxed_handles.cpp b/host/vulkan/vulkan_boxed_handles.cpp
+index e71b335..db893c4 100644
+--- a/host/vulkan/vulkan_boxed_handles.cpp
++++ b/host/vulkan/vulkan_boxed_handles.cpp
+@@ -34,6 +34,8 @@ void BoxedHandleManager::replayHandles(std::vector<BoxedHandle> handles) {
+ void BoxedHandleManager::clear() {
+     std::lock_guard<std::mutex> lock(mMutex);
+     mReverseMap.clear();
++    mDelayedRemoves.clear();
++    mDelayedRemoveCount.store(0, std::memory_order_release);
+     mStore.clear();
+ }
+ 
+@@ -140,9 +142,13 @@ void BoxedHandleManager::removeDelayed(uint64_t h, VkDevice device,
+                                        std::function<void()> callback) {
+     std::lock_guard<std::mutex> lock(mMutex);
+     mDelayedRemoves[device].push_back({h, callback});
++    mDelayedRemoveCount.fetch_add(1, std::memory_order_release);
+ }
+ 
+ void BoxedHandleManager::processDelayedRemoves(VkDevice device) {
++    if (mDelayedRemoveCount.load(std::memory_order_acquire) == 0) {
++        return;
++    }
+     std::vector<DelayedRemove> deviceDelayedRemoves;
+ 
+     {
+@@ -153,6 +159,8 @@ void BoxedHandleManager::processDelayedRemoves(VkDevice device) {
+ 
+         deviceDelayedRemoves = std::move(it->second);
+         mDelayedRemoves.erase(it);
++        mDelayedRemoveCount.fetch_sub(static_cast<uint32_t>(deviceDelayedRemoves.size()),
++                                      std::memory_order_release);
+     }
+ 
+     for (const auto& r : deviceDelayedRemoves) {
+diff --git a/host/vulkan/vulkan_boxed_handles.h b/host/vulkan/vulkan_boxed_handles.h
+index 27cafd7..3c62758 100644
+--- a/host/vulkan/vulkan_boxed_handles.h
++++ b/host/vulkan/vulkan_boxed_handles.h
+@@ -14,6 +14,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <deque>
+ #include <memory>
+ #include <mutex>
+@@ -115,6 +116,7 @@ class BoxedHandleManager {
+         BoxedHandle handle;
+         std::function<void()> callback;
+     };
++    std::atomic<uint32_t> mDelayedRemoveCount{0};
+     std::unordered_map<VkDevice, std::vector<DelayedRemove>> mDelayedRemoves GUARDED_BY(mMutex);
+ 
+     // If true, `add()` will use and consume the handles in `mHandleReplayQueue`.
+-- 
+2.50.1.windows.1
+

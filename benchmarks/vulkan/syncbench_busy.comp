@@ -1,0 +1,20 @@
+#version 450
+// syncbench: 指定した回数だけ整数演算を繰り返し、GPU を一定時間占有する（Fence のポーリング試験用）。
+layout(local_size_x = 64) in;
+
+layout(push_constant, std430) uniform Params {
+    uint iterations;
+    uint seed;
+} params;
+
+layout(set = 0, binding = 0, std430) buffer Output {
+    uint words[];
+} outbuf;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x ^ params.seed;
+    for (uint i = 0u; i < params.iterations; ++i) {
+        x = x * 1664525u + 1013904223u;
+    }
+    outbuf.words[gl_GlobalInvocationID.x] = x;
+}

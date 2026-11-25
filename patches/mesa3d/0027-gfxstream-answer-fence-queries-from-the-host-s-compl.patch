@@ -1,0 +1,262 @@
+From 6b9603057493c5154432678c15bd457c6a981409 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:07:47 +0900
+Subject: [PATCH] gfxstream: answer fence queries from the host's completion
+ table
+
+Velox-local change (biblioklept). With debug.velox.fence_shared=1 the
+driver reads the fence completion table the Velox host keeps in the ASG
+ring page (host gfxstream patch 0021). vkGetFenceStatus and
+vkWaitForFences return VK_SUCCESS without a round trip only when the slot
+holds this fence's host handle and the reset epoch the guest expects (the
+number of vkResetFences it issued, counted before the reset is sent).
+Torn slots, foreign handles, missing tables, external (sync fd) fences and
+devices with maintenance5 (device loss must reach fence calls) use the
+RPC as before. The table pointer is looked up once per thread.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I8e038e84f35fb1ab25a247bc340fa4d70ad35317
+---
+ .../include/AddressSpaceStream.h              |  5 ++
+ .../include/gfxstream/guest/IOStream.h        |  2 +
+ .../guest/vulkan/gfxstream_vk_device.cpp      |  4 +
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 87 +++++++++++++++++++
+ .../guest/vulkan_enc/ResourceTracker.h        | 11 +++
+ 5 files changed, 109 insertions(+)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+index a86653f..0478cf1 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
++++ b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+@@ -29,6 +29,11 @@ class AddressSpaceStream : public IOStream {
+     virtual int writeFully(const void* buf, size_t len);
+     virtual int writeFullyAsync(const void* buf, size_t len);
+     virtual const unsigned char* commitBufferAndReadFully(size_t size, void* buf, size_t len);
++    // Velox: offset 2560 of the from_host_large_xfer ring page (host gfxstream
++    // velox_fence_shared.h). The header's magic tells whether the host publishes there.
++    virtual const void* veloxFenceTable() {
++        return reinterpret_cast<const char*>(m_context.from_host_large_xfer.ring) + 2560;
++    }
+ 
+     void setMapping(VirtGpuResourceMappingPtr mapping) { m_mapping = mapping; }
+ 
+diff --git a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+index a3e0b73..54a14d6 100644
+--- a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
++++ b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+@@ -36,6 +36,8 @@ class IOStream {
+ 
+     virtual int connect(const char* /*serviceName*/ = nullptr) { return 0; }
+     virtual uint64_t processPipeInit() { return 0; }
++    // Velox: host-written fence completion table of this stream (ASG only), or null.
++    virtual const void* veloxFenceTable() { return nullptr; }
+ 
+     virtual void* allocBuffer(size_t minSize) = 0;
+     virtual int commitBuffer(size_t size) = 0;
+diff --git a/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp b/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
+index 7bca8fb..d93f8ee 100644
+--- a/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
++++ b/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
+@@ -107,6 +107,10 @@ static VkResult SetupInstanceForProcess(void) {
+     gfxstream::vk::ResourceTracker::get()->setThreadingCallbacks({
+         .hostConnectionGetFunc = getConnectionManager,
+         .vkEncoderGetFunc = getVulkanEncoder,
++        .veloxFenceTableGetFunc = [](GfxStreamConnectionManager* m) -> const void* {
++            auto* stream = m ? m->getStream() : nullptr;
++            return stream ? stream->veloxFenceTable() : nullptr;
++        },
+     });
+     gfxstream::vk::ResourceTracker::get()->setSeqnoPtr(&gSeqno);
+     gfxstream::vk::VkEncoder* vkEnc = getVulkanEncoder(mgr);
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index b9820c0..13a2adf 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1401,6 +1401,8 @@ void ResourceTracker::setDeviceInfo(VkDevice device, VkPhysicalDevice physdev,
+     auto* features14 = vk_find_struct_const(pNext, PHYSICAL_DEVICE_VULKAN_1_4_FEATURES);
+     info.canCacheFenceCompletion = mFenceCompletionCache &&
+         !(features5 && features5->maintenance5) && !(features14 && features14->maintenance5);
++    info.veloxFenceShared = mVeloxFenceShared &&
++        !(features5 && features5->maintenance5) && !(features14 && features14->maintenance5);
+ 
+     const VkBaseInStructure* extensionCreateInfo =
+         reinterpret_cast<const VkBaseInStructure*>(pNext);
+@@ -1615,6 +1617,10 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+             const long kb = strtol(streamValue, nullptr, 10);
+             mCommandStreamBytes = kb >= 16 && kb <= 65536 ? static_cast<size_t>(kb) * 1024 : 0;
+         }
++        char fenceSharedValue[PROP_VALUE_MAX] = {};
++        mVeloxFenceShared =
++            __system_property_get("debug.velox.fence_shared", fenceSharedValue) > 0 &&
++            !strcmp(fenceSharedValue, "1");
+         char firstValue[PROP_VALUE_MAX] = {};
+         if (mCommandStreamBytes &&
+             __system_property_get("debug.velox.cmd_stream_first_kb", firstValue) > 0) {
+@@ -5053,6 +5059,14 @@ VkResult ResourceTracker::on_vkCreateFence(void* context, VkResult input_result,
+ 
+     if (input_result != VK_SUCCESS) return input_result;
+ 
++    if (mVeloxFenceShared) {
++        std::lock_guard<std::recursive_mutex> lock(mLock);
++        auto deviceInfo = info_VkDevice.find(device);
++        auto fenceInfo = info_VkFence.find(*pFence);
++        if (deviceInfo != info_VkDevice.end() && fenceInfo != info_VkFence.end()) {
++            fenceInfo->second.veloxShared = deviceInfo->second.veloxFenceShared && !exportFenceInfoPtr;
++        }
++    }
+     if (mFenceCompletionCache) {
+         std::lock_guard<std::recursive_mutex> lock(mLock);
+         auto deviceInfo = info_VkDevice.find(device);
+@@ -5091,6 +5105,14 @@ VkResult ResourceTracker::on_vkResetFences(void* context, VkResult, VkDevice dev
+                                            uint32_t fenceCount, const VkFence* pFences) {
+     VkEncoder* enc = (VkEncoder*)context;
+     if (mFenceStats) mStatResetFencesRpc.fetch_add(1, std::memory_order_relaxed);
++    if (mVeloxFenceShared) {
++        // From here on a completion published for an older epoch no longer counts.
++        std::lock_guard<std::recursive_mutex> lock(mLock);
++        for (uint32_t i = 0; i < fenceCount; ++i) {
++            auto it = info_VkFence.find(pFences[i]);
++            if (it != info_VkFence.end()) ++it->second.veloxEpoch;
++        }
++    }
+     VkResult res = enc->vkResetFences(device, fenceCount, pFences, true /* do lock */);
+ 
+     if (res != VK_SUCCESS) return res;
+@@ -5255,6 +5277,50 @@ VkResult ResourceTracker::on_vkGetFenceFdKHR(void* context, VkResult, VkDevice d
+ #endif
+ }
+ 
++// Velox: true when the host's fence table (host gfxstream velox_fence_shared.h) holds a native
++// completion of |fence| for reset epoch |epoch|. The table is written only by the host; a torn
++// or foreign entry reads as "not known" and the caller asks the host.
++bool ResourceTracker::veloxFenceCompleted(VkFence fence, uint32_t epoch) {
++    struct Header {
++        uint32_t magic, version, slots, reserved[13];
++    };
++    struct Slot {
++        uint32_t seq, epoch;
++        uint64_t handle;
++    };
++    // The stream of a thread does not change while the thread lives, so the table pointer is
++    // looked up once per thread (the connection lookup is not free on every query).
++    static thread_local bool looked = false;
++    static thread_local const void* cachedTable = nullptr;
++    if (!looked) {
++        looked = true;
++        if (threadingCallbacks.veloxFenceTableGetFunc && threadingCallbacks.hostConnectionGetFunc) {
++            cachedTable =
++                threadingCallbacks.veloxFenceTableGetFunc(threadingCallbacks.hostConnectionGetFunc());
++        }
++    }
++    if (!cachedTable) return false;
++    const auto* header = static_cast<const Header*>(cachedTable);
++    if (__atomic_load_n(&header->magic, __ATOMIC_ACQUIRE) != 0x54465856u ||
++        __atomic_load_n(&header->version, __ATOMIC_RELAXED) != 1u ||
++        __atomic_load_n(&header->slots, __ATOMIC_RELAXED) != 64u) {
++        return false;
++    }
++    const uint64_t handle = gfxstream_vk_fence_to_host_u64(fence);
++    const uint32_t index =
++        static_cast<uint32_t>((handle * 0x9E3779B97F4A7C15ull) >> 58) & 63u;
++    const auto* slot = reinterpret_cast<const Slot*>(header + 1) + index;
++    const uint32_t s1 = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
++    if (s1 & 1u) return false;
++    const uint64_t h = __atomic_load_n(&slot->handle, __ATOMIC_RELAXED);
++    const uint32_t e = __atomic_load_n(&slot->epoch, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++    const uint32_t s2 = __atomic_load_n(&slot->seq, __ATOMIC_RELAXED);
++    const bool completed = s1 == s2 && h == handle && handle != 0 && e == epoch;
++    (completed ? mVeloxFenceHits : mVeloxFenceMisses).fetch_add(1, std::memory_order_relaxed);
++    return completed;
++}
++
+ VkResult ResourceTracker::on_vkGetFenceStatus(void* context, VkResult input_result, VkDevice device,
+                                               VkFence fence) {
+     VkEncoder* enc = (VkEncoder*)context;
+@@ -5279,6 +5345,9 @@ VkResult ResourceTracker::on_vkGetFenceStatus(void* context, VkResult input_resu
+             if (mFenceStats) mStatFenceStatusLocalReady.fetch_add(1, std::memory_order_relaxed);
+             return VK_SUCCESS;
+         }
++        if (info.veloxShared && veloxFenceCompleted(fence, info.veloxEpoch)) {
++            return VK_SUCCESS;
++        }
+     }
+ #endif
+ 
+@@ -5300,6 +5369,24 @@ VkResult ResourceTracker::on_vkWaitForFences(void* context, VkResult, VkDevice d
+                                              VkBool32 waitAll, uint64_t timeout) {
+ #if defined(VK_USE_PLATFORM_ANDROID_KHR) || DETECT_OS_LINUX
+     if (mFenceStats) mStatWaitForFencesCalls.fetch_add(1, std::memory_order_relaxed);
++    if (mVeloxFenceShared && fenceCount > 0) {
++        // Only completions the host observed natively for the fence's current epoch count;
++        // anything else goes to the host as before.
++        uint32_t completed = 0;
++        std::lock_guard<std::recursive_mutex> lock(mLock);
++        for (uint32_t i = 0; i < fenceCount; ++i) {
++            auto it = info_VkFence.find(pFences[i]);
++            if (it == info_VkFence.end()) continue;
++            const auto& info = it->second;
++            if (!info.syncFd && info.veloxShared &&
++                veloxFenceCompleted(pFences[i], info.veloxEpoch)) {
++                ++completed;
++            } else if (waitAll) {
++                break;
++            }
++        }
++        if (waitAll ? completed == fenceCount : completed != 0) return VK_SUCCESS;
++    }
+     if (mFenceCompletionCache && fenceCount > 0) {
+         uint32_t confirmed = 0;
+         std::lock_guard<std::recursive_mutex> lock(mLock);
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index d17448e..003115b 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -129,11 +129,13 @@ class ResourceTracker {
+ 
+     using HostConnectionGetFunc = GfxStreamConnectionManager* (*)();
+     using VkEncoderGetFunc = VkEncoder* (*)(GfxStreamConnectionManager*);
++    using VeloxFenceTableGetFunc = const void* (*)(GfxStreamConnectionManager*);
+     using CleanupCallback = std::function<void()>;
+ 
+     struct ThreadingCallbacks {
+         HostConnectionGetFunc hostConnectionGetFunc = nullptr;
+         VkEncoderGetFunc vkEncoderGetFunc = nullptr;
++        VeloxFenceTableGetFunc veloxFenceTableGetFunc = nullptr;
+     };
+ 
+     static uint32_t streamFeatureBits;
+@@ -740,6 +742,7 @@ class ResourceTracker {
+ 
+     struct VkDevice_Info {
+         bool canCacheFenceCompletion = false;
++        bool veloxFenceShared = false;
+         VkPhysicalDevice physdev;
+         VkPhysicalDeviceProperties props;
+         VkPhysicalDeviceMemoryProperties memProps;
+@@ -860,6 +863,10 @@ class ResourceTracker {
+ #endif
+         bool canCacheCompletion = false;
+         bool signaledConfirmed = false;
++        // Velox: host fence table (debug.velox.fence_shared). veloxEpoch counts the
++        // vkResetFences issued for this fence; a published completion counts only for it.
++        bool veloxShared = false;
++        uint32_t veloxEpoch = 0;
+     };
+ 
+     struct VkDescriptorPool_Info {
+@@ -937,6 +944,10 @@ class ResourceTracker {
+     // Several queues can submit command buffers referencing the same descriptor set.
+     std::mutex mDescriptorCommitLock;
+     bool mFenceCompletionCache = false;
++    bool mVeloxFenceShared = false;  // debug.velox.fence_shared
++    bool veloxFenceCompleted(VkFence fence, uint32_t epoch);
++    std::atomic<uint64_t> mVeloxFenceHits{0};
++    std::atomic<uint64_t> mVeloxFenceMisses{0};
+     // Diagnostics (debug.velox.fence_stats=1): per-process counts logged every 10 s.
+     bool mFenceStats = false;
+     std::atomic<uint64_t> mStatFenceStatusCalls{0}, mStatFenceStatusRpc{0},
+-- 
+2.50.1.windows.1
+

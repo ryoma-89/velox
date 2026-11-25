@@ -1,0 +1,108 @@
+From 0a460f8bbd5f1edba561447d5999ee397213f5b9 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 10:39:25 +0900
+Subject: [PATCH] gfxstream: optionally keep polling an ASG ring for a bounded
+ time
+
+The idle counter of RingStream::readRaw is never reset, so after warm-up a
+consumer publishes NEED_NOTIFY after about 30 pause instructions (1-3 us) and
+every following guest command needs an address space ping (a VM exit) and a
+host thread wake-up. VELOX_ASG_SPIN_US keeps the consumer polling for that
+long after the last command bytes (at most 1000 us; 0 or unset keeps the
+upstream behaviour). The budget is time based, so an idle context still
+sleeps; the NEED_NOTIFY publication and re-check are unchanged.
+
+Measured on WHPX (vk-upload, 2 boots x 15 intervals): semaphore query RPC
+15.6/17.3 us -> 9.06/8.97 us with 50 us.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Generated-by: LLM
+Change-Id: Ie6999098eb3f7ab9996725fceb64dc882ffb666f
+---
+ host/ring_stream.cpp | 35 +++++++++++++++++++++++++++++++++++
+ host/ring_stream.h   |  2 ++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index da7693c..6c91ecb 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -15,6 +15,8 @@
+ #include "ring_stream.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
+ #include <assert.h>
+ #include <memory.h>
+ 
+@@ -25,6 +27,32 @@
+ #include "render-utils/dma_device.h"
+ #include "render-utils/stream.h"
+ 
++namespace {
++
++// Velox: how long a consumer keeps polling after the last command before it publishes
++// NEED_NOTIFY and sleeps (VELOX_ASG_SPIN_US, 0 = upstream behaviour, at most 1000 us).
++// While it polls, a guest command needs no ping (no VM exit, no host thread wake-up).
++// The poll is bounded by time, so an idle context sleeps after the budget.
++uint64_t asgSpinBudgetNs() {
++    static const uint64_t budget = [] {
++        const char* value = std::getenv("VELOX_ASG_SPIN_US");
++        if (!value || !*value) return uint64_t{0};
++        char* end = nullptr;
++        const unsigned long us = std::strtoul(value, &end, 10);
++        if (end == value || *end) return uint64_t{0};
++        return uint64_t{std::min<unsigned long>(us, 1000)} * 1000;
++    }();
++    return budget;
++}
++
++uint64_t monotonicNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++}  // namespace
++
+ namespace gfxstream {
+ namespace {
+ 
+@@ -297,6 +325,12 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+ 
+             if (exitRequested()) return nullptr;
+ 
++            if (const uint64_t budget = asgSpinBudgetNs();
++                budget && monotonicNs() - mLastDataNs < budget) {
++                ring_buffer_yield();
++                continue;
++            }
++
+             if (mShouldExitForSnapshot && mInSnapshotOperation) {
+                 return nullptr;
+             }
+@@ -357,6 +391,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+     *inout_len = count;
+     ++mXmits;
+     mTotalRecv += count;
++    if (asgSpinBudgetNs()) mLastDataNs = monotonicNs();
+ 
+     if (exitRequested()) return nullptr;
+     __atomic_store_n(mContext.host_state, ASG_HOST_STATE_RENDERING, __ATOMIC_RELEASE);
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index 91d816b..fc6fb85 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -86,6 +86,8 @@ class RingStream final : public IOStream {
+     // before going to sleep.
+     static const uint32_t kMaxUnavailableReads = 8;
+     uint32_t mUnavailableReadCount = 0;
++    // Velox: when the last command bytes were returned (see asgSpinBudgetNs()).
++    uint64_t mLastDataNs = 0;
+ 
+     size_t mXmits = 0;
+     size_t mTotalRecv = 0;
+-- 
+2.50.1.windows.1
+

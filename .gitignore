@@ -1,0 +1,66 @@
+# Local runtime state, build artifacts, and external AOSP checkouts
+.velox/
+third_party/
+build/
+dist/
+out/
+
+# Python caches and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Android SDK, system images, AVDs, disk images, snapshots, and APKs
+*.apk
+*.aab
+*.qcow2
+*.img
+*.raw
+*.vmdk
+*.vhdx
+*.avd/
+snapshots/
+system-images/
+
+# Binaries, native libraries, objects, icons, and crash dumps
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.res
+*.dmp
+*.mdmp
+*.hprof
+*.spv
+launcher/velox.ico
+
+# Keys, credentials, and environment files
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+adbkey
+adbkey.pub
+.env
+.env.*
+*credentials*.json
+
+# Logs and OS/editor temporary files
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db

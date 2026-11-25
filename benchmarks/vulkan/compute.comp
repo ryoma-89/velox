@@ -1,0 +1,32 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Input {
+    uint words[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Output {
+    uint words[];
+};
+
+layout(push_constant, std430) uniform Params {
+    Input src;
+    Output dst;
+    uint seed;
+} params;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    uint state = params.src.words[index] ^ params.seed;
+    float value = float(state & 1023u);
+    for (int step = 0; step < 32; ++step) {
+        state = state * 1664525u + 1013904223u;
+        value += float(state >> 29u);
+        if (value >= 1024.0) {
+            value -= 1024.0;
+        }
+    }
+    params.dst.words[index] = state ^ uint(value);
+}

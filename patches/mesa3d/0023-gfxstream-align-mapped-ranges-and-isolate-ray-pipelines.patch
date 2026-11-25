@@ -1,0 +1,160 @@
+From 9541bb5fffc19c2e311d5b8c135d2812bd72465e Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:51:50 +0900
+Subject: [PATCH] gfxstream: align mapped ranges and isolate ray tracing
+ pipelines
+
+Change-Id: If515b64d8c9ee4d43120e999f22b0e5eb55abc5d
+---
+ .../codegen/scripts/cereal/transform.py       | 19 ++++++----
+ .../HostVisibleMemoryVirtualization.cpp       |  3 +-
+ .../HostVisibleMemoryVirtualization.h         |  2 ++
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 35 +++++++++++++++++--
+ .../guest/vulkan_enc/ResourceTracker.h        |  1 +
+ .../goldfish_vk_transform_guest.cpp           |  4 +--
+ 6 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/src/gfxstream/codegen/scripts/cereal/transform.py b/src/gfxstream/codegen/scripts/cereal/transform.py
+index 0dc4e58..2ab2e55 100644
+--- a/src/gfxstream/codegen/scripts/cereal/transform.py
++++ b/src/gfxstream/codegen/scripts/cereal/transform.py
+@@ -294,13 +294,18 @@ class VulkanTransform(VulkanWrapperGenerator):
+                     for p in api.parameters:
+                         cgen.stmt("(void)%s" % p.paramName)
+ 
+-                    genTransformsForVulkanType(
+-                        self.resourceTrackerVarName,
+-                        structInfo,
+-                        transformer.exprAccessor,
+-                        transformer.lenAccessor,
+-                        cgen,
+-                        variant=variant)
++                    if (self.resourceTrackerTypeName == "ResourceTracker" and
++                            variant == "tohost" and name == "VkMappedMemoryRange"):
++                        cgen.stmt("%s->mappedMemoryRangeTransform_tohost(%s)" %
++                                  (self.resourceTrackerVarName, self.toTransformVar))
++                    else:
++                        genTransformsForVulkanType(
++                            self.resourceTrackerVarName,
++                            structInfo,
++                            transformer.exprAccessor,
++                            transformer.lenAccessor,
++                            cgen,
++                            variant=variant)
+ 
+                     for member in structInfo.members:
+                         iterateVulkanType(
+diff --git a/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp b/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp
+index c5c87e7..e168b6a 100644
+--- a/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp
++++ b/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.cpp
+@@ -40,8 +40,7 @@ CoherentMemory::~CoherentMemory() {
+ VkDeviceMemory CoherentMemory::getDeviceMemory() const { return mMemory; }
+ 
+ bool CoherentMemory::subAllocate(uint64_t size, uint8_t** ptr, uint64_t& offset) {
+-    // 2^12 = 4096 (page size)
+-    auto block = u_mmAllocMem(mHeap, size, 12, 0);
++    auto block = u_mmAllocMem(mHeap, size, kSuballocationAlignmentBits, 0);
+     if (!block) return false;
+ 
+     offset = block->ofs;
+diff --git a/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.h b/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.h
+index 7066bcd..d579a56 100644
+--- a/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.h
++++ b/src/gfxstream/guest/vulkan_enc/HostVisibleMemoryVirtualization.h
+@@ -27,6 +27,7 @@ using GoldfishAddressSpaceBlockPtr = std::shared_ptr<GoldfishAddressSpaceBlock>;
+ 
+ class CoherentMemory {
+    public:
++    static constexpr unsigned kSuballocationAlignmentBits = 12;
+     CoherentMemory(VirtGpuResourceMappingPtr blobMapping, uint64_t size, VkDevice device,
+                    VkDeviceMemory memory);
+ 
+@@ -38,6 +39,7 @@ class CoherentMemory {
+     ~CoherentMemory();
+ 
+     VkDeviceMemory getDeviceMemory() const;
++    uint64_t getSize() const { return mSize; }
+ 
+     bool subAllocate(uint64_t size, uint8_t** ptr, uint64_t& offset);
+     bool release(uint64_t offset);
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 8cb53c5..6cf70eb 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1732,6 +1732,33 @@ void ResourceTracker::deviceMemoryTransform_tohost(VkDeviceMemory* memory, uint3
+     }
+ }
+ 
++void ResourceTracker::mappedMemoryRangeTransform_tohost(VkMappedMemoryRange* range) {
++    std::lock_guard<std::recursive_mutex> lock(mLock);
++    const auto memory = info_VkDeviceMemory.find(range->memory);
++    if (memory == info_VkDeviceMemory.end() || !memory->second.coherentMemory) return;
++
++    const auto& info = memory->second;
++    const auto& block = info.coherentMemory;
++    const VkDeviceSize offset = range->offset;
++    range->memory = block->getDeviceMemory();
++    range->offset += info.coherentMemoryOffset;
++    if (offset >= info.allocationSize) return;
++    const VkDeviceSize tail = info.allocationSize - offset;
++    if (range->size == VK_WHOLE_SIZE) range->size = tail;
++    if (range->size != tail || !usingDirectMapping()) return;
++
++    // The end of a guest allocation can be in the middle of a native non-coherent atom.
++    // Only extend into padding owned by this allocation, never the next suballocation.
++    const auto device = info_VkDevice.find(info.device);
++    if (device == info_VkDevice.end()) return;
++    const VkDeviceSize atom = device->second.props.limits.nonCoherentAtomSize;
++    if (!atom || atom > (VkDeviceSize{1} << CoherentMemory::kSuballocationAlignmentBits) ||
++        range->offset % atom || range->offset > block->getSize() ||
++        tail > block->getSize() - range->offset) return;
++    const VkDeviceSize padding = (atom - tail % atom) % atom;
++    if (padding <= block->getSize() - range->offset - tail) range->size += padding;
++}
++
+ uint32_t ResourceTracker::getColorBufferMemoryIndex(void* context, VkDevice device) {
+     // Create test image to get the memory requirements
+     VkEncoder* enc = (VkEncoder*)context;
+@@ -2023,8 +2050,12 @@ VkResult ResourceTracker::on_vkEnumerateDeviceExtensionProperties(
+             filteredExts.push_back(mHostDeviceExtensions[deferred]);
+             filteredExts.push_back(mHostDeviceExtensions[as]);
+             if (rayQuery != -1) filteredExts.push_back(mHostDeviceExtensions[rayQuery]);
+-            int pipeline = getHostDeviceExtensionIndex(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+-            if (pipeline != -1) filteredExts.push_back(mHostDeviceExtensions[pipeline]);
++            char rayTracingPipeline[PROP_VALUE_MAX];
++            if (__system_property_get("debug.velox.ray_tracing_pipeline", rayTracingPipeline) == 1 &&
++                rayTracingPipeline[0] == '1') {
++                int pipeline = getHostDeviceExtensionIndex(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
++                if (pipeline != -1) filteredExts.push_back(mHostDeviceExtensions[pipeline]);
++            }
+         }
+     }
+     char maintenance5[PROP_VALUE_MAX];
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index 8ec0dfe..add51bb 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -579,6 +579,7 @@ class ResourceTracker {
+     static ALWAYS_INLINE_GFXSTREAM uint32_t getSeqno();
+ 
+     // Transforms
++    void mappedMemoryRangeTransform_tohost(VkMappedMemoryRange* range);
+     void deviceMemoryTransform_tohost(VkDeviceMemory* memory, uint32_t memoryCount,
+                                       VkDeviceSize* offset, uint32_t offsetCount,
+                                       VkDeviceSize* size, uint32_t sizeCount, uint32_t* typeIndex,
+diff --git a/src/gfxstream/guest/vulkan_enc/autogenerated/goldfish_vk_transform_guest.cpp b/src/gfxstream/guest/vulkan_enc/autogenerated/goldfish_vk_transform_guest.cpp
+index 3a768d5..f616510 100644
+--- a/src/gfxstream/guest/vulkan_enc/autogenerated/goldfish_vk_transform_guest.cpp
++++ b/src/gfxstream/guest/vulkan_enc/autogenerated/goldfish_vk_transform_guest.cpp
+@@ -457,9 +457,7 @@ void transform_tohost_VkMappedMemoryRange(ResourceTracker* resourceTracker,
+                                           VkMappedMemoryRange* toTransform) {
+     (void)resourceTracker;
+     (void)toTransform;
+-    resourceTracker->deviceMemoryTransform_tohost(
+-        (VkDeviceMemory*)&toTransform->memory, 1, (VkDeviceSize*)&toTransform->offset, 1,
+-        (VkDeviceSize*)&toTransform->size, 1, (uint32_t*)nullptr, 0, (uint32_t*)nullptr, 0);
++    resourceTracker->mappedMemoryRangeTransform_tohost(toTransform);
+     if (toTransform->pNext) {
+         transform_tohost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
+     }

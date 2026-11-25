@@ -1,0 +1,142 @@
+﻿diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index fbbca471..adcffae7 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -43,6 +43,50 @@
+ #include <sys/prctl.h>
+ #endif
+ 
++#if defined(_WIN32) && !defined(CONFIG_PPOLL)
++#include <windows.h>
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++static int velox_highres_poll_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *v = getenv("VELOX_HIGHRES_POLL");
++        enabled = (v && v[0] == '1') ? 1 : 0;
++    }
++    return enabled;
++}
++
++static int64_t velox_highres_poll_slack_ns(void)
++{
++    static int64_t slack_ns = -1;
++    if (slack_ns < 0) {
++        const char *v = getenv("VELOX_HIGHRES_POLL_SLACK_US");
++        if (v && *v) {
++            long us = strtol(v, NULL, 10);
++            if (us < 0) us = 0;
++            if (us > 1000) us = 1000;
++            slack_ns = (int64_t)us * 1000LL;
++        } else {
++            slack_ns = 0;
++        }
++    }
++    return slack_ns;
++}
++
++static int64_t velox_qpc_freq(void)
++{
++    static int64_t freq = 0;
++    if (!freq) {
++        LARGE_INTEGER f;
++        QueryPerformanceFrequency(&f);
++        freq = f.QuadPart > 0 ? f.QuadPart : 10000000LL;
++    }
++    return freq;
++}
++#endif
++
+ /***********************************************************/
+ /* timers */
+ 
+@@ -336,6 +380,86 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
+     }
+ #else
++#ifdef _WIN32
++    if (timeout > 0 && timeout < 60LL * 1000000000LL &&
++        nfds < MAXIMUM_WAIT_OBJECTS - 1 && velox_highres_poll_enabled()) {
++        static __declspec(thread) HANDLE tl_timer = NULL;
++        static __declspec(thread) int tl_timer_init = 0;
++        if (!tl_timer_init) {
++            tl_timer_init = 1;
++            tl_timer = CreateWaitableTimerExW(
++                NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++            if (velox_highres_poll_slack_ns() > 0) {
++                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++            }
++        }
++        if (tl_timer) {
++            const int64_t slack_ns = velox_highres_poll_slack_ns();
++            const bool use_landing = (slack_ns > 0 && timeout <= 25LL * 1000000LL);
++            LARGE_INTEGER qpc_start = {0};
++            int64_t deadline_qpc = 0;
++            int64_t wait_ns = timeout;
++            if (use_landing) {
++                QueryPerformanceCounter(&qpc_start);
++                const int64_t freq = velox_qpc_freq();
++                deadline_qpc = qpc_start.QuadPart +
++                    (int64_t)(((double)timeout * (double)freq) / 1e9);
++                wait_ns = timeout > slack_ns ? (timeout - slack_ns) : 0;
++            }
++
++            int ret = 0;
++            if (wait_ns > 0) {
++                int64_t ticks = (wait_ns + 99) / 100;
++                if (ticks < 1) {
++                    ticks = 1;
++                }
++                LARGE_INTEGER due;
++                due.QuadPart = -ticks;
++                if (!SetWaitableTimer(tl_timer, &due, 0, NULL, NULL, FALSE)) {
++                    return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
++                }
++                GPollFD local_fds[MAXIMUM_WAIT_OBJECTS];
++                if (nfds > 0) {
++                    memcpy(local_fds, fds, nfds * sizeof(GPollFD));
++                }
++                local_fds[nfds].fd = (gintptr)tl_timer;
++                local_fds[nfds].events = G_IO_IN;
++                local_fds[nfds].revents = 0;
++                ret = g_poll(local_fds, nfds + 1, -1);
++                CancelWaitableTimer(tl_timer);
++                if (nfds > 0) {
++                    memcpy(fds, local_fds, nfds * sizeof(GPollFD));
++                }
++                if (ret > 0 && local_fds[nfds].revents) {
++                    ret--;
++                }
++                if (ret != 0 || !use_landing) {
++                    return ret;
++                }
++            }
++
++            if (use_landing) {
++                unsigned iter = 0;
++                for (;;) {
++                    if (nfds > 0 && (iter & 15u) == 0u) {
++                        int ev = g_poll(fds, nfds, 0);
++                        if (ev != 0) {
++                            return ev;
++                        }
++                    }
++                    LARGE_INTEGER now;
++                    QueryPerformanceCounter(&now);
++                    if (now.QuadPart >= deadline_qpc) {
++                        return 0;
++                    }
++                    YieldProcessor();
++                    ++iter;
++                }
++            }
++            return ret;
++        }
++    }
++#endif
+     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+ #endif
+ }

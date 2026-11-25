@@ -1,0 +1,132 @@
+From 0d9d028df51d0c79211b26804ac56b61c63338f9 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 19:29:56 +0900
+Subject: [PATCH] gfxstream: build the Android guest driver outside AOSP
+
+- Make the minigbm gralloc backend optional when its headers are not
+  available (goldfish gralloc only).
+- Declare the LL-NDK ANativeWindow functions when the android_stub
+  system/window.h (Nougat compatibility header) is used.
+- android_stub: add AHardwareBuffer_lock/unlock/getId link stubs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ia55cabec78e4228c0716768dabe4f4ff087db7cc
+---
+ src/android_stub/nativewindow_stub.cpp        | 19 +++++++++++++++++++
+ .../guest/android/ANativeWindowAndroid.cpp    | 11 +++++++++++
+ .../guest/android/GfxStreamGralloc.cpp        |  8 ++++++++
+ src/gfxstream/guest/android/meson.build       |  9 +++++++--
+ 4 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/src/android_stub/nativewindow_stub.cpp b/src/android_stub/nativewindow_stub.cpp
+index 277b5d5..a0b06fd 100644
+--- a/src/android_stub/nativewindow_stub.cpp
++++ b/src/android_stub/nativewindow_stub.cpp
+@@ -44,6 +44,25 @@ AHardwareBuffer_getNativeHandle(const AHardwareBuffer *buffer)
+    return NULL;
+ }
+ 
++int
++AHardwareBuffer_lock(AHardwareBuffer *buffer, uint64_t usage, int32_t fence,
++                     const ARect *rect, void **outVirtualAddress)
++{
++   return 0;
++}
++
++int
++AHardwareBuffer_unlock(AHardwareBuffer *buffer, int32_t *fence)
++{
++   return 0;
++}
++
++int
++AHardwareBuffer_getId(const AHardwareBuffer *buffer, uint64_t *outId)
++{
++   return 0;
++}
++
+ void
+ ANativeWindow_acquire(ANativeWindow *window)
+ {
+diff --git a/src/gfxstream/guest/android/ANativeWindowAndroid.cpp b/src/gfxstream/guest/android/ANativeWindowAndroid.cpp
+index e0b168d..66c4c81 100644
+--- a/src/gfxstream/guest/android/ANativeWindowAndroid.cpp
++++ b/src/gfxstream/guest/android/ANativeWindowAndroid.cpp
+@@ -10,6 +10,17 @@
+ #if DETECT_OS_ANDROID
+ #include <android/native_window.h>
+ #include <system/window.h>
++#if !defined(ANDROID_VNDK_NATIVEWINDOW_ANATIVEWINDOW_H)
++// The android_stub copy of system/window.h (used when building outside AOSP) is the Nougat
++// compatibility header: it defines struct ANativeWindow but not the LL-NDK functions of
++// vndk/window.h, and including vndk/window.h as well redefines the nativebase types.
++extern "C" {
++int ANativeWindow_dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd);
++int ANativeWindow_queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
++int ANativeWindow_cancelBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
++int ANativeWindow_setUsage(ANativeWindow* window, uint64_t usage);
++}
++#endif
+ #endif  // DETECT_OS_ANDROID
+ 
+ namespace gfxstream {
+diff --git a/src/gfxstream/guest/android/GfxStreamGralloc.cpp b/src/gfxstream/guest/android/GfxStreamGralloc.cpp
+index d8e1fff..044951c 100644
+--- a/src/gfxstream/guest/android/GfxStreamGralloc.cpp
++++ b/src/gfxstream/guest/android/GfxStreamGralloc.cpp
+@@ -12,16 +12,24 @@
+ #include <string>
+ 
+ #include "GrallocGoldfish.h"
++#ifndef GFXSTREAM_NO_MINIGBM_GRALLOC
+ #include "GrallocMinigbm.h"
++#endif
+ #include "android-base/properties.h"
++#include "util/log.h"
+ 
+ namespace gfxstream {
+ 
+ Gralloc* createPlatformGralloc(int32_t descriptor) {
+     const std::string value = android::base::GetProperty("ro.hardware.gralloc", "");
+     if (value == "minigbm") {
++#ifndef GFXSTREAM_NO_MINIGBM_GRALLOC
+         auto gralloc = new MinigbmGralloc(descriptor);
+         return gralloc;
++#else
++        mesa_loge("gfxstream: built without minigbm gralloc support");
++        return nullptr;
++#endif
+     }
+     return new GoldfishGralloc();
+ }
+diff --git a/src/gfxstream/guest/android/meson.build b/src/gfxstream/guest/android/meson.build
+index 9d171ed..3d58150 100644
+--- a/src/gfxstream/guest/android/meson.build
++++ b/src/gfxstream/guest/android/meson.build
+@@ -4,7 +4,8 @@
+ inc_gfxstream_android = include_directories('include')
+ deps_gfxstream_android = [dependency('android-utils')]
+ if host_machine.system() == 'android'
+-    dep_android_minigbm_headers = dependency('android-minigbm-headers')
++    # Velox: minigbm (virtio-gpu) gralloc support is optional when building outside AOSP.
++    dep_android_minigbm_headers = dependency('android-minigbm-headers', required: false)
+     dep_android_nativebase_headers = dependency('android-nativebase-headers')
+     dep_android_aemu_gralloc_headers = dependency('android-aemu-gralloc-headers')
+ 
+@@ -12,8 +13,12 @@ if host_machine.system() == 'android'
+         'ANativeWindowAndroid.cpp',
+         'GfxStreamGralloc.cpp',
+         'GrallocGoldfish.cpp',
+-        'GrallocMinigbm.cpp',
+     )
++    if dep_android_minigbm_headers.found()
++        files_gfxstream_android += files('GrallocMinigbm.cpp')
++    else
++        gfxstream_guest_args += '-DGFXSTREAM_NO_MINIGBM_GRALLOC'
++    endif
+ 
+     deps_gfxstream_android += [
+         dep_android_minigbm_headers,
+-- 
+2.50.1.windows.1
+

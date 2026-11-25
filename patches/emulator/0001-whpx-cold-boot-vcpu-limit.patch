@@ -1,0 +1,28 @@
+diff --git a/android-qemu2-glue/main.cpp b/android-qemu2-glue/main.cpp
+--- a/android-qemu2-glue/main.cpp
++++ b/android-qemu2-glue/main.cpp
+@@ -2747,10 +2747,19 @@
+     }
+ #endif
+
+-    if (hw->hw_cpu_ncore > 6) {
+-        dwarning(
+-                "Emulator does not support more than 6 cores. Number of cores "
+-                "set to 6");
+-        hw->hw_cpu_ncore = 6;
++    int maxCores = 6;
++#ifdef _WIN32
++    // Keep the hardware config and QEMU's initial processor count in sync.
++    // WHPX sizes its partition at startup, so keep this path cold-boot only.
++    if (accel_ok && (accel_mode == ACCEL_ON || accel_mode == ACCEL_AUTO) &&
++        accelerator == ANDROID_CPU_ACCELERATOR_WHPX && opts->no_snapshot &&
++        opts->no_snapstorage) {
++        const int logicalCpus = System::get()->getCpuCoreCount();
++        maxCores = std::max(6, std::min(logicalCpus, 20));
++    }
++#endif
++    if (hw->hw_cpu_ncore > maxCores) {
++        dwarning("Emulator limits this configuration to %d vCPUs.", maxCores);
++        hw->hw_cpu_ncore = maxCores;
+     }
+ #endif  // !TARGET_X86_64 && !TARGET_I386

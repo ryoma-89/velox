@@ -1,0 +1,162 @@
+From 03757de4669bef8a057cc27c4a7634a5250ffe52 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:18:23 +0900
+Subject: [PATCH] gfxstream: send small vkQueueFlushCommandsGOOGLE packets
+ inline in ASG Type-1 ring (patch 0028)
+
+---
+ .../include/AddressSpaceStream.h              |  1 +
+ .../include/gfxstream/guest/IOStream.h        |  2 ++
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 15 +++++++++++++-
+ .../guest/vulkan_enc/ResourceTracker.h        |  2 ++
+ .../guest/vulkan_enc/VulkanStreamGuest.cpp    |  4 ++++
+ .../guest/vulkan_enc/VulkanStreamGuest.h      |  1 +
+ ...eueFlushCommandsGOOGLE_encode_impl.cpp.inl | 20 +++++++++++++++----
+ 7 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+index 0478cf1..329de39 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
++++ b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+@@ -34,6 +34,7 @@ class AddressSpaceStream : public IOStream {
+     virtual const void* veloxFenceTable() {
+         return reinterpret_cast<const char*>(m_context.from_host_large_xfer.ring) + 2560;
+     }
++    virtual size_t veloxInlineFlushLimit() const { return m_writeStep; }
+ 
+     void setMapping(VirtGpuResourceMappingPtr mapping) { m_mapping = mapping; }
+ 
+diff --git a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+index 54a14d6..3a3a735 100644
+--- a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
++++ b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+@@ -38,6 +38,8 @@ class IOStream {
+     virtual uint64_t processPipeInit() { return 0; }
+     // Velox: host-written fence completion table of this stream (ASG only), or null.
+     virtual const void* veloxFenceTable() { return nullptr; }
++    // Velox: max inline Type-1 packet size (bytes) supported directly in the ring slot, or 0.
++    virtual size_t veloxInlineFlushLimit() const { return 0; }
+ 
+     virtual void* allocBuffer(size_t minSize) = 0;
+     virtual int commitBuffer(size_t size) = 0;
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 13a2adf..d7919b1 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -128,6 +128,7 @@ static uint32_t* sSeqnoPtr = nullptr;
+ 
+ // static
+ uint32_t ResourceTracker::streamFeatureBits = 0;
++size_t ResourceTracker::veloxInlineFlushBytes = 0;
+ ResourceTracker::ThreadingCallbacks ResourceTracker::threadingCallbacks;
+ 
+ struct StagingInfo {
+@@ -1626,7 +1627,16 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+             __system_property_get("debug.velox.cmd_stream_first_kb", firstValue) > 0) {
+             const long kb = strtol(firstValue, nullptr, 10);
+             const size_t bytes = kb > 0 ? static_cast<size_t>(kb) * 1024 : 0;
+-            mCommandStreamFirstBytes = bytes >= 4096 && bytes < mCommandStreamBytes ? bytes : 0;
++            mCommandStreamFirstBytes = bytes >= 2048 && bytes < mCommandStreamBytes ? bytes : 0;
++        }
++        char inlineFlushValue[PROP_VALUE_MAX] = {};
++        if (mFeatureInfo.hasVulkanQueueSubmitWithCommands &&
++            __system_property_get("debug.velox.inline_flush_kb", inlineFlushValue) > 0) {
++            const long kb = strtol(inlineFlushValue, nullptr, 10);
++            ResourceTracker::veloxInlineFlushBytes =
++                kb >= 4 && kb <= 256 ? static_cast<size_t>(kb) * 1024 : 0;
++        } else {
++            ResourceTracker::veloxInlineFlushBytes = 0;
+         }
+     }
+ #endif
+@@ -8555,6 +8565,9 @@ void ResourceTracker::streamCommandBufferEarly(VkCommandBuffer commandBuffer) {
+     stream->getWritten(&writtenPtr, &written);
+     if (!written) return;
+     enc->vkQueueFlushCommandsGOOGLE(queue, commandBuffer, written, writtenPtr, true /* do lock */);
++    if (ResourceTracker::veloxInlineFlushBytes > 0) {
++        enc->flush();
++    }
+     stream->reset();
+     ++cb->veloxStreamedFlushes;
+ }
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index 003115b..dfb0c77 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -139,6 +139,8 @@ class ResourceTracker {
+     };
+ 
+     static uint32_t streamFeatureBits;
++    // Velox: debug.velox.inline_flush_kb (bytes, 0 = disabled, max 256 KiB).
++    static size_t veloxInlineFlushBytes;
+     static ThreadingCallbacks threadingCallbacks;
+ 
+ #define HANDLE_REGISTER_DECL(type) \
+diff --git a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
+index 4622b04..51b324b 100644
+--- a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
++++ b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
+@@ -123,6 +123,10 @@ bool VulkanStreamGuest::decStreamRef() { return mStream->decRef(); }
+ 
+ uint8_t* VulkanStreamGuest::reserve(size_t size) { return (uint8_t*)mStream->alloc(size); }
+ 
++size_t VulkanStreamGuest::veloxInlineFlushLimit() const {
++    return mStream ? mStream->veloxInlineFlushLimit() : 0;
++}
++
+ VulkanCountingStream::VulkanCountingStream() : VulkanStreamGuest(nullptr) {}
+ VulkanCountingStream::~VulkanCountingStream() = default;
+ 
+diff --git a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
+index 3a8cbee..b53c5df 100644
+--- a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
++++ b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
+@@ -54,6 +54,7 @@ class VulkanStreamGuest : public gfxstream::aemu::Stream {
+     bool decStreamRef();
+ 
+     uint8_t* reserve(size_t size);
++    size_t veloxInlineFlushLimit() const;
+ 
+    private:
+     gfxstream::aemu::BumpPool mPool;
+diff --git a/src/gfxstream/guest/vulkan_enc/vkQueueFlushCommandsGOOGLE_encode_impl.cpp.inl b/src/gfxstream/guest/vulkan_enc/vkQueueFlushCommandsGOOGLE_encode_impl.cpp.inl
+index 67e5828..e2b414d 100644
+--- a/src/gfxstream/guest/vulkan_enc/vkQueueFlushCommandsGOOGLE_encode_impl.cpp.inl
++++ b/src/gfxstream/guest/vulkan_enc/vkQueueFlushCommandsGOOGLE_encode_impl.cpp.inl
+@@ -25,7 +25,12 @@ size_t* countPtr = &count;
+ }
+ bool queueSubmitWithCommandsEnabled = sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
+ uint32_t packetSize_vkQueueFlushCommandsGOOGLE = 4 + 4 + (queueSubmitWithCommandsEnabled ? 4 : 0) + count;
+-uint8_t* streamPtr = stream->reserve(packetSize_vkQueueFlushCommandsGOOGLE - local_dataSize);
++const size_t inlineLimit = std::min(stream->veloxInlineFlushLimit(),
++                                    ResourceTracker::veloxInlineFlushBytes);
++const bool useInline = inlineLimit > 0 && packetSize_vkQueueFlushCommandsGOOGLE <= inlineLimit;
++uint8_t* streamPtr = stream->reserve(
++    useInline ? packetSize_vkQueueFlushCommandsGOOGLE
++              : (packetSize_vkQueueFlushCommandsGOOGLE - local_dataSize));
+ uint8_t** streamPtrPtr = &streamPtr;
+ uint32_t opcode_vkQueueFlushCommandsGOOGLE = OP_vkQueueFlushCommandsGOOGLE;
+ uint32_t seqno = ResourceTracker::nextSeqno();
+@@ -43,9 +48,16 @@ memcpy(*streamPtrPtr, (uint64_t*)&cgen_var_1408, 1 * 8);
+ memcpy(*streamPtrPtr, (VkDeviceSize*)&local_dataSize, sizeof(VkDeviceSize));
+ *streamPtrPtr += sizeof(VkDeviceSize);
+ 
+-MESA_TRACE_SCOPE("vkQueueFlush large xfer");
+-stream->flush();
+-stream->writeLarge(local_pData, dataSize);
++if (useInline) {
++    if (local_dataSize > 0) {
++        memcpy(*streamPtrPtr, local_pData, local_dataSize);
++        *streamPtrPtr += local_dataSize;
++    }
++} else {
++    MESA_TRACE_SCOPE("vkQueueFlush large xfer");
++    stream->flush();
++    stream->writeLarge(local_pData, dataSize);
++}
+ 
+ ++encodeCount;;
+ if (0 == encodeCount % POOL_CLEAR_INTERVAL)
+-- 
+2.50.1.windows.1
+

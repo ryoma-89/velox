@@ -1,0 +1,569 @@
+From a099c15d42ccc5aad5ef16446027884cbfc5e21c Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:38:11 +0900
+Subject: [PATCH 19/20] velox: ASG prefetch trace, adaptive mode and thread
+ placement (patch 0019)
+
+Diagnostics and experiments for the receive prefetch (0018), all opt-in:
+- VELOX_ASG_PREFETCH_TRACE=<prefix>: per-context timeline of RenderThread
+  acquires, views, direct receives and prefetch pumps, written at teardown
+  (scripts/analyze_prefetch_trace.py in Velox reads it).
+- VELOX_ASG_PREFETCH_AHEAD=3 (adaptive): a large view keeps the stream hot
+  for VELOX_ASG_PREFETCH_HOLD_US; while hot the prefetch thread keeps
+  reading across view boundaries, may poll more often
+  (VELOX_ASG_PREFETCH_HOT_POLL), and RenderThread may wait for an
+  in-flight packet instead of taking the rings over
+  (VELOX_ASG_PREFETCH_WAIT_US). Measured: no gain over AHEAD=2 (the
+  remaining direct receives wait for the guest to produce the data) and
+  sync -5%, so it stays an experiment. AHEAD=2 remains the default.
+- Thread names (gfxstream-render, velox-asg-prefetch) and optional
+  affinity from VELOX_RENDER_AFFINITY / VELOX_PREFETCH_AFFINITY (hex masks
+  the launcher derives from EfficiencyClass, ANDed with the process mask).
+- VELOX_ASG_PROFILE also samples how often each thread runs on a core of
+  the highest EfficiencyClass.
+The diagnostic clock reads in receiveDirect only happen when profiling or
+tracing. Ring order, checks and replies are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ice8211ebe04044d5320a58c44a10a846a1fe1892
+---
+ host/render_thread.cpp |   2 +
+ host/ring_stream.cpp   | 280 +++++++++++++++++++++++++++++++++++++++--
+ host/ring_stream.h     |  57 +++++++++
+ 3 files changed, 327 insertions(+), 12 deletions(-)
+
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index 9f09771..d75f6ac 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -354,6 +354,8 @@ intptr_t RenderThread::main() {
+         setFinished();
+         return 0;
+     }
++    // Velox: thread name and optional placement (VELOX_RENDER_AFFINITY).
++    veloxPlaceCurrentThread("render");
+ 
+     ChannelStream stream(mChannel, RenderChannel::Buffer::kSmallSize);
+     IOStream* ioStream =
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 40ffd6e..f6953d5 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -28,6 +28,20 @@
+ #include "render-utils/dma_device.h"
+ #include "render-utils/stream.h"
+ 
++#include <cstdio>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#endif
++
+ namespace {
+ 
+ // Velox: how long a consumer keeps polling after the last command before it publishes
+@@ -67,9 +81,104 @@ uint64_t monotonicNs() {
+         .count();
+ }
+ 
++// EfficiencyClass of each logical processor in processor group 0 (-1 = unknown).
++struct CpuClasses {
++    std::vector<int> byIndex;
++    int maxClass = -1;
++    int minClass = 256;
++};
++
++const CpuClasses& cpuClasses() {
++    static const CpuClasses classes = [] {
++        CpuClasses result;
++#ifdef _WIN32
++        // SYSTEM_CPU_SET_INFORMATION (CpuSetInformation), declared here so that the build does
++        // not depend on _WIN32_WINNT; the layout is fixed by the Windows ABI.
++        struct CpuSetEntry {
++            DWORD size;
++            DWORD type;
++            DWORD id;
++            WORD group;
++            BYTE logicalProcessorIndex;
++            BYTE coreIndex;
++            BYTE lastLevelCacheIndex;
++            BYTE numaNodeIndex;
++            BYTE efficiencyClass;
++            BYTE allFlags;
++            DWORD reserved;
++            DWORD64 allocationTag;
++        };
++        using GetCpuSets = BOOL(WINAPI*)(void*, ULONG, PULONG, HANDLE, ULONG);
++        auto get = reinterpret_cast<GetCpuSets>(reinterpret_cast<void*>(
++            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation")));
++        ULONG length = 0;
++        if (get) get(nullptr, 0, &length, GetCurrentProcess(), 0);
++        std::vector<unsigned char> buffer(length);
++        if (get && length && get(buffer.data(), length, &length, GetCurrentProcess(), 0)) {
++            for (ULONG offset = 0; offset + sizeof(DWORD) * 2 <= length;) {
++                CpuSetEntry entry{};
++                memcpy(&entry, buffer.data() + offset,
++                       std::min<size_t>(sizeof(entry), length - offset));
++                if (!entry.size) break;
++                if (entry.type == 0 /* CpuSetInformation */ && entry.group == 0) {
++                    const size_t index = entry.logicalProcessorIndex;
++                    if (index >= result.byIndex.size()) result.byIndex.resize(index + 1, -1);
++                    result.byIndex[index] = entry.efficiencyClass;
++                    result.maxClass = std::max<int>(result.maxClass, entry.efficiencyClass);
++                    result.minClass = std::min<int>(result.minClass, entry.efficiencyClass);
++                }
++                offset += entry.size;
++            }
++        }
++#endif
++        return result;
++    }();
++    return classes;
++}
++
+ }  // namespace
+ 
+ namespace gfxstream {
++
++int veloxOnPerformanceCore() {
++#ifdef _WIN32
++    const CpuClasses& classes = cpuClasses();
++    const DWORD index = GetCurrentProcessorNumber();
++    return index < classes.byIndex.size() && classes.byIndex[index] == classes.maxClass ? 1 : 0;
++#else
++    return 0;
++#endif
++}
++
++void veloxPlaceCurrentThread(const char* role) {
++#ifdef _WIN32
++    const bool render = !std::strcmp(role, "render");
++    using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
++    static const auto setDescription = reinterpret_cast<SetDescription>(reinterpret_cast<void*>(
++        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
++    if (setDescription) {
++        setDescription(GetCurrentThread(), render ? L"gfxstream-render" : L"velox-asg-prefetch");
++    }
++    const char* value = std::getenv(render ? "VELOX_RENDER_AFFINITY" : "VELOX_PREFETCH_AFFINITY");
++    if (!value || !*value) return;
++    char* end = nullptr;
++    unsigned long long mask = std::strtoull(value, &end, 16);
++    if (end == value || *end) return;
++    DWORD_PTR processMask = 0;
++    DWORD_PTR systemMask = 0;
++    if (!GetProcessAffinityMask(GetCurrentProcess(), &processMask, &systemMask)) return;
++    mask &= processMask;
++    static std::atomic<int> logged{0};
++    const DWORD_PTR previous = mask ? SetThreadAffinityMask(GetCurrentThread(), mask) : 0;
++    if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
++        GFXSTREAM_INFO("VELOX_PLACEMENT role=%s mask=0x%llx process=0x%llx applied=%d", role, mask,
++                       static_cast<unsigned long long>(processMask), previous ? 1 : 0);
++    }
++#else
++    (void)role;
++#endif
++}
++
+ namespace {
+ 
+ constexpr uint32_t kAsgDuplexVersion = 0x564c0002;
+@@ -177,16 +286,46 @@ RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
+         // whenever there is data, 2: read ahead only while RenderThread decodes a view of at
+         // least VELOX_ASG_PREFETCH_MIN_KB (a large command batch). Small synchronous round
+         // trips then never hand the rings between threads.
+-        mPrefetchAhead = static_cast<int>(envSize("VELOX_ASG_PREFETCH_AHEAD", 2, 0, 2));
++        // 3: as 2, but a large view keeps the stream "hot" for VELOX_ASG_PREFETCH_HOLD_US, and
++        // the prefetch thread keeps reading across view boundaries while it is hot.
++        mPrefetchAhead = static_cast<int>(envSize("VELOX_ASG_PREFETCH_AHEAD", 2, 0, 3));
++        mPrefetchHoldNs = envSize("VELOX_ASG_PREFETCH_HOLD_US", 500, 0, 100000) * 1000;
++        mPrefetchWaitNs = envSize("VELOX_ASG_PREFETCH_WAIT_US", 0, 0, 10000) * 1000;
+         // Pauses between two polls of an empty ring by the prefetch thread.
+         mPrefetchPollPauses =
+             static_cast<uint32_t>(envSize("VELOX_ASG_PREFETCH_POLL", 1024, 0, 65536));
+         mPrefetchMinView = envSize("VELOX_ASG_PREFETCH_MIN_KB", 64, 0, 64 * 1024) * 1024;
++        mPrefetchHotPollPauses = static_cast<uint32_t>(
++            envSize("VELOX_ASG_PREFETCH_HOT_POLL", mPrefetchPollPauses, 0, 65536));
++    }
++}
++
++uint64_t RingStream::traceNow() { return monotonicNs(); }
++
++void RingStream::writeTrace() {
++    const char* prefix = std::getenv("VELOX_ASG_PREFETCH_TRACE");
++    const size_t count = std::min(mTraceCount.load(), mTraceCapacity);
++    // Only contexts that streamed (a few hundred events are setup and teardown).
++    if (!prefix || !*prefix || count < 10000) return;
++    static std::atomic<int> sequence{0};
++    char path[1024];
++    snprintf(path, sizeof(path), "%s-%lu-%d.bin", prefix,
++#ifdef _WIN32
++             static_cast<unsigned long>(GetCurrentProcessId()),
++#else
++             0ul,
++#endif
++             sequence.fetch_add(1));
++    if (FILE* file = std::fopen(path, "wb")) {
++        std::fwrite(mTrace.get(), sizeof(TraceEvent), count, file);
++        std::fclose(file);
++        GFXSTREAM_INFO("VELOX_ASG_PREFETCH_TRACE wrote %zu events to %s", count, path);
+     }
+ }
+ 
+ RingStream::~RingStream() {
+     stopPrefetch(true);
++    writeTrace();
+     if (mProfileTransfers && mXmits) {
+         GFXSTREAM_INFO("VELOX_ASG_RX duplex=%d reads=%zu bytes=%zu type1=%llu type3_reads=%llu "
+                        "type1_bytes=%llu type3_bytes=%llu",
+@@ -206,9 +345,27 @@ RingStream::~RingStream() {
+                        mPrefetchProducerBytes, mPrefetchDirectReads, mPrefetchDirectBytes,
+                        mPrefetchRolls, mPrefetchRelocatedBytes, mPrefetchJoins,
+                        mPrefetchJoinBytes, mPrefetchProducerStalls, mPrefetchProducerSleeps);
++        GFXSTREAM_INFO("VELOX_ASG_PREFETCH2 hot_poll=%u hold_us=%llu wait_us=%llu hot_opens=%llu waits=%llu "
++                       "wait_hits=%llu wait_ns=%llu direct_ns=%llu render_cpu_p=%llu "
++                       "render_cpu_other=%llu prefetch_cpu_p=%llu prefetch_cpu_other=%llu",
++                       mPrefetchHotPollPauses,
++                       static_cast<unsigned long long>(mPrefetchHoldNs / 1000),
++                       static_cast<unsigned long long>(mPrefetchWaitNs / 1000), mPrefetchHotOpens,
++                       mPrefetchWaits, mPrefetchWaitHits, mPrefetchWaitNsTotal, mPrefetchDirectNs,
++                       mCpuSamples[0][1], mCpuSamples[0][0], mCpuSamples[1][1],
++                       mCpuSamples[1][0]);
++    } else if (mProfileTransfers && mXmits) {
++        GFXSTREAM_INFO("VELOX_ASG_CPU render_cpu_p=%llu render_cpu_other=%llu", mCpuSamples[0][1],
++                       mCpuSamples[0][0]);
+     }
+ }
+ 
++void RingStream::sampleCpu(bool producer) {
++    if (!mProfileTransfers) return;
++    const int thread = producer ? 1 : 0;
++    if ((++mCpuSampleTick[thread] & 63) == 0) ++mCpuSamples[thread][veloxOnPerformanceCore()];
++}
++
+ void RingStream::requestExit() {
+     mShouldExit.store(true, std::memory_order_release);
+     if (mPrefetchWanted) wakePrefetchWaiters();
+@@ -304,7 +461,10 @@ uint32_t RingStream::availableCommandBytes(const ring_buffer* ring, const ring_b
+ }
+ 
+ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+-    if (!prefetchEnabled()) return readRing(buf, inout_len);
++    if (!prefetchEnabled()) {
++        sampleCpu(false);
++        return readRing(buf, inout_len);
++    }
+ 
+     // Only RenderThread::main() reads through here (the client flags before the first
+     // packet); ReadBuffer borrows larger views with acquirePrefetched().
+@@ -387,13 +547,26 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+             // Velox prefetch: the prefetch thread lets RenderThread receive directly (never
+             // set on the serial path).
+             if (mReaderIsProducer) {
++                mProducerPolling.store(true, std::memory_order_relaxed);
+                 if (producerShouldYield()) {
+                     *inout_len = 0;
+                     return static_cast<const unsigned char*>(buf);
+                 }
+                 // Poll an empty ring less often than the serial path does: every poll reads
+-                // the ring indices and stores host_state, cache lines the guest writes.
+-                for (uint32_t i = 0; i < mPrefetchPollPauses && !producerShouldYield(); ++i) {
++                // the ring indices and stores host_state, cache lines the guest writes. The
++                // takeover flag is checked on every pause, the gate (which may read the clock
++                // with AHEAD=3) every 64.
++                // AHEAD=3: while the stream is hot the guest is streaming large transfers, and
++                // it waits for each one to be read (ensureType3Finished) before it writes the
++                // next, so the ring is checked more often (VELOX_ASG_PREFETCH_HOT_POLL).
++                uint32_t pauses = mPrefetchPollPauses;
++                if (mPrefetchAhead == 3 && mPrefetchHotPollPauses != mPrefetchPollPauses &&
++                    monotonicNs() < mHotUntilNs.load(std::memory_order_relaxed)) {
++                    pauses = mPrefetchHotPollPauses;
++                }
++                for (uint32_t i = 0; i < pauses; ++i) {
++                    if (mConsumerWantsRing.load(std::memory_order_acquire)) break;
++                    if ((i & 63) == 63 && producerGateClosed()) break;
+                     ring_buffer_yield();
+                 }
+             }
+@@ -591,23 +764,73 @@ void RingStream::type3Read(
+ // trip does not pay a thread hand-off. Replies (commitBuffer) stay on RenderThread unchanged.
+ // ---------------------------------------------------------------------------------------------
+ 
++bool RingStream::producerGateClosed() const {
++    if (mPrefetchAhead < 2 || mConsumerBusy.load(std::memory_order_acquire)) return false;
++    // AHEAD=3: keep reading across view boundaries while the stream is hot.
++    return mPrefetchAhead != 3 || monotonicNs() >= mHotUntilNs.load(std::memory_order_relaxed);
++}
++
+ bool RingStream::producerShouldYield() const {
+-    return mConsumerWantsRing.load(std::memory_order_acquire) ||
+-           (mPrefetchAhead == 2 && !mConsumerBusy.load(std::memory_order_acquire));
++    return mConsumerWantsRing.load(std::memory_order_acquire) || producerGateClosed();
+ }
+ 
+ // RenderThread is about to decode a view: with VELOX_ASG_PREFETCH_AHEAD=2 the prefetch thread
+-// reads ahead from now until RenderThread asks for data again, if the view is large.
++// reads ahead from now until RenderThread asks for data again, if the view is large. With
++// AHEAD=3 a large view also keeps the stream hot for the hold time, and a small view opens the
++// gate while it is hot.
+ void RingStream::consumerBusy(size_t viewSize) {
+-    if (mPrefetchAhead == 2 && viewSize < mPrefetchMinView) return;
++    if (mPrefetchAhead == 3) {
++        const uint64_t now = monotonicNs();
++        if (viewSize >= mPrefetchMinView) {
++            mHotUntilNs.store(now + mPrefetchHoldNs, std::memory_order_relaxed);
++        } else if (now >= mHotUntilNs.load(std::memory_order_relaxed)) {
++            return;
++        } else {
++            ++mPrefetchHotOpens;
++        }
++    } else if (mPrefetchAhead == 2 && viewSize < mPrefetchMinView) {
++        return;
++    }
+     ++mPrefetchGateOpens;
+     mConsumerBusy.store(true, std::memory_order_seq_cst);
+-    if (mPrefetchAhead == 2 && mProducerWaiting.load(std::memory_order_seq_cst)) {
++    if (mPrefetchAhead >= 2 && mProducerWaiting.load(std::memory_order_seq_cst)) {
+         std::lock_guard<std::mutex> lock(mPrefetchMutex);
+         mProducerCv.notify_one();
+     }
+ }
+ 
++// AHEAD=3: RenderThread ran out of packets while the prefetch thread is receiving (not polling
++// an empty ring) on a hot stream: wait for it to publish instead of taking the rings over, so
++// RenderThread does not copy the rest of the packet itself. Gives up (and takes over) when the
++// prefetch thread starts to poll, the stream cools or the wait budget runs out.
++bool RingStream::waitForInflightPacket(uint64_t pos, size_t minSize) {
++    if (mPrefetchAhead != 3 || !mPrefetchWaitNs || !mPrefetchThread.joinable()) return false;
++    if (mProducerPolling.load(std::memory_order_acquire)) return false;
++    const uint64_t start = monotonicNs();
++    if (start >= mHotUntilNs.load(std::memory_order_relaxed)) return false;
++    ++mPrefetchWaits;
++    trace(kTraceWaitBegin, pos, static_cast<uint32_t>(minSize));
++    bool served = false;
++    uint64_t now = start;
++    for (uint32_t i = 0;; ++i) {
++        if (mPublishedEnd.load(std::memory_order_acquire) - pos >= minSize) {
++            served = true;
++            break;
++        }
++        if (mProducerPolling.load(std::memory_order_acquire) || prefetchStopping()) break;
++        if ((i & 63) == 63) {
++            now = monotonicNs();
++            if (now - start >= mPrefetchWaitNs) break;
++        }
++        ring_buffer_yield();
++    }
++    now = monotonicNs();
++    mPrefetchWaitNsTotal += now - start;
++    if (served) ++mPrefetchWaitHits;
++    trace(kTraceWaitEnd, mPublishedEnd.load(std::memory_order_relaxed), served ? 1 : 0);
++    return served;
++}
++
+ bool RingStream::prefetchStopping() const {
+     return mShouldExit.load(std::memory_order_acquire) ||
+            mPrefetchStop.load(std::memory_order_acquire);
+@@ -629,7 +852,17 @@ bool RingStream::startPrefetch() {
+     mFrameNext = 0;
+     mFrameEnd = kStreamFlagsSize;
+     mPrefetchStarted = true;
+-    if (mPrefetchAhead) mPrefetchThread = std::thread([this] { prefetchMain(); });
++    if (const char* trace = std::getenv("VELOX_ASG_PREFETCH_TRACE"); trace && *trace) {
++        const size_t events = envSize("VELOX_ASG_PREFETCH_TRACE_EVENTS", 1 << 20, 1024, 1 << 26);
++        mTrace.reset(new (std::nothrow) TraceEvent[events]);
++        if (mTrace) mTraceCapacity = events;
++    }
++    if (mPrefetchAhead) {
++        mPrefetchThread = std::thread([this] {
++            veloxPlaceCurrentThread("prefetch");
++            prefetchMain();
++        });
++    }
+     return true;
+ }
+ 
+@@ -734,12 +967,20 @@ int RingStream::pumpPrefetch(bool producer) {
+     mReaderIsProducer = producer;
+     const unsigned char* got = readRing(chunk->data.get() + used, &len);
+     mReaderIsProducer = false;
+-    if (!got) return -1;
+-    if (!len) return 0;
++    if (!got) {
++        if (producer) mProducerPolling.store(true, std::memory_order_relaxed);
++        return -1;
++    }
++    if (!len) {
++        if (producer) mProducerPolling.store(true, std::memory_order_relaxed);
++        return 0;
++    }
+     mProdWritten += len;
+     if (producer) {
++        mProducerPolling.store(false, std::memory_order_release);
+         ++mPrefetchProducerReads;
+         mPrefetchProducerBytes += len;
++        trace(kTraceProducerPump, mProdWritten, static_cast<uint32_t>(len));
+     } else {
+         ++mPrefetchDirectReads;
+         mPrefetchDirectBytes += len;
+@@ -772,10 +1013,13 @@ void RingStream::prefetchMain() {
+     while (!prefetchStopping()) {
+         // RenderThread takes priority for the rings; a pending snapshot stops the read-ahead
+         // (RenderThread still receives on demand, as the serial path does).
++        sampleCpu(true);
+         if (producerShouldYield() || mInSnapshotOperation.load(std::memory_order_acquire)) {
+             bool slept = false;
++            mProducerPolling.store(true, std::memory_order_relaxed);
+             prefetchIdle(&slept);
+             if (slept) ++mPrefetchProducerSleeps;
++            trace(kTraceProducerIdle, 0, slept ? 1 : 0);
+             continue;
+         }
+         {
+@@ -841,6 +1085,10 @@ RingStream::PrefetchChunk* RingStream::consumerChunkFor(uint64_t pos) {
+ // RenderThread receives directly until the stream holds |minSize| published bytes at |pos|.
+ bool RingStream::receiveDirect(uint64_t pos, size_t minSize) {
+     ++mPrefetchTakeovers;
++    // Diagnostics only (VELOX_ASG_PROFILE or the trace): the clock is not free on this path.
++    const bool timed = mProfileTransfers || mTraceCapacity;
++    const uint64_t startNs = timed ? monotonicNs() : 0;
++    const uint64_t startDirect = mPrefetchDirectBytes;
+     // Fast path: the prefetch thread is idle (the gate is closed for small round trips), so
+     // the rings are free and nothing has to be signalled.
+     std::unique_lock<std::mutex> reader(mRingReaderMutex, std::try_to_lock);
+@@ -861,6 +1109,7 @@ bool RingStream::receiveDirect(uint64_t pos, size_t minSize) {
+             ring_buffer_yield();
+         }
+     }
++    trace(kTraceDirectBegin, pos, contended ? 1 : 0);
+     // Release chunks behind |pos| so that receiving never waits on this thread itself.
+     consumerChunkFor(pos);
+     bool ok = true;
+@@ -872,6 +1121,9 @@ bool RingStream::receiveDirect(uint64_t pos, size_t minSize) {
+     }
+     reader.unlock();
+     if (contended) mConsumerWantsRing.store(false, std::memory_order_seq_cst);
++    if (timed) mPrefetchDirectNs += monotonicNs() - startNs;
++    trace(kTraceDirectEnd, mPublishedEnd.load(std::memory_order_relaxed),
++          static_cast<uint32_t>(mPrefetchDirectBytes - startDirect));
+     // With AHEAD=2 the gate is closed here (RenderThread is between views); consumerBusy()
+     // wakes the prefetch thread when it opens.
+     if (mPrefetchAhead != 2 && mProducerWaiting.load(std::memory_order_seq_cst)) {
+@@ -915,6 +1167,8 @@ const unsigned char* RingStream::acquirePrefetched(size_t unconsumed, size_t min
+     const uint64_t pos = mConsViewEnd - unconsumed;
+     ++mPrefetchAcquires;
+     mConsumerBusy.store(false, std::memory_order_release);
++    sampleCpu(false);
++    trace(kTraceAcquire, pos, static_cast<uint32_t>(std::min<size_t>(minSize, UINT32_MAX)));
+     for (;;) {
+         if (exitRequested() || mPrefetchStop.load(std::memory_order_acquire)) return nullptr;
+         if (PrefetchChunk* chunk = consumerChunkFor(pos)) {
+@@ -927,6 +1181,7 @@ const unsigned char* RingStream::acquirePrefetched(size_t unconsumed, size_t min
+             if (available >= minSize) {
+                 mConsViewEnd = published;
+                 *outLen = static_cast<size_t>(available);
++                trace(kTraceView, published, static_cast<uint32_t>(std::min<uint64_t>(available, UINT32_MAX)));
+                 consumerBusy(*outLen);
+                 return chunk->data.get() + (pos - chunk->start);
+             }
+@@ -943,6 +1198,7 @@ const unsigned char* RingStream::acquirePrefetched(size_t unconsumed, size_t min
+             if (mPublishedEnd.load(std::memory_order_acquire) - pos >= minSize) continue;
+         }
+         ++mPrefetchMisses;
++        if (waitForInflightPacket(pos, minSize)) continue;
+         if (!receiveDirect(pos, minSize)) return nullptr;
+     }
+ }
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index 361a39e..82f41b1 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -31,6 +31,15 @@
+ 
+ namespace gfxstream {
+ 
++// Velox: names the calling thread (|role| is "render" or "prefetch") and, if the environment
++// variable VELOX_<ROLE>_AFFINITY holds a hex mask ("0x..."), restricts it to the logical
++// processors of that mask that the process may use. The launcher derives the masks from
++// EfficiencyClass; nothing here hard-codes processor numbers.
++void veloxPlaceCurrentThread(const char* role);
++// Velox: 1 if the calling thread runs on a logical processor with the highest EfficiencyClass
++// (a P core on a hybrid CPU), 0 otherwise (also when the class is unknown).
++int veloxOnPerformanceCore();
++
+ // An IOStream instance that can be used by the host RenderThread to process
+ // messages from a pair of ring buffers (to host and from host).  It also takes
+ // a callback that does something when there are no available bytes to read in
+@@ -143,7 +152,37 @@ class RingStream final : public IOStream {
+     void wakePrefetchWaiters();
+     bool prefetchStopping() const;
+     bool producerShouldYield() const;
++    bool producerGateClosed() const;
+     void consumerBusy(size_t viewSize);
++    bool waitForInflightPacket(uint64_t pos, size_t minSize);
++    void sampleCpu(bool producer);
++    // Diagnostic timeline (VELOX_ASG_PREFETCH_TRACE=<path prefix>), written at destruction.
++    enum TraceKind : uint32_t {
++        kTraceAcquire = 1,      // pos, arg = minSize
++        kTraceView = 2,         // pos = view end, arg = view length
++        kTraceDirectBegin = 3,  // pos, arg = 1 if the prefetch thread held the rings
++        kTraceDirectEnd = 4,    // pos = published end, arg = bytes received directly
++        kTraceProducerPump = 5, // pos = bytes written, arg = bytes received
++        kTraceProducerIdle = 6, // arg = 1 when it slept
++        kTraceWaitBegin = 7,    // pos, arg = minSize
++        kTraceWaitEnd = 8,      // pos = published end, arg = 1 if served
++    };
++    struct TraceEvent {
++        uint64_t ns;
++        uint64_t pos;
++        uint32_t kind;
++        uint32_t arg;
++    };
++    void trace(uint32_t kind, uint64_t pos, uint32_t arg) {
++        if (!mTraceCapacity) return;
++        const size_t i = mTraceCount.fetch_add(1, std::memory_order_relaxed);
++        if (i < mTraceCapacity) mTrace[i] = TraceEvent{traceNow(), pos, kind, arg};
++    }
++    static uint64_t traceNow();
++    void writeTrace();
++    std::unique_ptr<TraceEvent[]> mTrace;
++    size_t mTraceCapacity = 0;
++    std::atomic<size_t> mTraceCount{0};
+ 
+     const bool mPrefetchWanted;
+     int mPrefetchAhead = 0;
+@@ -190,6 +229,24 @@ class RingStream final : public IOStream {
+     unsigned long long mPrefetchJoins = 0;
+     unsigned long long mPrefetchJoinBytes = 0;
+     unsigned long long mPrefetchGateOpens = 0;
++    // Velox adaptive prefetch (VELOX_ASG_PREFETCH_AHEAD=3): after a large view the stream is
++    // "hot" for VELOX_ASG_PREFETCH_HOLD_US, and the prefetch thread keeps reading across view
++    // boundaries and small views. A consumer that runs out while the prefetch thread is in the
++    // middle of a packet waits up to VELOX_ASG_PREFETCH_WAIT_US for it instead of taking the
++    // rings over (0 = always take over, as with AHEAD=2).
++    uint64_t mPrefetchHoldNs = 0;
++    uint64_t mPrefetchWaitNs = 0;
++    uint32_t mPrefetchHotPollPauses = 0;
++    std::atomic<uint64_t> mHotUntilNs{0};
++    std::atomic<bool> mProducerPolling{false};  // the prefetch thread polls an empty ring
++    unsigned long long mPrefetchWaits = 0;
++    unsigned long long mPrefetchWaitHits = 0;
++    unsigned long long mPrefetchWaitNsTotal = 0;
++    unsigned long long mPrefetchDirectNs = 0;   // RenderThread time in receiveDirect
++    unsigned long long mPrefetchHotOpens = 0;   // gate opened by the hold, not by the view
++    // CPU placement samples (VELOX_ASG_PROFILE): [thread][0 = other, 1 = performance core].
++    unsigned long long mCpuSamples[2][2] = {{0, 0}, {0, 0}};
++    uint32_t mCpuSampleTick[2] = {0, 0};
+ };
+ 
+ }  // namespace gfxstream
+-- 
+2.50.1.windows.1
+

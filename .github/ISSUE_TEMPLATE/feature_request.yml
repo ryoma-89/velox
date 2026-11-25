@@ -1,0 +1,24 @@
+name: Feature Request
+description: Propose a new feature or optimization for Velox
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the feature or optimization and the problem it solves.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Security & Integrity Compatibility
+      description: Confirm this proposal preserves VBS/HVCI, SELinux/AVB/Scudo, storage flush durability, and does not involve spoofing or benchmark hacks.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Proposed Verification Method
+      description: How should correctness and (if applicable) alternating A/B performance be verified?

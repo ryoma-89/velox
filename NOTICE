@@ -1,0 +1,17 @@
+Velox
+Copyright 2026 Velox Contributors
+
+This product includes original software developed by the Velox Project,
+licensed under the Apache License, Version 2.0 (see LICENSE and LICENSES/Apache-2.0.txt).
+
+IMPORTANT MULTI-LICENSE NOTICE:
+Patches under `patches/` modify third-party upstream open-source projects and
+remain strictly subject to their respective upstream licenses — Apache License 2.0
+is NOT applied blanket-wide to upstream patches:
+  - patches/emulator/  : GNU General Public License v2 (QEMU / AOSP Android Emulator)
+  - patches/gfxstream/ : Apache License 2.0 (AOSP gfxstream)
+  - patches/aemu/      : Apache License 2.0 (AOSP aemu)
+  - patches/mesa3d/    : MIT License (Mesa 3D)
+
+See THIRD_PARTY_NOTICES.md and LICENSES/ for full license boundaries,
+corresponding source obligations, and redistribution terms.

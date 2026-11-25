@@ -1,0 +1,129 @@
+From cd04b57af555856eefd79e1aec8779aea2df7673 Mon Sep 17 00:00:00 2001
+From: Velox <velox@local>
+Date: Wed, 25 Nov 2026 04:22:53 +0900
+Subject: [PATCH] velox: harden GLES InputBuffer alignment, shader cache key,
+ and GuestSyncs stale cleanup (patch 0030)
+
+---
+ .../include/gfxstream/host/ProtocolUtils.h    | 15 ++++++-----
+ .../gles_v2/angle_shader_parser.cpp           | 26 +++++++++++++------
+ .../glestranslator/gles_v2/gles_v30_imp.cpp   |  1 +
+ 3 files changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/host/decoder_common/include/gfxstream/host/ProtocolUtils.h b/host/decoder_common/include/gfxstream/host/ProtocolUtils.h
+index fc23eaa..0837f12 100644
+--- a/host/decoder_common/include/gfxstream/host/ProtocolUtils.h
++++ b/host/decoder_common/include/gfxstream/host/ProtocolUtils.h
+@@ -111,16 +111,17 @@ inline T Unpack(const void* ptr) {
+ // if the |ptr|'s |size| is small enough. If it doesn't fit into the internal
+ // array, an aligned copy is allocated on the heap and freed in the dtor.
+ 
+-// On x86_64, unaligned loads/stores are native hardware operations and host GL/EGL
+-// entrypoints accept byte-aligned payload pointers (e.g. glTexSubImage2D at +44,
+-// glBufferData at +20). Using Align = 1 eliminates a full malloc+memcpy+free per upload.
++// On x86_64, GL/EGL input payloads at 4-mod-8 offsets (e.g. glTexSubImage2D at +44,
++// glBufferData at +20) are 4-byte aligned, which satisfies GLint/GLuint/GLfloat alignment
++// and eliminates a full malloc+memcpy+free per upload while still copying arbitrary odd-byte
++// offsets safely. Keep GenericOutputBuffer at 8-byte alignment for 64-bit output pointers.
+ #if defined(__x86_64__) || defined(_M_X64)
+-static constexpr size_t kDefaultProtocolBufferAlign = 1;
++static constexpr size_t kDefaultInputBufferAlign = 4;
+ #else
+-static constexpr size_t kDefaultProtocolBufferAlign = 8;
++static constexpr size_t kDefaultInputBufferAlign = 8;
+ #endif
+ 
+-template <size_t StackSize = 1024, size_t Align = kDefaultProtocolBufferAlign>
++template <size_t StackSize = 1024, size_t Align = kDefaultInputBufferAlign>
+ class GenericInputBuffer {
+     static_assert(Align == 1 || Align == 2 || Align == 4 || Align == 8,
+                   "Bad alignment parameter");
+@@ -157,7 +158,7 @@ private:
+     char __attribute__((__aligned__(Align))) mArray[StackSize];
+ };
+ 
+-template <size_t StackSize = 1024, size_t Align = kDefaultProtocolBufferAlign>
++template <size_t StackSize = 1024, size_t Align = 8>
+ class GenericOutputBuffer {
+     static_assert(Align == 1 || Align == 2 || Align == 4 || Align == 8,
+                   "Bad alignment parameter");
+diff --git a/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp b/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp
+index f007749..3fa83f9 100644
+--- a/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp
++++ b/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp
+@@ -409,6 +409,7 @@ bool translate(bool hostUsesCoreProfile,
+ 
+     struct CachedTranslation {
+         bool ok = false;
++        bool hasLinkInfo = false;
+         std::string infoLog;
+         std::string objCode;
+         ShaderLinkInfo linkInfo;
+@@ -421,15 +422,18 @@ bool translate(bool hostUsesCoreProfile,
+     static TranslationCache* sCache = new TranslationCache;
+ 
+     std::string cacheKey;
+-    cacheKey.reserve(strlen(src) + 24);
++    cacheKey.reserve(strlen(src) + 32);
+     cacheKey.push_back(hostUsesCoreProfile ? '1' : '0');
+     cacheKey.push_back(':');
+     cacheKey += std::to_string(shaderType);
+     cacheKey.push_back(':');
++    cacheKey += std::to_string(esslVersion);
++    cacheKey.push_back(':');
+     cacheKey += src;
+ 
+     auto cachedIt = sCache->map.find(cacheKey);
+-    if (cachedIt != sCache->map.end()) {
++    if (cachedIt != sCache->map.end() &&
++        (!outShaderLinkInfo || cachedIt->second.hasLinkInfo)) {
+         *outInfolog = cachedIt->second.infoLog;
+         *outObjCode = cachedIt->second.objCode;
+         if (outShaderLinkInfo) {
+@@ -466,19 +470,25 @@ bool translate(bool hostUsesCoreProfile,
+     bool ret = res->compileStatus == 1;
+ 
+     if (ret) {
+-        if (sCache->map.size() >= kMaxCacheEntries && !sCache->order.empty()) {
+-            sCache->map.erase(sCache->order.front());
+-            sCache->order.pop_front();
+-        }
+         CachedTranslation entry;
+         entry.ok = ret;
++        entry.hasLinkInfo = (outShaderLinkInfo != nullptr);
+         entry.infoLog = *outInfolog;
+         entry.objCode = *outObjCode;
+         if (outShaderLinkInfo) {
+             entry.linkInfo = *outShaderLinkInfo;
+         }
+-        sCache->map.emplace(cacheKey, std::move(entry));
+-        sCache->order.push_back(std::move(cacheKey));
++        auto existing = sCache->map.find(cacheKey);
++        if (existing != sCache->map.end()) {
++            existing->second = std::move(entry);
++        } else {
++            if (sCache->map.size() >= kMaxCacheEntries && !sCache->order.empty()) {
++                sCache->map.erase(sCache->order.front());
++                sCache->order.pop_front();
++            }
++            sCache->map.emplace(cacheKey, std::move(entry));
++            sCache->order.push_back(std::move(cacheKey));
++        }
+     }
+ 
+     st->freeShaderResolveState(res);
+diff --git a/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp b/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
+index f99e3eb..50b0246 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
+@@ -463,6 +463,7 @@ public:
+         }
+ 
+         mSyncs.erase(it);
++        mStaleSyncs.erase(guestSyncToDelete);
+         return host;
+     }
+ 
+-- 
+2.50.1.windows.1
+

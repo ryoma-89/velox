@@ -1,0 +1,78 @@
+From 3ed505a9ce62889a43bc66988635185614ddd432 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 20:59:08 +0900
+Subject: [PATCH] gfxstream: close the ASG lost wakeup window
+
+RingStream::read stored NEED_NOTIFY and slept until a ping without
+looking at the rings again; a guest write that landed in between was
+not pinged and the stream stalled until an unrelated ping. Store
+NEED_NOTIFY with seq_cst, fence, re-check both rings, and bound the
+consumer wait to 10 ms as a safety net for guests without the fence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I41a1052790c11993246aba7a65f708d984e0ce89
+---
+ host/address_space/address_space_graphics.cpp |  8 +++++++-
+ host/ring_stream.cpp                          | 17 ++++++++++++++++-
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/host/address_space/address_space_graphics.cpp b/host/address_space/address_space_graphics.cpp
+index 49fb390..d34f260 100644
+--- a/host/address_space/address_space_graphics.cpp
++++ b/host/address_space/address_space_graphics.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include "gfxstream/host/address_space_graphics.h"
+ 
++#include <chrono>
+ #include <memory>
+ #include <optional>
+ 
+@@ -629,10 +630,15 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
+ AsgOnUnavailableReadStatus AddressSpaceGraphicsContext::onUnavailableRead() {
+     std::unique_lock<std::mutex> lock(mConsumerStateMutex);
+     gfxstream::base::ScopedLockAssertion lockAssertion(mConsumerStateMutex);
+-    mConsumerStateCv.wait(lock, [this]() {
++    // Velox: wake up at least every 10 ms and let the caller look at the rings again. Guests
++    // whose stream code has no fence between the ring write and the host_state read (the stock
++    // GLES libraries) can still miss a ping; this bounds the stall instead of waiting for an
++    // unrelated ping. Idle contexts wake 100 times per second.
++    const bool woken = mConsumerStateCv.wait_for(lock, std::chrono::milliseconds(10), [this]() {
+         gfxstream::base::ScopedLockAssertion lockAssertion(mConsumerStateMutex);
+         return mConsumerState.hasPendingWork();
+     });
++    if (!woken) return AsgOnUnavailableReadStatus::kContinue;
+ 
+     if (mConsumerState.exiting) {
+         return AsgOnUnavailableReadStatus::kExit;
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 034e63a..1aa1f17 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -258,7 +258,22 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+ 
+             ++mUnavailableReadCount;
+             if (mUnavailableReadCount >= kMaxUnavailableReads) {
+-                *(mContext.host_state) = ASG_HOST_STATE_NEED_NOTIFY;
++                __atomic_store_n(mContext.host_state, ASG_HOST_STATE_NEED_NOTIFY, __ATOMIC_SEQ_CST);
++
++                // Velox: the guest writes the ring and then reads host_state to decide whether to
++                // ping. Without a re-check here, a write that lands after the ring check above but
++                // before NEED_NOTIFY is visible is lost: the guest saw CAN_CONSUME/RENDERING and
++                // did not ping, and this thread sleeps until some other ping (observed as a
++                // video stream that stops updating with ASG). Store the state, fence, then look at
++                // the rings again (the guest does the mirror image: store ring, fence, load state).
++                __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                if (ring_buffer_available_read(mContext.to_host, 0) ||
++                    ring_buffer_available_read(mContext.to_host_large_xfer.ring,
++                                               &mContext.to_host_large_xfer.view)) {
++                    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME,
++                                     __ATOMIC_SEQ_CST);
++                    continue;
++                }
+ 
+                 bool sleeping = false;
+                 do {
+-- 
+2.50.1.windows.1
+

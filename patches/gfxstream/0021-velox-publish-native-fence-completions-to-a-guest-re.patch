@@ -1,0 +1,680 @@
+From 32e848083ed2751a846ff2755750d721b29c302c Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:07:46 +0900
+Subject: [PATCH] velox: publish native fence completions to a guest-readable
+ table (patch 0021)
+
+VELOX_FENCE_SHARED=1 (guest debug.velox.fence_shared=1). Each ASG context
+gets a 64-slot table in the unused tail of its from_host_large_xfer ring page
+(offset 2560). When a fence the guest submitted on that context reaches
+VK_SUCCESS natively, the host writes "boxed handle + reset epoch" into the
+table (seqlock per slot). The epoch counts vkResetFences processed for the
+fence, so a completion from before a reset never matches the guest's
+current epoch. The guest answers vkGetFenceStatus/vkWaitForFences locally
+only on an exact handle+epoch match and otherwise uses the RPC.
+
+Completions come from the host's own observations: a per-device watcher
+thread that waits (2 ms slices) on fences that stayed pending for
+VELOX_FENCE_WATCH_DELAY_US (100) without anyone observing them, and the
+RPC paths (vkGetFenceStatus / vkWaitForFences returning VK_SUCCESS). The
+watcher is never woken by a submission (it polls every 250 us while it has
+work), never touches a fence that the decoder observed first, and is
+cancelled (waiting for any native call on the fence to return) before a
+fence is reset or destroyed; it is stopped before a device's objects are
+destroyed and stops publishing after VK_ERROR_DEVICE_LOST. The host never
+reads the table; its decisions use FenceInfo, so a guest that scribbles
+over the page only confuses its own queries. The table is invalidated
+before the ASG context frees the ring storage and after a snapshot load.
+
+Also: thread names and optional priority for the watcher, and
+VELOX_<ROLE>_PRIORITY (above_normal / highest) for the Velox host threads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ia1054d2fa7a7d02fbb0b74b4d3bb6bfc006b910d
+---
+ host/render_thread.cpp                    |   5 +
+ host/ring_stream.cpp                      |  35 ++-
+ host/ring_stream.h                        |  10 +
+ host/vulkan/velox_fence_shared.h          | 310 ++++++++++++++++++++++
+ host/vulkan/vk_decoder_global_state.cpp   |  82 +++++-
+ host/vulkan/vk_decoder_internal_structs.h |   6 +
+ 6 files changed, 443 insertions(+), 5 deletions(-)
+ create mode 100644 host/vulkan/velox_fence_shared.h
+
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index d75f6ac..7f7a434 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -273,6 +273,7 @@ void RenderThread::waitForFinished() {
+     // A disconnected guest cannot drain an ASG reply while this thread waits for teardown.
+     if (mRingStream) {
+         mRingStream->requestExit();
++        mRingStream->invalidateFenceTable();
+         // Velox VELOX_ASG_PREFETCH: the ASG context has already woken a reader sleeping in
+         // onUnavailableRead, and its rings stay mapped until this returns.
+         mRingStream->stopPrefetch(true);
+@@ -356,6 +357,9 @@ intptr_t RenderThread::main() {
+     }
+     // Velox: thread name and optional placement (VELOX_RENDER_AFFINITY).
+     veloxPlaceCurrentThread("render");
++    // Velox: fences submitted from this thread publish their completion into this context's
++    // table (VELOX_FENCE_SHARED=1).
++    tVeloxCurrentFenceTable = mRingStream ? mRingStream->fenceTable() : nullptr;
+ 
+     ChannelStream stream(mChannel, RenderChannel::Buffer::kSmallSize);
+     IOStream* ioStream =
+@@ -617,6 +621,7 @@ intptr_t RenderThread::main() {
+         }
+     }
+ 
++    tVeloxCurrentFenceTable.reset();
+     // Velox VELOX_ASG_PREFETCH: stop receiving; teardown (waitForFinished) joins the thread.
+     if (mRingStream) mRingStream->stopPrefetch(false);
+ 
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index f6953d5..5ad0dff 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -152,14 +152,31 @@ int veloxOnPerformanceCore() {
+ 
+ void veloxPlaceCurrentThread(const char* role) {
+ #ifdef _WIN32
++    // Roles: "render" (RenderThread), "prefetch" (ASG receive prefetch), "fencewatch" (Velox
++    // fence completion watcher). VELOX_<ROLE>_AFFINITY: hex mask from the launcher.
++    // VELOX_<ROLE>_PRIORITY: "above_normal" or "highest" (thread priority inside this process;
++    // no system setting changes).
+     const bool render = !std::strcmp(role, "render");
++    const bool watch = !std::strcmp(role, "fencewatch");
+     using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+     static const auto setDescription = reinterpret_cast<SetDescription>(reinterpret_cast<void*>(
+         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
+     if (setDescription) {
+-        setDescription(GetCurrentThread(), render ? L"gfxstream-render" : L"velox-asg-prefetch");
++        setDescription(GetCurrentThread(), render  ? L"gfxstream-render"
++                                           : watch ? L"velox-fence-watch"
++                                                   : L"velox-asg-prefetch");
+     }
+-    const char* value = std::getenv(render ? "VELOX_RENDER_AFFINITY" : "VELOX_PREFETCH_AFFINITY");
++    const char* priority = std::getenv(render  ? "VELOX_RENDER_PRIORITY"
++                                       : watch ? "VELOX_FENCEWATCH_PRIORITY"
++                                               : "VELOX_PREFETCH_PRIORITY");
++    if (priority && !std::strcmp(priority, "above_normal")) {
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++    } else if (priority && !std::strcmp(priority, "highest")) {
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++    }
++    const char* value = std::getenv(render  ? "VELOX_RENDER_AFFINITY"
++                                    : watch ? "VELOX_FENCEWATCH_AFFINITY"
++                                            : "VELOX_PREFETCH_AFFINITY");
+     if (!value || !*value) return;
+     char* end = nullptr;
+     unsigned long long mask = std::strtoull(value, &end, 16);
+@@ -278,6 +295,10 @@ RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
+     mDuplex(supportsDuplex(info)),
+     mProfileTransfers(gfxstream::base::getEnvironmentVariable("VELOX_ASG_PROFILE") == "1"),
+     mPrefetchWanted(asgPrefetchWanted()) {
++    if (const char* shared = std::getenv("VELOX_FENCE_SHARED"); shared && !std::strcmp(shared, "1")) {
++        mFenceTable = std::make_shared<VeloxFenceTable>(
++            reinterpret_cast<uint8_t*>(mContext.from_host_large_xfer.ring));
++    }
+     if (mPrefetchWanted) {
+         mPrefetchChunkSize =
+             envSize("VELOX_ASG_PREFETCH_CHUNK_KB", 1024, 64, 64 * 1024) * 1024;
+@@ -324,6 +345,7 @@ void RingStream::writeTrace() {
+ }
+ 
+ RingStream::~RingStream() {
++    invalidateFenceTable();
+     stopPrefetch(true);
+     writeTrace();
+     if (mProfileTransfers && mXmits) {
+@@ -354,7 +376,11 @@ RingStream::~RingStream() {
+                        mPrefetchWaits, mPrefetchWaitHits, mPrefetchWaitNsTotal, mPrefetchDirectNs,
+                        mCpuSamples[0][1], mCpuSamples[0][0], mCpuSamples[1][1],
+                        mCpuSamples[1][0]);
+-    } else if (mProfileTransfers && mXmits) {
++    }
++    if (mProfileTransfers && mFenceTable) {
++        GFXSTREAM_INFO("VELOX_FENCE_SHARED published=%llu", mFenceTable->published());
++    }
++    if (mProfileTransfers && !mPrefetchStarted && mXmits) {
+         GFXSTREAM_INFO("VELOX_ASG_CPU render_cpu_p=%llu render_cpu_other=%llu", mCpuSamples[0][1],
+                        mCpuSamples[0][0]);
+     }
+@@ -1269,6 +1295,9 @@ void RingStream::onSave(gfxstream::Stream* stream) {
+ 
+ unsigned char* RingStream::onLoad(gfxstream::Stream* stream) {
+     mLoadedFromSnapshot = true;  // the loaded stream state belongs to the serial path
++    // The fence epochs of the saved guest are not tracked across a snapshot: stop publishing,
++    // the guest falls back to the RPC for every fence.
++    invalidateFenceTable();
+     gfxstream::host::loadBuffer(stream, &mReadBuffer);
+     mReadBufferLeft = mReadBuffer.size();
+ 
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index 82f41b1..fd6643d 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -28,6 +28,7 @@
+ #include "gfxstream/host/iostream.h"
+ #include "render-utils/RenderChannel.h"
+ #include "render-utils/address_space_graphics_types.h"
++#include "vulkan/velox_fence_shared.h"
+ 
+ namespace gfxstream {
+ 
+@@ -77,6 +78,14 @@ class RingStream final : public IOStream {
+     // already have woken a thread sleeping in onUnavailableRead).
+     void stopPrefetch(bool join);
+ 
++    // Velox fence completion table (VELOX_FENCE_SHARED=1), see vulkan/velox_fence_shared.h.
++    // Null when off or after a snapshot load. invalidateFenceTable() is called before the ASG
++    // context frees the ring storage.
++    std::shared_ptr<VeloxFenceTable> fenceTable() const { return mFenceTable; }
++    void invalidateFenceTable() {
++        if (mFenceTable) mFenceTable->invalidate();
++    }
++
+   protected:
+     virtual void* allocBuffer(size_t minSize) override final;
+     virtual int commitBuffer(size_t size) override final;
+@@ -184,6 +193,7 @@ class RingStream final : public IOStream {
+     size_t mTraceCapacity = 0;
+     std::atomic<size_t> mTraceCount{0};
+ 
++    std::shared_ptr<VeloxFenceTable> mFenceTable;
+     const bool mPrefetchWanted;
+     int mPrefetchAhead = 0;
+     uint32_t mPrefetchPollPauses = 0;
+diff --git a/host/vulkan/velox_fence_shared.h b/host/vulkan/velox_fence_shared.h
+new file mode 100644
+index 0000000..40c8ff0
+--- /dev/null
++++ b/host/vulkan/velox_fence_shared.h
+@@ -0,0 +1,310 @@
++// Copyright (C) 2026 The Velox authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#pragma once
++
++// Velox fence completion table (VELOX_FENCE_SHARED=1, guest debug.velox.fence_shared=1).
++//
++// The host publishes, for fences submitted through an ASG context, "this fence (boxed handle)
++// reached VK_SUCCESS natively in reset epoch E" into a small table in the tail of that context's
++// ring storage (the third page, after the from_host_large_xfer ring header, which only uses its
++// first 2308 bytes). The guest may then answer vkGetFenceStatus / vkWaitForFences without a
++// round trip, but only when the slot names its fence and the epoch it expects (the number of
++// vkResetFences it issued for the fence). Everything else falls back to the RPC.
++//
++// Isolation: the table is written by the host and never read by it; the host's decisions use
++// its own state (FenceInfo, the watcher). A guest that scribbles over the table can only make
++// its own fence queries wrong. Only a native VK_SUCCESS observed by the host is published, so
++// CPU-side submission is never reported as GPU completion.
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#include <vulkan/vulkan.h>
++
++namespace gfxstream {
++
++// Defined in ring_stream.cpp (names the thread; role "fencewatch").
++void veloxPlaceCurrentThread(const char* role);
++
++// Layout shared with the guest (Mesa gfxstream AddressSpaceStream). Offsets are within the
++// 4 KiB page that holds the from_host_large_xfer ring header.
++constexpr uint32_t kVeloxFenceTableOffset = 2560;
++constexpr uint32_t kVeloxFenceTableMagic = 0x54465856;  // "VXFT"
++constexpr uint32_t kVeloxFenceTableVersion = 1;
++constexpr uint32_t kVeloxFenceTableSlots = 64;
++
++struct VeloxFenceTableHeader {
++    uint32_t magic;
++    uint32_t version;
++    uint32_t slots;
++    uint32_t reserved[13];
++};
++
++struct VeloxFenceSlot {
++    uint32_t seq;    // odd while the host rewrites the slot (seqlock)
++    uint32_t epoch;  // reset epoch of the completion
++    uint64_t handle; // boxed (guest-visible) fence handle, 0 = empty
++};
++
++static_assert(sizeof(VeloxFenceTableHeader) == 64, "layout");
++static_assert(sizeof(VeloxFenceSlot) == 16, "layout");
++static_assert(kVeloxFenceTableOffset + sizeof(VeloxFenceTableHeader) +
++                      kVeloxFenceTableSlots * sizeof(VeloxFenceSlot) <= 4096,
++              "the table must fit in the page");
++
++inline uint32_t veloxFenceSlotIndex(uint64_t handle) {
++    return static_cast<uint32_t>((handle * 0x9E3779B97F4A7C15ull) >> 58) &
++           (kVeloxFenceTableSlots - 1);
++}
++
++class VeloxFenceTable {
++   public:
++    // |page| is the guest-shared page (host mapping of guest RAM); the table lives at
++    // kVeloxFenceTableOffset. The constructor clears stale contents of a reused page first.
++    explicit VeloxFenceTable(uint8_t* page) : mBase(page + kVeloxFenceTableOffset) {
++        std::memset(mBase, 0, sizeof(VeloxFenceTableHeader) +
++                                  kVeloxFenceTableSlots * sizeof(VeloxFenceSlot));
++        auto* header = reinterpret_cast<VeloxFenceTableHeader*>(mBase);
++        header->version = kVeloxFenceTableVersion;
++        header->slots = kVeloxFenceTableSlots;
++        __atomic_store_n(&header->magic, kVeloxFenceTableMagic, __ATOMIC_RELEASE);
++    }
++
++    // The ring storage is freed with the ASG context; nothing is written after this.
++    void invalidate() {
++        std::lock_guard<std::mutex> lock(mMutex);
++        if (!mValid) return;
++        auto* header = reinterpret_cast<VeloxFenceTableHeader*>(mBase);
++        __atomic_store_n(&header->magic, 0u, __ATOMIC_RELEASE);
++        mValid = false;
++    }
++
++    void publish(uint64_t handle, uint32_t epoch) {
++        if (!handle) return;
++        std::lock_guard<std::mutex> lock(mMutex);
++        if (!mValid) return;
++        writeSlot(slot(handle), handle, epoch);
++        ++mPublished;
++    }
++
++    // Forget |handle| (reset or destroy) so that its old completion is never reused.
++    void clear(uint64_t handle) {
++        if (!handle) return;
++        std::lock_guard<std::mutex> lock(mMutex);
++        if (!mValid) return;
++        VeloxFenceSlot* s = slot(handle);
++        if (__atomic_load_n(&s->handle, __ATOMIC_RELAXED) == handle) writeSlot(s, 0, 0);
++    }
++
++    unsigned long long published() const { return mPublished; }
++
++   private:
++    VeloxFenceSlot* slot(uint64_t handle) {
++        return reinterpret_cast<VeloxFenceSlot*>(mBase + sizeof(VeloxFenceTableHeader)) +
++               veloxFenceSlotIndex(handle);
++    }
++
++    // Seqlock: only the host writes (under mMutex), so the counter is even between writes.
++    static void writeSlot(VeloxFenceSlot* s, uint64_t handle, uint32_t epoch) {
++        const uint32_t seq = __atomic_load_n(&s->seq, __ATOMIC_RELAXED) & ~1u;
++        __atomic_store_n(&s->seq, seq + 1, __ATOMIC_RELAXED);
++        __atomic_thread_fence(__ATOMIC_RELEASE);
++        __atomic_store_n(&s->handle, handle, __ATOMIC_RELAXED);
++        __atomic_store_n(&s->epoch, epoch, __ATOMIC_RELAXED);
++        __atomic_store_n(&s->seq, seq + 2, __ATOMIC_RELEASE);
++    }
++
++    std::mutex mMutex;
++    uint8_t* mBase;
++    bool mValid = true;
++    unsigned long long mPublished = 0;
++};
++
++// The table of the ASG context whose RenderThread is decoding on this thread (null for pipe
++// transports or when the feature is off).
++inline thread_local std::shared_ptr<VeloxFenceTable> tVeloxCurrentFenceTable;
++
++// Per-device thread that waits for submitted fences natively and publishes completions.
++// Fences are only waited on between add() and cancel(); cancel() returns once no native call
++// on the fence is in progress, so the caller may then reset or destroy it.
++class VeloxFenceWatcher {
++   public:
++    struct Entry {
++        VkFence fence;    // native
++        uint64_t boxed;   // guest-visible handle
++        uint32_t epoch;
++        std::shared_ptr<VeloxFenceTable> table;
++        std::chrono::steady_clock::time_point eligible{};  // set by add()
++    };
++
++    // A fence is waited on only once it has been pending for |delay| without anyone else
++    // observing its completion: a guest that waits for its fence right away (a synchronous
++    // frame) gets the answer from its own RPC, and the watcher then never touches the fence,
++    // so it adds no concurrent native wait and no cancel() wait to that path.
++    VeloxFenceWatcher(VkDevice device, PFN_vkWaitForFences wait, PFN_vkGetFenceStatus status,
++                      std::chrono::microseconds delay)
++        : mDevice(device), mWait(wait), mStatus(status), mDelay(delay), mThread([this] { run(); }) {}
++
++    ~VeloxFenceWatcher() { stop(); }
++
++    void stop() {
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            mStop = true;
++            mPending.clear();
++        }
++        mCv.notify_all();
++        if (mThread.joinable()) mThread.join();
++    }
++
++    // Never wakes the watcher: a submission must not pay for a thread wake-up. The watcher
++    // looks at the list every kPollPeriod while it is not empty.
++    void add(Entry entry) {
++        entry.eligible = std::chrono::steady_clock::now() + mDelay;
++        std::lock_guard<std::mutex> lock(mMutex);
++        if (mStop || mLost) return;
++        for (auto& e : mPending) {
++            if (e.fence == entry.fence) {
++                e = std::move(entry);
++                return;
++            }
++        }
++        mPending.push_back(std::move(entry));
++    }
++
++    // The host observed the fence's completion itself (and published it): stop watching it
++    // without waiting for a native call the watcher may have in progress.
++    void observed(VkFence fence) {
++        std::lock_guard<std::mutex> lock(mMutex);
++        for (size_t i = 0; i < mPending.size(); ++i) {
++            if (mPending[i].fence == fence) {
++                mPending.erase(mPending.begin() + i);
++                return;
++            }
++        }
++    }
++
++    void cancel(VkFence fence) {
++        std::unique_lock<std::mutex> lock(mMutex);
++        for (size_t i = 0; i < mPending.size(); ++i) {
++            if (mPending[i].fence == fence) {
++                mPending.erase(mPending.begin() + i);
++                break;
++            }
++        }
++        mCv.wait(lock, [&] {
++            for (VkFence f : mInWait) {
++                if (f == fence) return false;
++            }
++            return true;
++        });
++    }
++
++    unsigned long long completions() const { return mCompletions.load(std::memory_order_relaxed); }
++
++   private:
++    void run() {
++        setThreadName();
++        std::vector<VkFence> batch;
++        std::vector<VkFence> done;
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lock(mMutex);
++                for (;;) {
++                    if (mStop) return;
++                    const auto now = std::chrono::steady_clock::now();
++                    auto next = now + kPollPeriod;
++                    batch.clear();
++                    if (!mLost) {
++                        for (const auto& e : mPending) {
++                            if (e.eligible <= now) {
++                                if (batch.size() < 64) batch.push_back(e.fence);
++                            } else if (e.eligible < next) {
++                                next = e.eligible;
++                            }
++                        }
++                    }
++                    if (!batch.empty()) break;
++                    // Idle: sleep a period at a time (add() does not notify); stop() notifies.
++                    mCv.wait_until(lock, next);
++                }
++                mInWait = batch;
++            }
++            done.clear();
++            // Wait for any of them, in short slices so that cancel() and stop() are prompt.
++            VkResult result = mWait(mDevice, static_cast<uint32_t>(batch.size()), batch.data(),
++                                    VK_FALSE, 2000000ull);
++            bool lost = result == VK_ERROR_DEVICE_LOST;
++            if (result == VK_SUCCESS) {
++                for (VkFence f : batch) {
++                    const VkResult s = mStatus(mDevice, f);
++                    if (s == VK_SUCCESS) {
++                        done.push_back(f);
++                    } else if (s == VK_ERROR_DEVICE_LOST) {
++                        lost = true;
++                    }
++                }
++            }
++            {
++                std::lock_guard<std::mutex> lock(mMutex);
++                if (lost) {
++                    // Never publish after a device loss; the guest's RPCs report the loss.
++                    mLost = true;
++                    mPending.clear();
++                }
++                for (VkFence f : done) {
++                    for (size_t i = 0; i < mPending.size(); ++i) {
++                        if (mPending[i].fence != f) continue;
++                        mPending[i].table->publish(mPending[i].boxed, mPending[i].epoch);
++                        mCompletions.fetch_add(1, std::memory_order_relaxed);
++                        mPending.erase(mPending.begin() + i);
++                        break;
++                    }
++                }
++                mInWait.clear();
++            }
++            mCv.notify_all();
++            if (result != VK_SUCCESS && result != VK_TIMEOUT && !lost) {
++                // Unexpected error: back off instead of spinning on it.
++                std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            }
++        }
++    }
++
++    static void setThreadName() { veloxPlaceCurrentThread("fencewatch"); }
++
++    VkDevice mDevice;
++    PFN_vkWaitForFences mWait;
++    PFN_vkGetFenceStatus mStatus;
++    std::chrono::microseconds mDelay;
++    static constexpr std::chrono::microseconds kPollPeriod{250};
++    std::mutex mMutex;
++    std::condition_variable mCv;
++    std::vector<Entry> mPending;
++    std::vector<VkFence> mInWait;
++    bool mStop = false;
++    bool mLost = false;
++    std::atomic<unsigned long long> mCompletions{0};
++    std::thread mThread;
++};
++
++}  // namespace gfxstream
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index f46d7af..0f0a205 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ #include "vk_decoder_global_state.h"
+ #include "velox_trace.h"
++#include "velox_fence_shared.h"
+ 
+ #ifndef _WIN32
+ #include <unistd.h>
+@@ -4635,7 +4636,12 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
+-        return vk->vkGetFenceStatus(device, fence);
++        const VkResult result = vk->vkGetFenceStatus(device, fence);
++        if (result == VK_SUCCESS) {
++            std::lock_guard<std::mutex> lock(mMutex);
++            veloxPublishObservedLocked(fence);
++        }
++        return result;
+     }
+ 
+     VkResult on_vkWaitForFences(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+@@ -4645,7 +4651,13 @@ class VkDecoderGlobalState::Impl {
+         auto vk = dispatch_VkDevice(boxed_device);
+ 
+         // TODO(b/397501277): wait state checks cause test failures on old API levels
+-        return waitForFences(device, vk, fenceCount, pFences, waitAll, timeout, false);
++        const VkResult result =
++            waitForFences(device, vk, fenceCount, pFences, waitAll, timeout, false);
++        if (result == VK_SUCCESS && (waitAll || fenceCount == 1)) {
++            std::lock_guard<std::mutex> lock(mMutex);
++            for (uint32_t i = 0; i < fenceCount; ++i) veloxPublishObservedLocked(pFences[i]);
++        }
++        return result;
+     }
+ 
+     VkResult on_vkResetFences(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
+@@ -4671,6 +4683,8 @@ class VkDecoderGlobalState::Impl {
+                     continue;
+                 }
+                 FenceInfo& fenceInfo = fenceInfoIt->second;
++                veloxForgetFenceLocked(device, fence, fenceInfo);
++                ++fenceInfo.veloxEpoch;
+ 
+                 if (fenceInfo.latestUse) {
+                     if (!IsDone(*fenceInfo.latestUse)) {
+@@ -5196,6 +5210,42 @@ class VkDecoderGlobalState::Impl {
+         return DestroyFenceStatus::kDestroyed;
+     }
+ 
++    // Velox: stop watching |fence| (returns once no native call on it is in progress) and clear
++    // its published completion, before it is reset or destroyed.
++    void veloxForgetFenceLocked(VkDevice device, VkFence fence, FenceInfo& fenceInfo)
++        REQUIRES(mMutex) {
++        if (auto it = mVeloxFenceWatchers.find(device); it != mVeloxFenceWatchers.end()) {
++            it->second->cancel(fence);
++        }
++        if (fenceInfo.veloxTable) {
++            fenceInfo.veloxTable->clear(reinterpret_cast<uint64_t>(fenceInfo.boxed));
++        }
++    }
++
++    // Velox: publish a completion the host itself observed (VK_SUCCESS from the driver).
++    void veloxPublishObservedLocked(VkFence fence) REQUIRES(mMutex) {
++        auto* fenceInfo = gfxstream::base::find(mFenceInfo, fence);
++        if (fenceInfo && fenceInfo->veloxTable && !fenceInfo->external) {
++            fenceInfo->veloxTable->publish(reinterpret_cast<uint64_t>(fenceInfo->boxed),
++                                           fenceInfo->veloxEpoch);
++            if (auto it = mVeloxFenceWatchers.find(fenceInfo->device);
++                it != mVeloxFenceWatchers.end()) {
++                it->second->observed(fence);
++            }
++        }
++    }
++
++    static std::chrono::microseconds veloxFenceWatchDelay() {
++        static const std::chrono::microseconds delay = [] {
++            const char* value = std::getenv("VELOX_FENCE_WATCH_DELAY_US");
++            long us = value && *value ? std::strtol(value, nullptr, 10) : 100;
++            if (us < 0) us = 0;
++            if (us > 100000) us = 100000;
++            return std::chrono::microseconds(us);
++        }();
++        return delay;
++    }
++
+     void destroyFenceLocked(VkDevice device, VulkanDispatch* deviceDispatch, VkFence fence,
+                             bool allowExternalFenceRecycling) REQUIRES(mMutex) {
+         auto fenceInfoIt = mFenceInfo.find(fence);
+@@ -5204,6 +5254,7 @@ class VkDecoderGlobalState::Impl {
+             return;
+         }
+         auto& fenceInfo = fenceInfoIt->second;
++        veloxForgetFenceLocked(device, fence, fenceInfo);
+ 
+         auto deviceInfoIt = mDeviceInfo.find(device);
+         if (deviceInfoIt == mDeviceInfo.end()) {
+@@ -8563,6 +8614,23 @@ class VkDecoderGlobalState::Impl {
+ 
+         {
+             std::lock_guard<std::mutex> lock(mMutex);
++            // Velox: watch the application's fence and publish its native completion into the
++            // submitting context's table (VELOX_FENCE_SHARED=1).
++            if (fence != VK_NULL_HANDLE && tVeloxCurrentFenceTable) {
++                auto* fenceInfo = gfxstream::base::find(mFenceInfo, fence);
++                if (fenceInfo && !fenceInfo->external && fenceInfo->vk &&
++                    fenceInfo->vk->vkWaitForFences && fenceInfo->vk->vkGetFenceStatus) {
++                    fenceInfo->veloxTable = tVeloxCurrentFenceTable;
++                    auto& watcher = mVeloxFenceWatchers[device];
++                    if (!watcher) {
++                        watcher = std::make_unique<VeloxFenceWatcher>(
++                            device, fenceInfo->vk->vkWaitForFences,
++                            fenceInfo->vk->vkGetFenceStatus, veloxFenceWatchDelay());
++                    }
++                    watcher->add({fence, reinterpret_cast<uint64_t>(fenceInfo->boxed),
++                                  fenceInfo->veloxEpoch, fenceInfo->veloxTable});
++                }
++            }
+             // Update image layouts
+             for (uint32_t i = 0; i < submitCount; i++) {
+                 for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
+@@ -11828,6 +11896,12 @@ class VkDecoderGlobalState::Impl {
+ 
+     void extractDeviceAndDependenciesLocked(VkDevice device,
+                                             InstanceObjects::DeviceObjects& deviceObjects) REQUIRES(mMutex) {
++        // Velox: no native fence call of the watcher may outlive the device's fences. The
++        // watcher never takes mMutex, and it waits in short slices, so this returns promptly.
++        if (auto it = mVeloxFenceWatchers.find(device); it != mVeloxFenceWatchers.end()) {
++            it->second->stop();
++            mVeloxFenceWatchers.erase(it);
++        }
+         extractInfosWithDeviceInto(device, mBufferInfo, deviceObjects.buffers);
+         extractInfosWithDeviceInto(device, mCommandBufferInfo, deviceObjects.commandBuffers);
+         extractInfosWithDeviceInto(device, mCommandPoolInfo, deviceObjects.commandPools);
+@@ -12275,6 +12349,10 @@ class VkDecoderGlobalState::Impl {
+         mDescriptorUpdateTemplateInfo GUARDED_BY(mMutex);
+     std::unordered_map<VkDeviceMemory, MemoryInfo> mMemoryInfo GUARDED_BY(mMutex);
+     std::unordered_map<VkFence, FenceInfo> mFenceInfo GUARDED_BY(mMutex);
++    // Velox fence completion watchers, one per device that submitted a fence from a context
++    // with a fence table (VELOX_FENCE_SHARED=1).
++    std::unordered_map<VkDevice, std::unique_ptr<VeloxFenceWatcher>> mVeloxFenceWatchers
++        GUARDED_BY(mMutex);
+     std::unordered_map<VkFramebuffer, FramebufferInfo> mFramebufferInfo GUARDED_BY(mMutex);
+     std::unordered_map<VkImage, ImageInfo> mImageInfo GUARDED_BY(mMutex);
+     std::unordered_map<VkImageView, ImageViewInfo> mImageViewInfo GUARDED_BY(mMutex);
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 2d05ed1..2051a8d 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -14,6 +14,7 @@
+ 
+ #pragma once
+ 
++#include "velox_fence_shared.h"
+ #include <vulkan/vulkan.h>
+ 
+ #ifdef __ANDROID__
+@@ -428,6 +429,11 @@ struct FenceInfo {
+     // upon before destruction (e.g. as part of a vkAcquireImageANDROID() call),
+     // the waitable that tracking that host operation.
+     std::optional<DeviceOpWaitable> latestUse;
++
++    // Velox fence completion table (velox_fence_shared.h): number of vkResetFences processed
++    // for this fence, and the table its completions are published to (set at submission).
++    uint32_t veloxEpoch = 0;
++    std::shared_ptr<gfxstream::VeloxFenceTable> veloxTable;
+ };
+ 
+ struct SemaphoreInfo {
+-- 
+2.50.1.windows.1
+

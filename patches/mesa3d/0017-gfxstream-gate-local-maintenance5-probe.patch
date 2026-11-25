@@ -1,0 +1,24 @@
+Subject: gfxstream: gate a local maintenance5 probe
+
+Generated-by: LLM
+biblioklept
+
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 75c3090..9755a2f 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1988,6 +1988,14 @@ VkResult ResourceTracker::on_vkEnumerateDeviceExtensionProperties(
+         }
+     }
+
++#ifdef __ANDROID__
++    char maintenance5[PROP_VALUE_MAX];
++    if (__system_property_get("debug.velox.maintenance5", maintenance5) == 1 && maintenance5[0] == '1') {
++        int index = getHostDeviceExtensionIndex(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
++        if (index != -1) filteredExts.push_back(mHostDeviceExtensions[index]);
++    }
++#endif
++
+     VkExtensionProperties anbExtProps[] = {
+ #ifdef VK_USE_PLATFORM_ANDROID_KHR
+         {"VK_ANDROID_native_buffer", 7},

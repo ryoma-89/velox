@@ -1,0 +1,38 @@
+name: Velox CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Security: Public CI runs exclusively on GitHub-hosted runners.
+# Never attach personal/maintainer PCs as self-hosted runners for untrusted PRs.
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Test, Validate & Audit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Code quality syntax check
+        run: python -m compileall -q velox scripts tests
+
+      - name: Run Python unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Audit secrets, PII, prohibited files, patches, configs, licenses, and doc links
+        run: python scripts/audit_public_release.py --mode public --root .

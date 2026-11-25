@@ -1,0 +1,273 @@
+From d13f7944866170261539cc8a968df013daecd127 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:22:17 +0900
+Subject: [PATCH] velox: harden ASG prefetch lifecycle, lazy-start thread, and
+ join under graphicsDriverLock (patch 0022)
+
+Protect mPrefetchThread creation/stop/join with mPrefetchLifecycleMutex (never joining while holding the mutex), lazily launch the prefetch thread for AHEAD>=2 only on the first large view so idle/small-command contexts do not spawn or wake threads every 2 ms, stop the 2 ms idle polling in AHEAD=2, and perform OS thread exit/join under graphicsDriverLock() in RenderThread::sendExitSignal() so DLL_THREAD_DETACH never races with vkDestroyDevice.
+
+Change-Id: I5f8c3a92d1b4e706c2a19d84f73b0e2a6d4c9102
+---
+ host/render_thread.cpp |   9 +++-
+ host/ring_stream.cpp   | 105 ++++++++++++++++++++++++++++++++++++-----
+ host/ring_stream.h     |  22 +++++++--
+ 3 files changed, 116 insertions(+), 20 deletions(-)
+
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index 7f7a434..15c38b8 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -274,8 +274,9 @@ void RenderThread::waitForFinished() {
+     if (mRingStream) {
+         mRingStream->requestExit();
+         mRingStream->invalidateFenceTable();
+-        // Velox VELOX_ASG_PREFETCH: the ASG context has already woken a reader sleeping in
+-        // onUnavailableRead, and its rings stay mapped until this returns.
++        // Velox VELOX_ASG_PREFETCH: stop the prefetch loop so it stops accessing the ASG rings
++        // while they are still mapped. Actual OS thread exit/join happens in sendExitSignal()
++        // under graphicsDriverLock() so DLL_THREAD_DETACH never races with vkDestroyDevice.
+         mRingStream->stopPrefetch(true);
+     }
+     AutoLock lock(mLock);
+@@ -292,6 +293,10 @@ void RenderThread::sendExitSignal() {
+     mDecodersShouldStop.store(true, std::memory_order_relaxed);
+     mCanExit.store(true, std::memory_order_relaxed);
+     mExitSignal.broadcastAndUnlock(&lock);
++    // Callers hold graphicsDriverLock() here; let the prefetch thread exit and join under it.
++    if (mRingStream) {
++        mRingStream->exitAndJoinPrefetch();
++    }
+ }
+ 
+ void RenderThread::addressSpaceGraphicsReloadRingConfig() {
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 5ad0dff..72a9835 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -22,8 +22,10 @@
+ #include <memory.h>
+ 
+ #include "gfxstream/host/dma_device.h"
++#include "gfxstream/host/graphics_driver_lock.h"
+ #include "gfxstream/common/logging.h"
+ #include "gfxstream/host/stream_utils.h"
++#include "gfxstream/synchronization/Lock.h"
+ #include "gfxstream/system/System.h"
+ #include "render-utils/dma_device.h"
+ #include "render-utils/stream.h"
+@@ -347,6 +349,11 @@ void RingStream::writeTrace() {
+ RingStream::~RingStream() {
+     invalidateFenceTable();
+     stopPrefetch(true);
++    if (hasJoinablePrefetchThread()) {
++        // Fallback when destroyed without going through RenderThread::sendExitSignal().
++        gfxstream::base::AutoLock driverLock(*gfxstream::host::graphicsDriverLock());
++        exitAndJoinPrefetch();
++    }
+     writeTrace();
+     if (mProfileTransfers && mXmits) {
+         GFXSTREAM_INFO("VELOX_ASG_RX duplex=%d reads=%zu bytes=%zu type1=%llu type3_reads=%llu "
+@@ -818,6 +825,11 @@ void RingStream::consumerBusy(size_t viewSize) {
+         return;
+     }
+     ++mPrefetchGateOpens;
++    // Lazy thread start for AHEAD >= 2: contexts that never stream large batches (e.g. control
++    // pipes or short-lived device threads) never spawn a prefetch thread at all.
++    if (mPrefetchAhead >= 2) {
++        ensurePrefetchThread();
++    }
+     mConsumerBusy.store(true, std::memory_order_seq_cst);
+     if (mPrefetchAhead >= 2 && mProducerWaiting.load(std::memory_order_seq_cst)) {
+         std::lock_guard<std::mutex> lock(mPrefetchMutex);
+@@ -830,7 +842,10 @@ void RingStream::consumerBusy(size_t viewSize) {
+ // RenderThread does not copy the rest of the packet itself. Gives up (and takes over) when the
+ // prefetch thread starts to poll, the stream cools or the wait budget runs out.
+ bool RingStream::waitForInflightPacket(uint64_t pos, size_t minSize) {
+-    if (mPrefetchAhead != 3 || !mPrefetchWaitNs || !mPrefetchThread.joinable()) return false;
++    if (mPrefetchAhead != 3 || !mPrefetchWaitNs ||
++        !mPrefetchThreadLaunched.load(std::memory_order_acquire)) {
++        return false;
++    }
+     if (mProducerPolling.load(std::memory_order_acquire)) return false;
+     const uint64_t start = monotonicNs();
+     if (start >= mHotUntilNs.load(std::memory_order_relaxed)) return false;
+@@ -867,6 +882,20 @@ void RingStream::wakePrefetchWaiters() {
+     mProducerCv.notify_all();
+ }
+ 
++void RingStream::ensurePrefetchThread() {
++    if (!mPrefetchAhead || mPrefetchThreadLaunched.load(std::memory_order_acquire)) return;
++    std::lock_guard<std::mutex> lock(mPrefetchLifecycleMutex);
++    if (mPrefetchThreadStarted || prefetchStopping()) return;
++    mPrefetchThreadStarted = true;
++    mPrefetchLoopDone = false;
++    mPrefetchCanExit = false;
++    mPrefetchThread = std::thread([this] {
++        veloxPlaceCurrentThread("prefetch");
++        prefetchMain();
++    });
++    mPrefetchThreadLaunched.store(true, std::memory_order_release);
++}
++
+ bool RingStream::startPrefetch() {
+     if (mPrefetchStarted) return true;
+     if (prefetchStopping()) return false;
+@@ -883,22 +912,50 @@ bool RingStream::startPrefetch() {
+         mTrace.reset(new (std::nothrow) TraceEvent[events]);
+         if (mTrace) mTraceCapacity = events;
+     }
+-    if (mPrefetchAhead) {
+-        mPrefetchThread = std::thread([this] {
+-            veloxPlaceCurrentThread("prefetch");
+-            prefetchMain();
+-        });
++    // AHEAD=1 always prefetches; AHEAD>=2 launches the thread lazily on the first large view.
++    if (mPrefetchAhead == 1) {
++        ensurePrefetchThread();
+     }
+     return true;
+ }
+ 
+-void RingStream::stopPrefetch(bool join) {
++void RingStream::stopPrefetch(bool waitLoop) {
++    if (!mPrefetchWanted) return;
++    mPrefetchStop.store(true, std::memory_order_release);
++    wakePrefetchWaiters();
++    if (!waitLoop) return;
++    std::unique_lock<std::mutex> lock(mPrefetchLifecycleMutex);
++    if (!mPrefetchThreadStarted) return;
++    if (mPrefetchThread.joinable() &&
++        mPrefetchThread.get_id() == std::this_thread::get_id()) {
++        return;
++    }
++    mPrefetchLifecycleCv.wait(lock, [this] { return mPrefetchLoopDone; });
++}
++
++bool RingStream::hasJoinablePrefetchThread() {
++    if (!mPrefetchWanted) return false;
++    std::lock_guard<std::mutex> lock(mPrefetchLifecycleMutex);
++    return mPrefetchThread.joinable();
++}
++
++void RingStream::exitAndJoinPrefetch() {
+     if (!mPrefetchWanted) return;
+     mPrefetchStop.store(true, std::memory_order_release);
+     wakePrefetchWaiters();
+-    if (join && mPrefetchThread.joinable() &&
+-        mPrefetchThread.get_id() != std::this_thread::get_id()) {
+-        mPrefetchThread.join();
++    std::thread toJoin;
++    {
++        std::lock_guard<std::mutex> lock(mPrefetchLifecycleMutex);
++        mPrefetchCanExit = true;
++        mPrefetchLifecycleCv.notify_all();
++        if (mPrefetchThread.joinable() &&
++            mPrefetchThread.get_id() != std::this_thread::get_id()) {
++            toJoin = std::move(mPrefetchThread);
++        }
++    }
++    // Never hold mPrefetchLifecycleMutex while joining.
++    if (toJoin.joinable()) {
++        toJoin.join();
+     }
+ }
+ 
+@@ -1028,8 +1085,20 @@ void RingStream::prefetchIdle(bool* sleeping) {
+         *sleeping = true;
+         std::unique_lock<std::mutex> lock(mPrefetchMutex);
+         mProducerWaiting.store(true, std::memory_order_seq_cst);
+-        if (producerShouldYield() || mInSnapshotOperation.load(std::memory_order_seq_cst)) {
+-            mProducerCv.wait_for(lock, std::chrono::milliseconds(2));
++        if (!prefetchStopping() &&
++            (producerShouldYield() || mInSnapshotOperation.load(std::memory_order_seq_cst))) {
++            if (mPrefetchAhead == 2 && !mInSnapshotOperation.load(std::memory_order_seq_cst)) {
++                // With AHEAD=2, consumerBusy() and wakePrefetchWaiters() notify mProducerCv
++                // under mPrefetchMutex after setting mConsumerBusy/mPrefetchStop with seq_cst,
++                // so sleeping without a 2 ms timer avoids thousands of idle wake-ups/sec.
++                mProducerCv.wait(lock, [this] {
++                    return prefetchStopping() ||
++                           (!producerShouldYield() &&
++                            !mInSnapshotOperation.load(std::memory_order_acquire));
++                });
++            } else {
++                mProducerCv.wait_for(lock, std::chrono::milliseconds(2));
++            }
+         }
+         mProducerWaiting.store(false, std::memory_order_relaxed);
+     }
+@@ -1054,7 +1123,9 @@ void RingStream::prefetchMain() {
+             if (mPrefetchChunks.size() >= mPrefetchMaxChunks) {
+                 ++mPrefetchProducerStalls;
+                 mProducerWaiting.store(true, std::memory_order_seq_cst);
+-                mProducerCv.wait_for(lock, std::chrono::milliseconds(2));
++                if (!prefetchStopping()) {
++                    mProducerCv.wait_for(lock, std::chrono::milliseconds(2));
++                }
+                 mProducerWaiting.store(false, std::memory_order_relaxed);
+                 continue;
+             }
+@@ -1073,6 +1144,14 @@ void RingStream::prefetchMain() {
+         }
+     }
+     exitRequested();  // publishes ASG_HOST_STATE_EXIT if that is why the loop ended
++    // Signal that no more ASG ring accesses will occur, then wait until exitAndJoinPrefetch()
++    // permits OS thread teardown under graphicsDriverLock().
++    {
++        std::unique_lock<std::mutex> lock(mPrefetchLifecycleMutex);
++        mPrefetchLoopDone = true;
++        mPrefetchLifecycleCv.notify_all();
++        mPrefetchLifecycleCv.wait(lock, [this] { return mPrefetchCanExit; });
++    }
+ }
+ 
+ RingStream::PrefetchChunk* RingStream::consumerChunkFor(uint64_t pos) {
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index fd6643d..84d60c1 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -74,9 +74,14 @@ class RingStream final : public IOStream {
+     // |unconsumed| is how many bytes at the end of the previous view were not consumed.
+     // Blocks until the view holds at least |minSize| bytes. nullptr on exit or snapshot.
+     const unsigned char* acquirePrefetched(size_t unconsumed, size_t minSize, size_t* outLen);
+-    // Stops the prefetch thread; |join| waits for it (teardown only: the ASG context must
+-    // already have woken a thread sleeping in onUnavailableRead).
+-    void stopPrefetch(bool join);
++    // Stops the prefetch loop; when |waitLoop| is true, waits until the prefetch thread has
++    // stopped touching the ASG rings (the ASG context must already have woken a reader sleeping
++    // in onUnavailableRead), without terminating the OS thread yet.
++    void stopPrefetch(bool waitLoop);
++    // Allows the prefetch thread to exit and joins it. Must be called under graphicsDriverLock()
++    // so OS thread teardown (DllMain DLL_THREAD_DETACH on Windows) never races with vkDestroyDevice.
++    void exitAndJoinPrefetch();
++    bool hasJoinablePrefetchThread();
+ 
+     // Velox fence completion table (VELOX_FENCE_SHARED=1), see vulkan/velox_fence_shared.h.
+     // Null when off or after a snapshot load. invalidateFenceTable() is called before the ASG
+@@ -149,6 +154,7 @@ class RingStream final : public IOStream {
+         std::atomic<bool> sealed{false};     // no more bytes; the next chunk exists
+     };
+     bool startPrefetch();
++    void ensurePrefetchThread();
+     void prefetchMain();
+     void prefetchIdle(bool* sleeping);
+     int pumpPrefetch(bool producer);
+@@ -200,8 +206,14 @@ class RingStream final : public IOStream {
+     size_t mPrefetchMinView = 0;
+     std::atomic<bool> mConsumerBusy{false};
+     bool mLoadedFromSnapshot = false;
+-    bool mPrefetchStarted = false;  // RenderThread only
+-    std::thread mPrefetchThread;
++    bool mPrefetchStarted = false;  // RenderThread only (chunk init)
++    std::mutex mPrefetchLifecycleMutex;
++    std::condition_variable mPrefetchLifecycleCv;
++    bool mPrefetchThreadStarted = false;  // guarded by mPrefetchLifecycleMutex
++    bool mPrefetchLoopDone = false;       // guarded by mPrefetchLifecycleMutex
++    bool mPrefetchCanExit = false;        // guarded by mPrefetchLifecycleMutex
++    std::atomic<bool> mPrefetchThreadLaunched{false};
++    std::thread mPrefetchThread;          // guarded by mPrefetchLifecycleMutex
+     std::atomic<bool> mPrefetchStop{false};
+     std::atomic<bool> mConsumerWantsRing{false};
+     std::atomic<bool> mProducerWaiting{false};
+-- 
+2.50.1.windows.1
+

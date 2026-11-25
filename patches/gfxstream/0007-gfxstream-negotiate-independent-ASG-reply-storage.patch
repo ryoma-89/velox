@@ -1,0 +1,335 @@
+From 1919e10d4fe9b33c02f2f483a9e756edc66eac6f Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:44:29 +0900
+Subject: [PATCH] gfxstream: negotiate independent ASG reply storage
+
+Generated-by: LLM
+Change-Id: I7b6b0ab1c2e0ea2801755afc9058f5097c3cfe7b
+---
+ host/address_space/address_space_graphics.cpp |   6 +
+ host/renderer_impl.cpp                        |   5 +-
+ host/ring_stream.cpp                          | 149 ++++++++++++++----
+ host/ring_stream.h                            |  10 ++
+ 4 files changed, 136 insertions(+), 34 deletions(-)
+
+diff --git a/host/address_space/address_space_graphics.cpp b/host/address_space/address_space_graphics.cpp
+index d34f260..c092db8 100644
+--- a/host/address_space/address_space_graphics.cpp
++++ b/host/address_space/address_space_graphics.cpp
+@@ -608,6 +608,11 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
+         };
+         mCurrentConsumer = mConsumerInterface.create(consumerCreateInfo, nullptr);
+ 
++        if (!mCurrentConsumer) {
++            info->size = UINT64_MAX;
++            info->metadata = UINT64_MAX;
++            break;
++        }
+         if (mVirtioGpuInfo) {
+             info->metadata = mCombinedAllocation.hostmemId;
+         }
+@@ -774,6 +779,7 @@ bool AddressSpaceGraphicsContext::load(gfxstream::Stream* stream) {
+         };
+         mCurrentConsumer = mConsumerInterface.create(consumerCreateInfo, stream);
+ 
++        if (!mCurrentConsumer) return false;
+         mConsumerInterface.postLoad(mCurrentConsumer);
+     }
+ 
+diff --git a/host/renderer_impl.cpp b/host/renderer_impl.cpp
+index 0d37d6f..950ca96 100644
+--- a/host/renderer_impl.cpp
++++ b/host/renderer_impl.cpp
+@@ -222,7 +222,10 @@ void RendererImpl::removeListener(FrameBufferChangeEventListener* listener) {
+ void* RendererImpl::addressSpaceGraphicsConsumerCreate(
+         const AsgConsumerCreateInfo& info, gfxstream::Stream* loadStream) {
+     auto thread = new RenderThread(info, loadStream);
+-    thread->start();
++    if (!thread->start()) {
++        delete thread;
++        return nullptr;
++    }
+     std::lock_guard<std::mutex> lock(mAddressSpaceRenderThreadMutex);
+     mAddressSpaceRenderThreads.emplace(thread);
+     return (void*)thread;
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 0a5779e..da7693c 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -28,16 +28,34 @@
+ namespace gfxstream {
+ namespace {
+ 
++constexpr uint32_t kAsgDuplexVersion = 0x564c0002;
++
++bool supportsDuplex(const AsgConsumerCreateInfo& info) {
++    return info.version == kAsgDuplexVersion && info.buffer_size >= 2 * kAsgPageSize &&
++           !(info.buffer_size & (info.buffer_size - 1)) && info.buffer_flush_interval &&
++           (info.buffer_size / 2) % info.buffer_flush_interval == 0;
++}
++
+ struct asg_context CreateContext(const AsgConsumerCreateInfo& info) {
+-    struct asg_context context = asg_context_create(info.ring_storage, info.buffer, info.buffer_size);
++    const bool duplex = supportsDuplex(info);
++    const uint32_t commandSize = duplex ? info.buffer_size / 2 : info.buffer_size;
++    struct asg_context context = asg_context_create(info.ring_storage, info.buffer, commandSize);
++    if (duplex) {
++        ring_buffer_init_view_only(&context.from_host_large_xfer.view,
++                                   reinterpret_cast<uint8_t*>(info.buffer + commandSize), commandSize);
++    }
+ 
+-    context.ring_config->buffer_size = info.buffer_size;
++    context.ring_config->buffer_size = commandSize;
+     context.ring_config->flush_interval = info.buffer_flush_interval;
+     context.ring_config->host_consumed_pos = 0;
+     context.ring_config->guest_write_pos = 0;
+     context.ring_config->transfer_mode = 1;
+     context.ring_config->transfer_size = 0;
+     context.ring_config->in_error = 0;
++    // A QEMU with a legacy renderer can still provide a duplex-sized mapping.
++    // Guests switch views only after the renderer explicitly acknowledges it.
++    __atomic_store_n(&context.from_host_large_xfer.ring->config[0],
++                     duplex ? kAsgDuplexVersion : 0, __ATOMIC_RELEASE);
+ 
+     return context;
+ }
+@@ -94,7 +112,8 @@ RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
+     mContext(CreateContext(info)),
+     mSavedRingConfig(*mContext.ring_config),
+     mCallbacks(info.callbacks),
+-    mBufSize(info.buffer_size) {}
++    mBufSize(info.buffer_size),
++    mDuplex(supportsDuplex(info)) {}
+ 
+ RingStream::~RingStream() = default;
+ 
+@@ -124,22 +143,45 @@ void* RingStream::allocBuffer(size_t minSize) {
+     return mWriteBuffer.data();
+ }
+ 
++uint32_t RingStream::availableReplyBytes() {
++    const auto& reply = mContext.from_host_large_xfer;
++    if (!mDuplex) return ring_buffer_available_write(reply.ring, &reply.view);
++
++    const uint32_t retired = __atomic_load_n(&reply.ring->read_pos, __ATOMIC_ACQUIRE);
++    const uint32_t outstanding = mReplyProduced - mReplyConsumed;
++    if (retired - mReplyConsumed > outstanding || outstanding >= reply.view.size) {
++        protocolError();
++        return 0;
++    }
++    mReplyConsumed = retired;
++    return reply.view.size - 1 - (mReplyProduced - mReplyConsumed);
++}
++
++bool RingStream::writeReply(const uint8_t* data, uint32_t size) {
++    auto& reply = mContext.from_host_large_xfer;
++    if (!mDuplex) return ring_buffer_view_write(reply.ring, &reply.view, data, size, 1) == 1;
++
++    const uint32_t offset = mReplyProduced & reply.view.mask;
++    const uint32_t first = std::min(size, reply.view.size - offset);
++    memcpy(reply.view.buf + offset, data, first);
++    if (first < size) memcpy(reply.view.buf, data + first, size - first);
++    mReplyProduced += size;
++    __atomic_store_n(&reply.ring->write_pos, mReplyProduced, __ATOMIC_RELEASE);
++    return true;
++}
++
+ int RingStream::commitBuffer(size_t size) {
+     size_t sent = 0;
+-    auto data = mWriteBuffer.data();
++    const auto* data = reinterpret_cast<const uint8_t*>(mWriteBuffer.data());
+ 
+     unsigned idlePolls = 0;
+     constexpr unsigned kSpinLimit = 128;
+     while (sent < size) {
+         if (exitRequested()) return sent;
+-        auto avail = ring_buffer_available_write(
+-            mContext.from_host_large_xfer.ring,
+-            &mContext.from_host_large_xfer.view);
+-
+-        auto todo = std::min<size_t>(size - sent, avail);
+-        if (todo && ring_buffer_view_write(mContext.from_host_large_xfer.ring,
+-                                          &mContext.from_host_large_xfer.view,
+-                                          data + sent, todo, 1) == 1) {
++        const auto avail = availableReplyBytes();
++
++        const uint32_t todo = std::min<size_t>(size - sent, avail);
++        if (todo && writeReply(data + sent, todo)) {
+             sent += todo;
+             idlePolls = 0;
+             continue;
+@@ -155,6 +197,19 @@ int RingStream::commitBuffer(size_t size) {
+     return sent;
+ }
+ 
++uint32_t RingStream::availableCommandBytes(const ring_buffer* ring, const ring_buffer_view* view,
++                                           uint32_t consumed) {
++    if (!mDuplex) return ring_buffer_available_read(ring, view);
++
++    const uint32_t produced = __atomic_load_n(&ring->write_pos, __ATOMIC_ACQUIRE);
++    const uint32_t available = produced - consumed;
++    if (available >= (view ? view->size : RING_BUFFER_SIZE)) {
++        protocolError();
++        return 0;
++    }
++    return available;
++}
++
+ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+     size_t wanted = *inout_len;
+     size_t count = 0U;
+@@ -192,12 +247,12 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+         if (exitRequested()) return nullptr;
+         __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_RELEASE);
+ 
+-        ringAvailable =
+-            ring_buffer_available_read(mContext.to_host, 0);
++        ringAvailable = availableCommandBytes(mContext.to_host, nullptr, mCommandConsumed);
+         ringLargeXferAvailable =
+-            ring_buffer_available_read(
+-                mContext.to_host_large_xfer.ring,
+-                &mContext.to_host_large_xfer.view);
++            availableCommandBytes(mContext.to_host_large_xfer.ring,
++                                  &mContext.to_host_large_xfer.view, mUploadConsumed);
++        if (mDuplex && ringAvailable && ringLargeXferAvailable) protocolError();
++        if (exitRequested()) return nullptr;
+ 
+         auto current = dst + count;
+         auto ptrEnd = dst + wanted;
+@@ -221,13 +276,17 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+                 inLargeXfer = false;
+             }
+         } else {
+-            if (inLargeXfer && 0 != __atomic_load_n(&mContext.ring_config->transfer_size, __ATOMIC_ACQUIRE)) {
++            if (!mDuplex && inLargeXfer &&
++                __atomic_load_n(&mContext.ring_config->transfer_size, __ATOMIC_ACQUIRE)) {
++                if (spins < maxSpins) {
++                    ++spins;
++                    ring_buffer_yield();
++                } else {
++                    gfxstream::base::sleepUs(10);
++                }
+                 continue;
+             }
+-
+-            if (inLargeXfer && 0 == __atomic_load_n(&mContext.ring_config->transfer_size, __ATOMIC_ACQUIRE)) {
+-                inLargeXfer = false;
+-            }
++            inLargeXfer = false;
+ 
+             if (++spins < maxSpins) {
+                 ring_buffer_yield();
+@@ -253,13 +312,14 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+                 // video stream that stops updating with ASG). Store the state, fence, then look at
+                 // the rings again (the guest does the mirror image: store ring, fence, load state).
+                 __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-                if (ring_buffer_available_read(mContext.to_host, 0) ||
+-                    ring_buffer_available_read(mContext.to_host_large_xfer.ring,
+-                                               &mContext.to_host_large_xfer.view)) {
++                if (availableCommandBytes(mContext.to_host, nullptr, mCommandConsumed) ||
++                    availableCommandBytes(mContext.to_host_large_xfer.ring,
++                                          &mContext.to_host_large_xfer.view, mUploadConsumed)) {
+                     __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME,
+                                      __ATOMIC_SEQ_CST);
+                     continue;
+                 }
++                if (exitRequested()) return nullptr;
+ 
+                 bool sleeping = false;
+                 do {
+@@ -305,10 +365,18 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+ 
+ void RingStream::type1Read(size_t* count, char* current, const char* ptrEnd) {
+     asg_type1_xfer xfer{};
+-    ring_buffer_copy_contents(mContext.to_host, nullptr, sizeof(xfer),
+-                              reinterpret_cast<uint8_t*>(&xfer));
++    if (mDuplex) {
++        static_assert(RING_BUFFER_SIZE % sizeof(xfer) == 0);
++        memcpy(&xfer, mContext.to_host->buf + (mCommandConsumed & (RING_BUFFER_SIZE - 1)),
++               sizeof(xfer));
++    } else {
++        ring_buffer_copy_contents(mContext.to_host, nullptr, sizeof(xfer),
++                                  reinterpret_cast<uint8_t*>(&xfer));
++    }
+     const uint32_t bufferSize = mContext.buffer_size;
+-    if (!xfer.size || xfer.offset >= bufferSize || xfer.size > bufferSize - xfer.offset) {
++    const uint32_t step = mSavedRingConfig.flush_interval;
++    if (!xfer.size || xfer.offset >= bufferSize || xfer.size > bufferSize - xfer.offset ||
++        (mDuplex && (xfer.offset != mNextCommandOffset || xfer.size > step))) {
+         GFXSTREAM_ERROR("Invalid ASG type1 transfer: offset %u, size %u, buffer size %u",
+                         xfer.offset, xfer.size, bufferSize);
+         protocolError();
+@@ -324,7 +392,11 @@ void RingStream::type1Read(size_t* count, char* current, const char* ptrEnd) {
+         memcpy(current, src, xfer.size);
+         *count += xfer.size;
+     }
+-    if (ring_buffer_advance_read(mContext.to_host, sizeof(xfer), 1) != 1) {
++    if (mDuplex) {
++        mNextCommandOffset = (mNextCommandOffset + step) & (bufferSize - 1);
++        mCommandConsumed += sizeof(xfer);
++        __atomic_store_n(&mContext.to_host->read_pos, mCommandConsumed, __ATOMIC_RELEASE);
++    } else if (ring_buffer_advance_read(mContext.to_host, sizeof(xfer), 1) != 1) {
+         protocolError();
+         return;
+     }
+@@ -343,14 +415,25 @@ void RingStream::type3Read(
+     // Update the remaining byte count before advancing read_pos, which can
+     // let the guest start its next transfer. A corrupt cursor must never
+     // make the renderer block in a second wait that teardown cannot cancel.
+-    if (!readSize || !__atomic_compare_exchange_n(transferSize, &xferTotal, xferTotal - readSize,
+-                                                false, __ATOMIC_RELEASE, __ATOMIC_RELAXED) ||
+-        ring_buffer_view_read(mContext.to_host_large_xfer.ring, &mContext.to_host_large_xfer.view,
+-                              current, readSize, 1) != 1) {
++    if (!readSize || (mDuplex && available > xferTotal) ||
++        !__atomic_compare_exchange_n(transferSize, &xferTotal, xferTotal - readSize,
++                                                false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+         protocolError();
+         return;
+     }
+ 
++    auto& upload = mContext.to_host_large_xfer;
++    if (mDuplex) {
++        const uint32_t offset = mUploadConsumed & upload.view.mask;
++        const uint32_t first = std::min(readSize, upload.view.size - offset);
++        memcpy(current, upload.view.buf + offset, first);
++        if (first < readSize) memcpy(current + first, upload.view.buf, readSize - first);
++        mUploadConsumed += readSize;
++        __atomic_store_n(&upload.ring->read_pos, mUploadConsumed, __ATOMIC_RELEASE);
++    } else if (ring_buffer_view_read(upload.ring, &upload.view, current, readSize, 1) != 1) {
++        protocolError();
++        return;
++    }
+     *count += readSize;
+ }
+ 
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index e0fd4b9..91d816b 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -59,6 +59,10 @@ class RingStream final : public IOStream {
+ 
+     void type1Read(size_t* count, char* current, const char* ptrEnd);
+     void type3Read(uint32_t available, size_t* count, char* current, const char* ptrEnd);
++    uint32_t availableCommandBytes(const ring_buffer* ring, const ring_buffer_view* view,
++                                   uint32_t consumed);
++    uint32_t availableReplyBytes();
++    bool writeReply(const uint8_t* data, uint32_t size);
+     void protocolError();
+     bool exitRequested();
+ 
+@@ -71,6 +75,12 @@ class RingStream final : public IOStream {
+     size_t mReadBufferLeft = 0;
+ 
+     uint32_t mBufSize = 0;
++    const bool mDuplex;
++    uint32_t mCommandConsumed = 0;
++    uint32_t mNextCommandOffset = 0;
++    uint32_t mUploadConsumed = 0;
++    uint32_t mReplyProduced = 0;
++    uint32_t mReplyConsumed = 0;
+ 
+     // The number of times this RingStream should attempt reading
+     // before going to sleep.
+-- 
+2.50.1.windows.1
+

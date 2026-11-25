@@ -1,0 +1,279 @@
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp
+index 96f8f2bd..c14275eb 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp
+@@ -959,6 +959,7 @@ EmulatorQtWindow::~EmulatorQtWindow() {
+ }
+ 
+ void EmulatorQtWindow::focusOutEvent(QFocusEvent* event) {
++    mNativeTouchOrPenActive = false;
+     for (auto& key : mHeldModifiers) {
+         SkinEvent skin_event = createSkinEvent(kEventKeyUp);
+         skin_event.u.key.keycode = key;
+@@ -1332,6 +1333,35 @@ void EmulatorQtWindow::releaseMouse() {
+ 
+ #endif  // __APPLE__
+ 
++bool EmulatorQtWindow::shouldProcessMouseEvent(const QMouseEvent* event) {
++    if (!event) {
++        return false;
++    }
++    if (event->source() == Qt::MouseEventNotSynthesized) {
++        return true;
++    }
++    // Filter out system/Qt-synthesized mouse events only while a native
++    // TouchScreen or Tablet/Pen gesture is active or just ended (Windows Ink
++    // long-press / release synthesis window). Remote Desktop, mobile remote
++    // clients, and touch-to-mouse drivers deliver only synthesized mouse events
++    // (MI_WP_SIGNATURE) without native QTouchEvent/QTabletEvent and must pass.
++    constexpr qint64 kNativeTouchPenCooldownMs = 250;
++    constexpr qint64 kNativeActiveStaleMs = 5000;
++    if (mNativeTouchOrPenActive) {
++        if (!mNativeTouchOrPenTimer.isValid() ||
++            mNativeTouchOrPenTimer.elapsed() > kNativeActiveStaleMs) {
++            mNativeTouchOrPenActive = false;
++        } else {
++            return false;
++        }
++    }
++    if (mNativeTouchOrPenTimer.isValid() &&
++        mNativeTouchOrPenTimer.elapsed() <= kNativeTouchPenCooldownMs) {
++        return false;
++    }
++    return true;
++}
++
+ void EmulatorQtWindow::mouseMoveEvent(QMouseEvent* event) {
+     // The motion event will interfere with the swipe gesture being synthesized.
+     if (mWheelScrollTimer.isActive())
+@@ -1344,10 +1374,9 @@ void EmulatorQtWindow::mouseMoveEvent(QMouseEvent* event) {
+                  ->no_mouse_reposition) {
+         // Block all the incoming mouse events if mouse is being moved to
+         // center of the screen.
+-        if (!mMouseRepositioning &&
+-            (event->source() == Qt::MouseEventNotSynthesized)) {
++        if (!mMouseRepositioning && shouldProcessMouseEvent(event)) {
+             // Pen long press generates synthesized mouse events,
+-            // which need to be filtered out
++            // which need to be filtered out when native touch/pen is active
+             SkinEventType eventType = translateMouseEventType(
+                     kEventMouseMotion, event->button(), event->buttons());
+             handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1379,8 +1408,8 @@ void EmulatorQtWindow::mouseMoveEvent(QMouseEvent* event) {
+         }
+     } else {
+         // Pen long press generates synthesized mouse events,
+-        // which need to be filtered out
+-        if (event->source() == Qt::MouseEventNotSynthesized) {
++        // which need to be filtered out when native touch/pen is active
++        if (shouldProcessMouseEvent(event)) {
+             SkinEventType eventType = translateMouseEventType(
+                     kEventMouseMotion, event->button(), event->buttons());
+             handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1496,8 +1525,8 @@ void EmulatorQtWindow::mousePressEvent(QMouseEvent* event) {
+     }
+ 
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    // which need to be filtered out when native touch/pen is active
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = translateMouseEventType(
+                 kEventMouseButtonDown, event->button(), event->buttons());
+         handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1507,7 +1536,7 @@ void EmulatorQtWindow::mousePressEvent(QMouseEvent* event) {
+ 
+ void EmulatorQtWindow::mouseReleaseEvent(QMouseEvent* event) {
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
++    // which need to be filtered out when native touch/pen is active
+     if (android::featurecontrol::isEnabled(
+                 android::featurecontrol::VirtioDualModeMouse) &&
+         mRelativeMouseCoordMode && mMouseGrabbed) {
+@@ -1517,7 +1546,7 @@ void EmulatorQtWindow::mouseReleaseEvent(QMouseEvent* event) {
+         updateWindowTitle();
+         mContainer.setCursor(getCursorShape(/*mouseGrabbed*/ false));
+     }
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = translateMouseEventType(
+                 kEventMouseButtonUp, event->button(), event->buttons());
+         handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1544,6 +1573,8 @@ void EmulatorQtWindow::tabletEvent(QTabletEvent* event) {
+ 
+     switch (event->type()) {
+         case QEvent::TabletPress: {
++            mNativeTouchOrPenActive = true;
++            mNativeTouchOrPenTimer.restart();
+             button_pressed =
+                     ((event->buttons() & Qt::RightButton) == Qt::RightButton);
+             eventType = translatePenEventType(kEventPenPress, event->button(),
+@@ -1555,6 +1586,8 @@ void EmulatorQtWindow::tabletEvent(QTabletEvent* event) {
+             break;
+         }
+         case QEvent::TabletRelease: {
++            mNativeTouchOrPenActive = false;
++            mNativeTouchOrPenTimer.restart();
+             button_pressed =
+                     ((event->buttons() & Qt::RightButton) == Qt::RightButton);
+             eventType = translatePenEventType(kEventPenRelease, event->button(),
+@@ -1566,6 +1599,10 @@ void EmulatorQtWindow::tabletEvent(QTabletEvent* event) {
+             break;
+         }
+         case QEvent::TabletMove: {
++            mNativeTouchOrPenActive =
++                    (event->buttons() != Qt::NoButton) ||
++                    (event->pressure() > 0.0);
++            mNativeTouchOrPenTimer.restart();
+             button_pressed =
+                     ((event->buttons() & Qt::RightButton) == Qt::RightButton);
+             if ((event->pos().x() != mPenPosX) ||
+@@ -2025,12 +2062,19 @@ void EmulatorQtWindow::handleTouchPoints(const QTouchEvent& touch,
+ 
+ bool EmulatorQtWindow::event(QEvent* ev) {
+     if (ev->type() == QEvent::TouchBegin || ev->type() == QEvent::TouchUpdate ||
+-        ev->type() == QEvent::TouchEnd) {
++        ev->type() == QEvent::TouchEnd || ev->type() == QEvent::TouchCancel) {
+         QTouchEvent* touchEvent = static_cast<QTouchEvent*>(ev);
+         // b/216383452 Only process multitouch events generated from touch
+         // screen.
+         if (touchEvent->device()->type() ==
+             QInputDevice::DeviceType::TouchScreen) {
++            if (ev->type() == QEvent::TouchCancel) {
++                mNativeTouchOrPenActive = false;
++                mNativeTouchOrPenTimer.restart();
++                return true;
++            }
++            mNativeTouchOrPenActive = (ev->type() != QEvent::TouchEnd);
++            mNativeTouchOrPenTimer.restart();
+             handleTouchPoints(*touchEvent);
+             return true;
+         }
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h
+index 97b737c6..b4001980 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h
+@@ -36,6 +36,7 @@
+ 
+ #include <QDragEnterEvent>
+ #include <QDropEvent>
++#include <QElapsedTimer>
+ #include <QFrame>
+ #include <QGuiApplication>
+ #include <QImage>
+@@ -678,6 +679,13 @@ private:
+     /* State of mouse event type translation state machine. */
+     TouchState mMouseTouchState = TouchState::NOT_TOUCHING;
+ 
++    /* Tracks active/recent native TouchScreen or Tablet/Pen input so we only
++     * filter system-synthesized mouse events that duplicate native touch/pen
++     * events, without dropping Remote Desktop / touch-to-mouse input. */
++    bool mNativeTouchOrPenActive = false;
++    QElapsedTimer mNativeTouchOrPenTimer;
++    bool shouldProcessMouseEvent(const QMouseEvent* event);
++
+     SkinEventType translatePenEventType(SkinEventType type,
+                                         Qt::MouseButton button,
+                                         Qt::MouseButtons buttons);
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.cpp b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.cpp
+index 45a84068..56832f9a 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.cpp
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.cpp
+@@ -287,10 +287,34 @@ void MultiDisplayWidget::paintWindow(uint32_t colorBufferId) {
+     update();
+ }
+ 
++bool MultiDisplayWidget::shouldProcessMouseEvent(const QMouseEvent* event) {
++    if (!event) {
++        return false;
++    }
++    if (event->source() == Qt::MouseEventNotSynthesized) {
++        return true;
++    }
++    constexpr qint64 kNativeTouchCooldownMs = 250;
++    constexpr qint64 kNativeActiveStaleMs = 5000;
++    if (mNativeTouchActive) {
++        if (!mNativeTouchTimer.isValid() ||
++            mNativeTouchTimer.elapsed() > kNativeActiveStaleMs) {
++            mNativeTouchActive = false;
++        } else {
++            return false;
++        }
++    }
++    if (mNativeTouchTimer.isValid() &&
++        mNativeTouchTimer.elapsed() <= kNativeTouchCooldownMs) {
++        return false;
++    }
++    return true;
++}
++
+ void MultiDisplayWidget::mousePressEvent(QMouseEvent* event) {
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    // which need to be filtered out when native touch is active
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = mMouseEvHandler.translateMouseEventType(
+                     kEventMouseButtonDown, event->button(), event->buttons());
+         mMouseEvHandler.handleMouseEvent(eventType, mMouseEvHandler.getSkinMouseButton(event),
+@@ -300,8 +324,8 @@ void MultiDisplayWidget::mousePressEvent(QMouseEvent* event) {
+ 
+ void MultiDisplayWidget::mouseMoveEvent(QMouseEvent* event) {
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    // which need to be filtered out when native touch is active
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = mMouseEvHandler.translateMouseEventType(
+                 kEventMouseMotion, event->button(), event->buttons());
+ 
+@@ -312,8 +336,8 @@ void MultiDisplayWidget::mouseMoveEvent(QMouseEvent* event) {
+ 
+ void MultiDisplayWidget::mouseReleaseEvent(QMouseEvent* event) {
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    // which need to be filtered out when native touch is active
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = mMouseEvHandler.translateMouseEventType(
+                     kEventMouseButtonUp, event->button(), event->buttons());
+         mMouseEvHandler.handleMouseEvent(eventType, mMouseEvHandler.getSkinMouseButton(event),
+@@ -323,8 +347,15 @@ void MultiDisplayWidget::mouseReleaseEvent(QMouseEvent* event) {
+ 
+ bool MultiDisplayWidget::event(QEvent* ev) {
+     if (ev->type() == QEvent::TouchBegin || ev->type() == QEvent::TouchUpdate ||
+-        ev->type() == QEvent::TouchEnd) {
++        ev->type() == QEvent::TouchEnd || ev->type() == QEvent::TouchCancel) {
+         QTouchEvent* touchEvent = static_cast<QTouchEvent*>(ev);
++        if (ev->type() == QEvent::TouchCancel) {
++            mNativeTouchActive = false;
++            mNativeTouchTimer.restart();
++            return true;
++        }
++        mNativeTouchActive = (ev->type() != QEvent::TouchEnd);
++        mNativeTouchTimer.restart();
+         auto win = EmulatorQtWindow::getInstance();
+         win->handleTouchPoints(*touchEvent, mDisplayId);
+         return true;
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.h b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.h
+index 4db43c59..65afa481 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.h
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/multi-display-widget.h
+@@ -18,6 +18,7 @@
+ #include "android/skin/qt/mouse-event-handler.h"
+ #include "android/skin/qt/SharedStreamEmulator.h"
+ 
++#include <QElapsedTimer>
+ #include <QPixmap>
+ 
+ class MultiDisplayWidget : public GLWidget {
+@@ -54,6 +55,9 @@ private:
+     GLuint mIndexBuffer;
+     uint32_t mColorBufferId;
+     MouseEventHandler mMouseEvHandler;
++    bool mNativeTouchActive = false;
++    QElapsedTimer mNativeTouchTimer;
++    bool shouldProcessMouseEvent(const QMouseEvent* event);
+     GLuint createShader(GLint shaderType, const char* shaderText);
+     void clearGL();
+     std::unique_ptr<SharedStreamEmulator> mStreamer;

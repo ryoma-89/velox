@@ -1,0 +1,86 @@
+From dff466b14c7f3b5ea37e8065088a19bd23d5d04d Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:38:11 +0900
+Subject: [PATCH 20/20] velox: inline the sub-decoder stream accessors, push
+ constants on the stack (patch 0020)
+
+subDecode calls VulkanMemReadingStream::setBuf/getBuf once per command and
+they lived in another translation unit; they are now inline. Push constant
+values up to 256 bytes (the usual maxPushConstantsSize) are copied to a
+stack buffer instead of the bump pool (the previous stack buffer held only
+16 bytes, so every 32-byte push constant went through BumpPool::alloc).
+The size and range checks are unchanged and happen before the copy.
+vk-render draws: +4% (host v2 vs v3, two boots each, checksums match).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ib7f7b3fbf3ddcac8a54102e16457b141c410df4f
+---
+ host/vulkan/vk_sub_decoder.cpp | 6 ++++--
+ host/vulkan/vulkan_stream.cpp  | 7 -------
+ host/vulkan/vulkan_stream.h    | 8 ++++++--
+ 3 files changed, 10 insertions(+), 11 deletions(-)
+
+diff --git a/host/vulkan/vk_sub_decoder.cpp b/host/vulkan/vk_sub_decoder.cpp
+index 48b8937..b586def 100644
+--- a/host/vulkan/vk_sub_decoder.cpp
++++ b/host/vulkan/vk_sub_decoder.cpp
+@@ -1001,7 +1001,9 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 uint32_t offset;
+                 uint32_t size;
+                 const void* pValues;
+-                uint8_t* stack_pValues[MAX_STACK_ITEMS];
++                // Velox: room for the usual push constant limit (256 bytes) so that the values
++                // are copied to the stack instead of the bump pool.
++                alignas(16) uint8_t stack_pValues[256];
+                 uint64_t cgen_var_0;
+                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 8);
+                 *readStreamPtrPtr += 8;
+@@ -1020,7 +1022,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 }
+                 layout = try_unbox_VkPipelineLayout((VkPipelineLayout)cgen_var_0);
+                 if (CC_UNLIKELY(!layout)) return ptr - buf;
+-                if (size <= MAX_STACK_ITEMS) {
++                if (size <= sizeof(stack_pValues)) {
+                     pValues = (void*)stack_pValues;
+                 } else {
+                     readStream->alloc((void**)&pValues, size * sizeof(const uint8_t));
+diff --git a/host/vulkan/vulkan_stream.cpp b/host/vulkan/vulkan_stream.cpp
+index c1bf3e7..2edc134 100644
+--- a/host/vulkan/vulkan_stream.cpp
++++ b/host/vulkan/vulkan_stream.cpp
+@@ -175,13 +175,6 @@ VulkanMemReadingStream::VulkanMemReadingStream(uint8_t* start, const gfxstream::
+ 
+ VulkanMemReadingStream::~VulkanMemReadingStream() {}
+ 
+-void VulkanMemReadingStream::setBuf(uint8_t* buf) {
+-    mStart = buf;
+-    mReadPos = 0;
+-}
+-
+-uint8_t* VulkanMemReadingStream::getBuf() { return mStart; }
+-
+ void VulkanMemReadingStream::setReadPos(uintptr_t pos) { mReadPos = pos; }
+ 
+ ssize_t VulkanMemReadingStream::read(void* buffer, size_t size) {
+diff --git a/host/vulkan/vulkan_stream.h b/host/vulkan/vulkan_stream.h
+index 61095ce..04e65bf 100644
+--- a/host/vulkan/vulkan_stream.h
++++ b/host/vulkan/vulkan_stream.h
+@@ -94,8 +94,12 @@ class VulkanMemReadingStream : public VulkanStream {
+     VulkanMemReadingStream(uint8_t* start, const gfxstream::host::FeatureSet& features);
+     ~VulkanMemReadingStream();
+ 
+-    void setBuf(uint8_t* buf);
+-    uint8_t* getBuf();
++    // Velox: inline (subDecode calls these once per command).
++    void setBuf(uint8_t* buf) {
++        mStart = buf;
++        mReadPos = 0;
++    }
++    uint8_t* getBuf() { return mStart; }
+     void setReadPos(uintptr_t pos);
+ 
+     ssize_t read(void* buffer, size_t size) override;
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,28 @@
+From bac7b2414f18138040e23a2260d721a72acd1603 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 23:04:14 +0900
+Subject: [PATCH] gfxstream: avoid null member access in global Vulkan function
+ lookup
+
+Change-Id: Ie963fc7f5451a3941ca30711e821581fadac8398
+---
+ src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp b/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
+index 7abcf97..7bca8fb 100644
+--- a/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
++++ b/src/gfxstream/guest/vulkan/gfxstream_vk_device.cpp
+@@ -651,7 +651,8 @@ vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName) {
+ 
+ PFN_vkVoidFunction gfxstream_vk_GetInstanceProcAddr(VkInstance _instance, const char* pName) {
+     VK_FROM_HANDLE(gfxstream_vk_instance, instance, _instance);
+-    return vk_instance_get_proc_addr(&instance->base, &gfxstream_vk_instance_entrypoints, pName);
++    return vk_instance_get_proc_addr(instance ? &instance->base : nullptr,
++                                     &gfxstream_vk_instance_entrypoints, pName);
+ }
+ 
+ PFN_vkVoidFunction gfxstream_vk_GetDeviceProcAddr(VkDevice _device, const char* pName) {
+-- 
+2.50.1.windows.1
+

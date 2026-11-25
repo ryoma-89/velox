@@ -1,0 +1,131 @@
+diff --git a/target/i386/whpx-all.c b/target/i386/whpx-all.c
+--- a/target/i386/whpx-all.c
++++ b/target/i386/whpx-all.c
+@@ -26,6 +26,7 @@
+ #include "sysemu/cpus.h"
+ #include "qemu/abort.h"
+ #include "qemu/main-loop.h"
++#include "qemu/timer.h"
+ #include "hw/boards.h"
+ #include "qemu/error-report.h"
+ #include "qemu/queue.h"
+@@ -159,6 +160,18 @@
+     WHV_REGISTER_VALUE values[RTL_NUMBER_OF(whpx_register_names)];
+ };
+ 
++enum WhpxExitCounter {
++    WHPX_EXIT_MMIO,
++    WHPX_EXIT_PORT_IO,
++    WHPX_EXIT_INTERRUPT_WINDOW,
++    WHPX_EXIT_HALT,
++    WHPX_EXIT_CANCEL,
++    WHPX_EXIT_MSR,
++    WHPX_EXIT_CPUID,
++    WHPX_EXIT_OTHER,
++    WHPX_EXIT_COUNT
++};
++
+ struct whpx_vcpu {
+     WHV_EMULATOR_HANDLE emulator;
+     bool window_registered;
+@@ -173,6 +186,7 @@
+      * QEMU fixed this in "WHPX: TSC get and set should be dependent on VM state" (2020).
+      */
+     bool set_tsc;
++    uint64_t exit_counts[WHPX_EXIT_COUNT];
+ 
+     /* Must be the last field as it may have a tail */
+     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
+@@ -185,6 +199,8 @@
+ typedef HRESULT (WINAPI *whpx_suspend_partition_time_t)(WHV_PARTITION_HANDLE Partition);
+ static whpx_suspend_partition_time_t whpx_suspend_partition_time;
+ static WHV_PROCESSOR_XSAVE_FEATURES whpx_xsave_cap;
++static bool whpx_collect_exit_counts;
++static QEMUTimer whpx_exit_counts_timer;
+ 
+ struct whpx_state whpx_global;
+ struct WHPDispatch whp_dispatch;
+@@ -206,6 +222,61 @@
+ static struct whpx_vcpu *get_whpx_vcpu(CPUState *cpu)
+ {
+     return cpu->whpx_vcpu;
++}
++
++static void whpx_count_exit(struct whpx_vcpu *vcpu)
++{
++    enum WhpxExitCounter counter;
++    switch (vcpu->exit_ctx.ExitReason) {
++    case WHvRunVpExitReasonMemoryAccess:
++        counter = WHPX_EXIT_MMIO;
++        break;
++    case WHvRunVpExitReasonX64IoPortAccess:
++        counter = WHPX_EXIT_PORT_IO;
++        break;
++    case WHvRunVpExitReasonX64InterruptWindow:
++        counter = WHPX_EXIT_INTERRUPT_WINDOW;
++        break;
++    case WHvRunVpExitReasonX64Halt:
++        counter = WHPX_EXIT_HALT;
++        break;
++    case WHvRunVpExitReasonCanceled:
++        counter = WHPX_EXIT_CANCEL;
++        break;
++    case WHvRunVpExitReasonX64MsrAccess:
++        counter = WHPX_EXIT_MSR;
++        break;
++    case WHvRunVpExitReasonX64Cpuid:
++        counter = WHPX_EXIT_CPUID;
++        break;
++    default:
++        counter = WHPX_EXIT_OTHER;
++        break;
++    }
++
++    /* Only this vCPU writes its counters. The main loop samples them. */
++    atomic_set(&vcpu->exit_counts[counter], atomic_read(&vcpu->exit_counts[counter]) + 1);
++}
++
++static void whpx_log_exit_counts(void *opaque)
++{
++    uint64_t sums[WHPX_EXIT_COUNT] = {0};
++    CPUState *cpu;
++    CPU_FOREACH(cpu) {
++        struct whpx_vcpu *vcpu = get_whpx_vcpu(cpu);
++        if (vcpu) {
++            for (unsigned i = 0; i < WHPX_EXIT_COUNT; ++i) {
++                sums[i] += atomic_read(&vcpu->exit_counts[i]);
++            }
++        }
++    }
++    fprintf(stderr, "VELOX_WHPX_EXITS host_ms=%" PRId64 " mmio=%" PRIu64 " port_io=%" PRIu64
++            " interrupt_window=%" PRIu64 " halt=%" PRIu64 " cancel=%" PRIu64
++            " msr=%" PRIu64 " cpuid=%" PRIu64 " other=%" PRIu64 "\n",
++            qemu_clock_get_ms(QEMU_CLOCK_HOST), sums[WHPX_EXIT_MMIO], sums[WHPX_EXIT_PORT_IO],
++            sums[WHPX_EXIT_INTERRUPT_WINDOW], sums[WHPX_EXIT_HALT], sums[WHPX_EXIT_CANCEL],
++            sums[WHPX_EXIT_MSR], sums[WHPX_EXIT_CPUID], sums[WHPX_EXIT_OTHER]);
++    timer_mod(&whpx_exit_counts_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
+ }
+ 
+ static WHV_X64_SEGMENT_REGISTER whpx_seg_q2h(const SegmentCache *qs, int v86,
+@@ -1124,6 +1195,9 @@
+             break;
+         }
+ 
++        if (whpx_collect_exit_counts) {
++            whpx_count_exit(vcpu);
++        }
+         whpx_vcpu_post_run(cpu);
+ 
+         switch (vcpu->exit_ctx.ExitReason) {
+@@ -1937,6 +2011,11 @@
+     whpx_memory_init();
+ 
+     cpu_interrupt_handler = whpx_handle_interrupt;
++    whpx_collect_exit_counts = g_strcmp0(g_getenv("VELOX_WHPX_EXIT_STATS"), "1") == 0;
++    if (whpx_collect_exit_counts) {
++        timer_init_ms(&whpx_exit_counts_timer, QEMU_CLOCK_REALTIME, whpx_log_exit_counts, NULL);
++        timer_mod(&whpx_exit_counts_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
++    }
+ 
+     printf("Windows Hypervisor Platform accelerator is operational\n");
+     return 0;

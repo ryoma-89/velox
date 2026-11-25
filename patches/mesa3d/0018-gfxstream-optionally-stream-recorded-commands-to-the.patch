@@ -1,0 +1,154 @@
+From 9127b260a9f46ebfbcd56acf19c546fd707e5318 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:35:13 +0900
+Subject: [PATCH] gfxstream: optionally stream recorded commands to the host
+ before submit
+
+With VulkanQueueSubmitWithCommands a command buffer is staged in the guest
+and sent at submit, so the host decodes it only after the guest finished
+recording, and the next synchronous call waits behind the whole decode.
+debug.velox.cmd_stream_kb=N sends the staged commands with
+vkQueueFlushCommandsGOOGLE at a command boundary once N KiB are staged; the
+host appends them to the same host command buffer and the rest goes at
+submit. Skipped for secondary command buffers, after vkCmdExecuteCommands
+and with auxiliary command memory. Descriptor sets bound so far are
+committed first, as at submit. The staging stream is flushed before
+reading its size: commands encoded since the last commit sit in the
+IOStream allocation and reset() would drop them (a first version lost them;
+caught by dEQP-VK.api.command_buffers.record_many_draws_primary_2).
+
+vk-render draws (20000 draws/frame) on WHPX + ASG: 786 -> 1028 frames/s
+with 256 KiB; game/sync unchanged; image checksums identical. dEQP with
+16 KiB: api.command_buffers, binding_model.descriptor_update,
+synchronization.basic, draw.renderpass basic/indexed, push_constant pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+
+Change-Id: I06466016e77d86bcc9e4d01715e11eceabc0da8c
+---
+ .../include/gfxstream/guest/IOStream.h        |  3 +
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 66 ++++++++++++++++++-
+ .../guest/vulkan_enc/ResourceTracker.h        |  3 +
+ 3 files changed, 69 insertions(+), 3 deletions(-)
+
+diff --git a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+index 3fb3b8f..a3e0b73 100644
+--- a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
++++ b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+@@ -82,6 +82,9 @@ class IOStream {
+         return stat;
+     }
+ 
++    // Bytes handed out by alloc() but not yet passed to commitBuffer() (committed by flush()).
++    size_t uncommittedBytes() const { return m_iostreamBuf ? m_bufsize - m_free : 0; }
++
+     const unsigned char* readback(void* buf, size_t len) {
+         if (m_iostreamBuf && m_free != m_bufsize) {
+             size_t size = m_bufsize - m_free;
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 9755a2f..789b0a8 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1593,6 +1593,16 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+         mFeatureInfo.hasVulkanQueueSubmitWithCommands &&
+         mFeatureInfo.hasVulkanDeferredDescriptorPoolReset && deferredDescriptorPoolResetAllowed();
+ 
++#if DETECT_OS_ANDROID
++    {
++        char streamValue[PROP_VALUE_MAX] = {};
++        if (mFeatureInfo.hasVulkanQueueSubmitWithCommands &&
++            __system_property_get("debug.velox.cmd_stream_kb", streamValue) > 0) {
++            const long kb = strtol(streamValue, nullptr, 10);
++            mCommandStreamBytes = kb >= 16 && kb <= 65536 ? static_cast<size_t>(kb) * 1024 : 0;
++        }
++    }
++#endif
+     mFenceCompletionCache = mFeatureInfo.hasVulkanFenceStatusHint && fenceCompletionCacheAllowed();
+ #if DETECT_OS_ANDROID
+     char value[PROP_VALUE_MAX] = {};
+@@ -8318,12 +8328,62 @@ ALWAYS_INLINE_GFXSTREAM VkEncoder* ResourceTracker::getCommandBufferEncoder(
+                               ResourceTracker::get()->getFree());
+         sStaging.popStaging((CommandBufferStagingStream**)&cb->privateStream, &cb->privateEncoder);
+     }
+-    uint8_t* writtenPtr;
+-    size_t written;
+-    ((CommandBufferStagingStream*)cb->privateStream)->getWritten(&writtenPtr, &written);
++    ResourceTracker* tracker = ResourceTracker::get();
++    if (tracker->mCommandStreamBytes) {
++        // getWritten() only counts committed bytes; commands encoded since the last commit are
++        // still in the IOStream allocation.
++        uint8_t* writtenPtr;
++        size_t written;
++        auto* staging = (CommandBufferStagingStream*)cb->privateStream;
++        staging->getWritten(&writtenPtr, &written);
++        if (written + staging->uncommittedBytes() >= tracker->mCommandStreamBytes) {
++            tracker->streamCommandBufferEarly(commandBuffer);
++        }
++    }
+     return cb->privateEncoder;
+ }
+ 
++// Velox: with VulkanQueueSubmitWithCommands the guest records a command buffer into a private
++// staging stream and sends it with vkQueueFlushCommandsGOOGLE at submit time, so the host decodes
++// it only after the guest has finished recording, and a following synchronous call (for example
++// vkWaitForFences on an older fence) waits behind the whole decode. Called at a command boundary
++// once the staged bytes reach mCommandStreamBytes, this sends them early; the host appends them
++// to the same host command buffer (flushes decode in sequence-number order), and the rest is
++// sent at submit as before.
++//
++// Not done for secondary command buffers or once vkCmdExecuteCommands was recorded (secondaries
++// must be complete on the host before the primary's execute command is decoded), nor with the
++// auxiliary command memory path. Descriptor sets bound so far are committed first, exactly as at
++// submit, so the host never decodes a bind of a set it has not realized.
++void ResourceTracker::streamCommandBufferEarly(VkCommandBuffer commandBuffer) {
++    struct goldfish_VkCommandBuffer* cb = gfxstream_vk_command_buffer_from_handle(commandBuffer);
++    if (!cb || cb->isSecondary || cb->subObjects || !cb->privateStream ||
++        mFeatureInfo.hasVulkanAuxCommandMemory || !cb->device) {
++        return;
++    }
++    struct gfxstream_vk_device* device = gfxstream_vk_device_from_handle(cb->device);
++    if (!device || list_is_empty(&device->base.queues)) return;
++    struct vk_queue* first = list_first_entry(&device->base.queues, struct vk_queue, link);
++    VkQueue queue = vk_queue_to_handle(first);
++
++    VkEncoder* enc = ResourceTracker::getThreadLocalEncoder();
++    if (mFeatureInfo.hasVulkanBatchedDescriptorSetUpdate) {
++        std::lock_guard<std::mutex> lock(mDescriptorCommitLock);
++        std::unordered_set<VkDescriptorSet> pendingSets;
++        collectAllPendingDescriptorSetsBottomUp({commandBuffer}, pendingSets);
++        commitDescriptorSetUpdates(enc, queue, pendingSets, mGuestOnlyDescriptorPoolReset);
++    }
++    unsigned char* writtenPtr = nullptr;
++    size_t written = 0;
++    CommandBufferStagingStream* stream = static_cast<CommandBufferStagingStream*>(cb->privateStream);
++    // Commit the commands still held in the IOStream allocation; reset() would drop them.
++    stream->flush();
++    stream->getWritten(&writtenPtr, &written);
++    if (!written) return;
++    enc->vkQueueFlushCommandsGOOGLE(queue, commandBuffer, written, writtenPtr, true /* do lock */);
++    stream->reset();
++}
++
+ // static
+ ALWAYS_INLINE_GFXSTREAM VkEncoder* ResourceTracker::getQueueEncoder(VkQueue queue) {
+     auto enc = ResourceTracker::getThreadLocalEncoder();
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index 3947342..8ec0dfe 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -684,6 +684,9 @@ class ResourceTracker {
+                                        bool alsoClearPendingDescriptorSets);
+ 
+     void resetCommandBufferPendingTopology(VkCommandBuffer commandBuffer);
++    // Velox: send the commands recorded so far to the host while recording continues.
++    void streamCommandBufferEarly(VkCommandBuffer commandBuffer);
++    size_t mCommandStreamBytes = 0;  // debug.velox.cmd_stream_kb; 0 = only at submit
+ 
+     void clearCommandPool(VkCommandPool commandPool);
+ 
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,171 @@
+From 101688bdf59dc2cad8628ce62d1fa1acaedd60de Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:30:19 +0900
+Subject: [PATCH] velox: replace unbounded seqno spin with tiered wait and CV
+ notify (patch 0024)
+
+In VkDecoder::Impl::decode(), out-of-order RenderThreads spun indefinitely
+in while (seqno - *seqnoPtr != 1) _mm_pause() without yielding or sleeping.
+Under multi-thread Vulkan concurrency (especially soft18 at 6-8+ threads
+and auto20 at 12-16 threads), waiting RenderThreads saturated CPU cores and
+starved the seqno+1 owner or guest vCPUs, causing 144x-1000x latency spikes.
+
+Replace the unbounded spin with a 3-tier wait in ProcessResources:
+512 pauses -> 128 yields -> 1 ms CV wait, woken only when waiters > 0
+after an opcode completes (zero lock overhead on single-thread fast paths).
+
+Change-Id: I16a24b0e9c7d8f4a21e6c90b5d3f81a47e2c0024
+---
+ .../gfxstream/host/process_resources.h        | 65 ++++++++++++++++++-
+ host/vulkan/vk_decoder.cpp                    | 28 ++++----
+ 2 files changed, 75 insertions(+), 18 deletions(-)
+
+diff --git a/host/common/include/gfxstream/host/process_resources.h b/host/common/include/gfxstream/host/process_resources.h
+index 204036f..57bad03 100644
+--- a/host/common/include/gfxstream/host/process_resources.h
++++ b/host/common/include/gfxstream/host/process_resources.h
+@@ -17,14 +17,21 @@
+ #define _PROCESS_RESOURCES_H
+ 
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ #include <unordered_map>
+ #include <vector>
+ #include "gfxstream/Compiler.h"
+ #include "gfxstream/ThreadAnnotations.h"
+ 
++#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
++#include <immintrin.h>
++#endif
++
+ namespace gfxstream {
+ namespace host {
+ 
+@@ -40,8 +47,61 @@ class ProcessResources {
+     ~ProcessResources() = default;
+     std::atomic<uint32_t>* getSequenceNumberPtr() const { return &mSequenceNumber; }
+ 
++    // Velox: fast check for waiting RenderThreads after mSequenceNumber advances.
++    // Single-threaded streams see 0 waiters and take no lock.
++    void notifySequenceWaiters() const {
++        if (mSequenceWaiters.load(std::memory_order_seq_cst) > 0) {
++            std::lock_guard<std::mutex> lock(mSequenceMutex);
++            mSequenceCv.notify_all();
++        }
++    }
++
++    // Velox: tiered wait for (expectedSeqno - mSequenceNumber == 1) without unbounded
++    // CPU-burning spin loops that starve the seqno+1 owner or guest vCPUs under oversubscription.
++    // Returns true when it is this thread's turn, or false if exiting / guest process dead.
++    bool waitForSequenceNumber(uint32_t expectedSeqno,
++                               const std::atomic<bool>& shouldExit) const {
++        if (expectedSeqno - mSequenceNumber.load(std::memory_order_acquire) == 1) {
++            return true;
++        }
++        for (uint32_t spins = 0;; ++spins) {
++            if (expectedSeqno - mSequenceNumber.load(std::memory_order_acquire) == 1) {
++                return true;
++            }
++            if (shouldExit.load(std::memory_order_relaxed) ||
++                mGuestProcessDead.load(std::memory_order_relaxed)) {
++                return false;
++            }
++            if (spins < 512) {
++#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
++                _mm_pause();
++#elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
++                __asm__ __volatile__("pause;");
++#endif
++            } else if (spins < 640) {
++                std::this_thread::yield();
++            } else {
++                // Leaf lock only: never held across any other lock.
++                mSequenceWaiters.fetch_add(1, std::memory_order_seq_cst);
++                {
++                    std::unique_lock<std::mutex> lock(mSequenceMutex);
++                    mSequenceCv.wait_for(lock, std::chrono::milliseconds(1), [&] {
++                        return (expectedSeqno - mSequenceNumber.load(std::memory_order_seq_cst) ==
++                                1) ||
++                               shouldExit.load(std::memory_order_relaxed) ||
++                               mGuestProcessDead.load(std::memory_order_relaxed);
++                    });
++                }
++                mSequenceWaiters.fetch_sub(1, std::memory_order_relaxed);
++            }
++        }
++    }
++
+     void setGuestProcessDead(bool dead = true) const {
+-        mGuestProcessDead.store(dead, std::memory_order_relaxed);
++        mGuestProcessDead.store(dead, std::memory_order_seq_cst);
++        if (dead) {
++            notifySequenceWaiters();
++        }
+     }
+     bool isGuestProcessDead() const {
+         return mGuestProcessDead.load(std::memory_order_relaxed);
+@@ -76,6 +136,9 @@ class ProcessResources {
+    private:
+     ProcessResources() : mSequenceNumber(0) {}
+     mutable std::atomic<uint32_t> mSequenceNumber;
++    mutable std::atomic<uint32_t> mSequenceWaiters{0};
++    mutable std::mutex mSequenceMutex;
++    mutable std::condition_variable mSequenceCv;
+     mutable std::atomic<bool> mGuestProcessDead{false};
+     mutable std::mutex mCleanupCallbacksMutex;
+     mutable std::unordered_map<void*, std::function<void()>> mCleanupCallbacks
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index 3484cd7..740d61f 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -196,24 +196,14 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                     seqno, gfxstream::base::getCurrentThreadId());
+             }
+             if (seqnoPtr && !m_forSnapshotLoad) {
+-                {
+-                    while ((seqno - seqnoPtr->load(std::memory_order_seq_cst) != 1)) {
+-                        if (shouldExit.load(std::memory_order_relaxed) ||
+-                            (processResources && processResources->isGuestProcessDead())) {
+-                            GFXSTREAM_WARNING(
+-                                "Process=%s is exitting. Skip processing seqno=%d on thread=0x%x.",
+-                                processName ? processName : "null", seqno,
+-                                gfxstream::base::getCurrentThreadId());
+-                            return 0;
+-                        }
+-#if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64)))
+-                        _mm_pause();
+-#elif (defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)))
+-                        __asm__ __volatile__("pause;");
+-#endif
+-                    }
+-                    m_prevSeqno = seqno;
++                if (!processResources->waitForSequenceNumber(seqno, shouldExit)) {
++                    GFXSTREAM_WARNING(
++                        "Process=%s is exitting. Skip processing seqno=%d on thread=0x%x.",
++                        processName ? processName : "null", seqno,
++                        gfxstream::base::getCurrentThreadId());
++                    return 0;
+                 }
++                m_prevSeqno = seqno;
+             }
+         }
+ 
+@@ -24955,6 +24945,10 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+             }
+         }
+ 
++        if (m_queueSubmitWithCommandsEnabled && processResources) {
++            processResources->notifySequenceWaiters();
++        }
++
+         if (m_snapshotsEnabled) {
+             m_state->snapshot()->destroyApiCallInfoIfUnused(snapshotApiCallHandle);
+         }
+-- 
+2.50.1.windows.1
+

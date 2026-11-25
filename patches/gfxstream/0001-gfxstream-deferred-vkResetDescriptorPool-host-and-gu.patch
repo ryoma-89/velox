@@ -1,0 +1,605 @@
+From 17c5efc20be482236003136b959405c4496c93b6 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 20:09:01 +0900
+Subject: [PATCH] gfxstream: deferred vkResetDescriptorPool (host and guest
+ negotiation)
+
+Host: handle vkQueueCommitDescriptorSetUpdates2GOOGLE (codegen output
+for the new command spliced into the checked-in decoder) and reset a
+pool when the commit carries a newer reset epoch. Advertise
+ANDROID_EMU_vulkan_deferred_descriptor_pool_reset with batched
+descriptor updates when Vulkan snapshots are off (snapshots do not
+record the epochs).
+
+Guest: query the capability and pass it to the Vulkan driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ie0b1f199505845f50d2e0ebbecd74af764373f1e
+---
+ guest/renderControl_enc/EmulatorFeatureInfo.h |   7 +
+ .../ExtendedRenderControl.cpp                 |   8 +
+ .../renderControl_enc/ExtendedRenderControl.h |   1 +
+ .../GfxStreamRenderControl.cpp                |   1 +
+ host/render_control.cpp                       |  12 ++
+ .../cereal/common/goldfish_vk_dispatch.cpp    |   9 ++
+ .../cereal/common/goldfish_vk_dispatch.h      |   1 +
+ .../cereal/common/goldfish_vk_marshaling.cpp  |   5 +
+ .../cereal/common/goldfish_vk_marshaling.h    |   1 +
+ host/vulkan/vk_decoder.cpp                    | 144 ++++++++++++++++++
+ host/vulkan/vk_decoder_global_state.cpp       |  71 +++++++++
+ host/vulkan/vk_decoder_global_state.h         |   8 +
+ host/vulkan/vk_decoder_internal_structs.h     |   4 +
+ host/vulkan/vk_decoder_snapshot.cpp           |  26 ++++
+ host/vulkan/vk_decoder_snapshot.h             |   9 ++
+ host/vulkan/vulkan_gfxstream.h                |  15 ++
+ 16 files changed, 322 insertions(+)
+
+diff --git a/guest/renderControl_enc/EmulatorFeatureInfo.h b/guest/renderControl_enc/EmulatorFeatureInfo.h
+index 07552ec..11d9715 100644
+--- a/guest/renderControl_enc/EmulatorFeatureInfo.h
++++ b/guest/renderControl_enc/EmulatorFeatureInfo.h
+@@ -132,6 +132,10 @@ static const char kSyncBufferData[] = "ANDROID_EMU_sync_buffer_data";
+ // Batched descriptor set update
+ static const char kVulkanBatchedDescriptorSetUpdate[] = "ANDROID_EMU_vulkan_batched_descriptor_set_update";
+ 
++// Deferred vkResetDescriptorPool (vkQueueCommitDescriptorSetUpdates2GOOGLE)
++static const char kVulkanDeferredDescriptorPoolReset[] =
++    "ANDROID_EMU_vulkan_deferred_descriptor_pool_reset";
++
+ // Async QSRI
+ static const char kVulkanAsyncQsri[] = "ANDROID_EMU_vulkan_async_qsri";
+ 
+@@ -175,6 +179,7 @@ struct EmulatorFeatureInfo {
+         hasAsyncFrameCommands(false),
+         hasVulkanQueueSubmitWithCommands(false),
+         hasVulkanBatchedDescriptorSetUpdate(false),
++        hasVulkanDeferredDescriptorPoolReset(false),
+         hasSyncBufferData(false),
+         hasVulkanAsyncQsri(false),
+         hasReadColorBufferDma(false),
+@@ -206,6 +211,7 @@ struct EmulatorFeatureInfo {
+     bool hasAsyncFrameCommands;
+     bool hasVulkanQueueSubmitWithCommands;
+     bool hasVulkanBatchedDescriptorSetUpdate;
++    bool hasVulkanDeferredDescriptorPoolReset;
+     bool hasSyncBufferData;
+     bool hasVulkanAsyncQsri;
+     bool hasReadColorBufferDma;
+@@ -232,6 +238,7 @@ struct EmulatorGfxStreamVkFeatureInfo {
+     bool hasVulkanBatchedDescriptorSetUpdate;
+     bool hasVulkanAsyncQsri;
+     bool hasVulkanAuxCommandMemory;
++    bool hasVulkanDeferredDescriptorPoolReset;
+     bool setupComplete;
+ };
+ 
+diff --git a/guest/renderControl_enc/ExtendedRenderControl.cpp b/guest/renderControl_enc/ExtendedRenderControl.cpp
+index 7089361..1b7eece 100644
+--- a/guest/renderControl_enc/ExtendedRenderControl.cpp
++++ b/guest/renderControl_enc/ExtendedRenderControl.cpp
+@@ -257,6 +257,12 @@ void ExtendedRCEncoderContext::queryAndSetVulkanBatchedDescriptorSetUpdateSuppor
+     }
+ }
+ 
++void ExtendedRCEncoderContext::queryAndSetVulkanDeferredDescriptorPoolReset() {
++    std::string hostExtensions = queryHostExtensions();
++    this->featureInfo()->hasVulkanDeferredDescriptorPoolReset =
++        hostExtensions.find(kVulkanDeferredDescriptorPoolReset) != std::string::npos;
++}
++
+ void ExtendedRCEncoderContext::queryAndSetSyncBufferData() {
+     std::string hostExtensions = queryHostExtensions();
+     if (hostExtensions.find(kSyncBufferData) != std::string::npos) {
+@@ -332,4 +338,6 @@ void ExtendedRCEncoderContext::setVulkanFeatureInfo(void* info) {
+         this->featureInfo()->hasVulkanBatchedDescriptorSetUpdate;
+     featureInfo->hasVulkanAsyncQsri = this->featureInfo()->hasVulkanAsyncQsri;
+     featureInfo->hasVulkanAuxCommandMemory = this->featureInfo()->hasVulkanAuxCommandMemory;
++    featureInfo->hasVulkanDeferredDescriptorPoolReset =
++        this->featureInfo()->hasVulkanDeferredDescriptorPoolReset;
+ }
+diff --git a/guest/renderControl_enc/ExtendedRenderControl.h b/guest/renderControl_enc/ExtendedRenderControl.h
+index 53ef26f..d9a1832 100644
+--- a/guest/renderControl_enc/ExtendedRenderControl.h
++++ b/guest/renderControl_enc/ExtendedRenderControl.h
+@@ -93,6 +93,7 @@ class ExtendedRCEncoderContext : public renderControl_encoder_context_t {
+     void queryAndSetAsyncFrameCommands();
+     void queryAndSetVulkanQueueSubmitWithCommandsSupport();
+     void queryAndSetVulkanBatchedDescriptorSetUpdateSupport();
++    void queryAndSetVulkanDeferredDescriptorPoolReset();
+     void queryAndSetSyncBufferData();
+     void queryAndSetVulkanAsyncQsri();
+     void queryAndSetReadColorBufferDma();
+diff --git a/guest/renderControl_enc/GfxStreamRenderControl.cpp b/guest/renderControl_enc/GfxStreamRenderControl.cpp
+index 040823f..f0009e4 100644
+--- a/guest/renderControl_enc/GfxStreamRenderControl.cpp
++++ b/guest/renderControl_enc/GfxStreamRenderControl.cpp
+@@ -110,6 +110,7 @@ int32_t renderControlInit(GfxStreamConnectionManager* mgr, void* vkInfo) {
+         rcEnc->queryAndSetAsyncFrameCommands();
+         rcEnc->queryAndSetVulkanQueueSubmitWithCommandsSupport();
+         rcEnc->queryAndSetVulkanBatchedDescriptorSetUpdateSupport();
++        rcEnc->queryAndSetVulkanDeferredDescriptorPoolReset();
+         rcEnc->queryAndSetSyncBufferData();
+         rcEnc->queryAndSetVulkanAsyncQsri();
+         rcEnc->queryAndSetReadColorBufferDma();
+diff --git a/host/render_control.cpp b/host/render_control.cpp
+index 4753b0c..1d43fad 100644
+--- a/host/render_control.cpp
++++ b/host/render_control.cpp
+@@ -250,6 +250,12 @@ static const char* kVulkanQueueSubmitWithCommands = "ANDROID_EMU_vulkan_queue_su
+ // Batched descriptor set update
+ static const char* kVulkanBatchedDescriptorSetUpdate = "ANDROID_EMU_vulkan_batched_descriptor_set_update";
+ 
++// Deferred vkResetDescriptorPool for batched descriptor set updates
++// (vkQueueCommitDescriptorSetUpdates2GOOGLE). Not advertised with Vulkan snapshots, which do not
++// record the reset epochs.
++static const char* kVulkanDeferredDescriptorPoolReset =
++    "ANDROID_EMU_vulkan_deferred_descriptor_pool_reset";
++
+ // Synchronized glBufferData call
+ static const char* kSyncBufferData = "ANDROID_EMU_sync_buffer_data";
+ 
+@@ -595,6 +601,12 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
+         glStr += " ";
+     }
+ 
++    if (vulkanBatchedDescriptorSetUpdate && !features.VulkanSnapshots.enabled() &&
++        name == GL_EXTENSIONS) {
++        glStr += kVulkanDeferredDescriptorPoolReset;
++        glStr += " ";
++    }
++
+     if (virtioGpuNativeSyncEnabled && name == GL_EXTENSIONS) {
+         glStr += kVirtioGpuNativeSync;
+         glStr += " ";
+diff --git a/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp b/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp
+index 674c4f1..52c7566 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp
+@@ -933,6 +933,9 @@ void init_vulkan_dispatch_from_system_loader(DlOpenFunc dlOpenFunc, DlSymFunc dl
+     out->vkTraceAsyncGOOGLE = (PFN_vkTraceAsyncGOOGLE)dlSymFunc(lib, "vkTraceAsyncGOOGLE");
+     out->vkSetDebugMetadataAsyncGOOGLE =
+         (PFN_vkSetDebugMetadataAsyncGOOGLE)dlSymFunc(lib, "vkSetDebugMetadataAsyncGOOGLE");
++    out->vkQueueCommitDescriptorSetUpdates2GOOGLE =
++        (PFN_vkQueueCommitDescriptorSetUpdates2GOOGLE)dlSymFunc(
++            lib, "vkQueueCommitDescriptorSetUpdates2GOOGLE");
+ #endif
+ #ifdef VK_QNX_external_memory_screen_buffer
+     out->vkGetScreenBufferPropertiesQNX =
+@@ -2093,6 +2096,9 @@ void init_vulkan_dispatch_from_instance(VulkanDispatch* vk, VkInstance instance,
+     out->vkSetDebugMetadataAsyncGOOGLE =
+         (PFN_vkSetDebugMetadataAsyncGOOGLE)vk->vkGetInstanceProcAddr(
+             instance, "vkSetDebugMetadataAsyncGOOGLE");
++    out->vkQueueCommitDescriptorSetUpdates2GOOGLE =
++        (PFN_vkQueueCommitDescriptorSetUpdates2GOOGLE)vk->vkGetInstanceProcAddr(
++            instance, "vkQueueCommitDescriptorSetUpdates2GOOGLE");
+ #endif
+ #ifdef VK_QNX_external_memory_screen_buffer
+     out->vkGetScreenBufferPropertiesQNX =
+@@ -3227,6 +3233,9 @@ void init_vulkan_dispatch_from_device(VulkanDispatch* vk, VkDevice device, Vulka
+         (PFN_vkTraceAsyncGOOGLE)vk->vkGetDeviceProcAddr(device, "vkTraceAsyncGOOGLE");
+     out->vkSetDebugMetadataAsyncGOOGLE = (PFN_vkSetDebugMetadataAsyncGOOGLE)vk->vkGetDeviceProcAddr(
+         device, "vkSetDebugMetadataAsyncGOOGLE");
++    out->vkQueueCommitDescriptorSetUpdates2GOOGLE =
++        (PFN_vkQueueCommitDescriptorSetUpdates2GOOGLE)vk->vkGetDeviceProcAddr(
++            device, "vkQueueCommitDescriptorSetUpdates2GOOGLE");
+ #endif
+ #ifdef VK_QNX_external_memory_screen_buffer
+     out->vkGetScreenBufferPropertiesQNX =
+diff --git a/host/vulkan/cereal/common/goldfish_vk_dispatch.h b/host/vulkan/cereal/common/goldfish_vk_dispatch.h
+index 9b2ce2e..e7960a8 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_dispatch.h
++++ b/host/vulkan/cereal/common/goldfish_vk_dispatch.h
+@@ -647,6 +647,7 @@ struct VulkanDispatch {
+     PFN_vkGetSemaphoreGOOGLE vkGetSemaphoreGOOGLE;
+     PFN_vkTraceAsyncGOOGLE vkTraceAsyncGOOGLE;
+     PFN_vkSetDebugMetadataAsyncGOOGLE vkSetDebugMetadataAsyncGOOGLE;
++    PFN_vkQueueCommitDescriptorSetUpdates2GOOGLE vkQueueCommitDescriptorSetUpdates2GOOGLE;
+ #endif
+ #ifdef VK_QNX_external_memory_screen_buffer
+     PFN_vkGetScreenBufferPropertiesQNX vkGetScreenBufferPropertiesQNX;
+diff --git a/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp b/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp
+index 9f578c6..afe550a 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp
+@@ -23897,6 +23897,11 @@ const char* api_opcode_to_string(const uint32_t opcode) {
+         case OP_vkCmdResetEvent2:
+             return "OP_vkCmdResetEvent2";
+ #endif
++#ifdef VK_GOOGLE_gfxstream
++        case OP_vkQueueCommitDescriptorSetUpdates2GOOGLE: {
++            return "OP_vkQueueCommitDescriptorSetUpdates2GOOGLE";
++        }
++#endif
+ #ifdef VK_COMPUTE_VERSION_1_4
+         case OP_vkCmdPushDescriptorSetWithTemplate:
+             return "OP_vkCmdPushDescriptorSetWithTemplate";
+diff --git a/host/vulkan/cereal/common/goldfish_vk_marshaling.h b/host/vulkan/cereal/common/goldfish_vk_marshaling.h
+index 911ee69..a149e8d 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_marshaling.h
++++ b/host/vulkan/cereal/common/goldfish_vk_marshaling.h
+@@ -4978,6 +4978,7 @@ void unmarshal_VkDebugMetadataGOOGLE(VulkanStream* vkStream, VkStructureType roo
+                                      VkDebugMetadataGOOGLE* forUnmarshaling);
+ 
+ #define OP_vkSetDebugMetadataAsyncGOOGLE 236453297
++#define OP_vkQueueCommitDescriptorSetUpdates2GOOGLE 283906910
+ #endif
+ #ifdef VK_EXT_border_color_swizzle
+ void marshal_VkPhysicalDeviceBorderColorSwizzleFeaturesEXT(
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index 9cebe2a..562f892 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -23070,6 +23070,150 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                     seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+                 break;
+             }
++            case OP_vkQueueCommitDescriptorSetUpdates2GOOGLE: {
++                GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY,
++                                      "VkDecoder vkQueueCommitDescriptorSetUpdates2GOOGLE");
++                VkQueue queue;
++                uint32_t descriptorPoolCount;
++                const VkDescriptorPool* pDescriptorPools;
++                const uint64_t* pDescriptorPoolResetEpochs;
++                uint32_t descriptorSetCount;
++                const VkDescriptorSetLayout* pSetLayouts;
++                const uint64_t* pDescriptorSetPoolIds;
++                const uint32_t* pDescriptorSetWhichPool;
++                const uint32_t* pDescriptorSetPendingAllocation;
++                const uint32_t* pDescriptorWriteStartingIndices;
++                uint32_t pendingDescriptorWriteCount;
++                const VkWriteDescriptorSet* pPendingDescriptorWrites;
++                // Begin global wrapped dispatchable handle unboxing for queue;
++                uint64_t cgen_var_0;
++                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
++                *readStreamPtrPtr += 1 * 8;
++                *(VkQueue*)&queue = (VkQueue)(VkQueue)((VkQueue)(*&cgen_var_0));
++                auto vk = dispatch_VkQueue(queue);
++                memcpy((uint32_t*)&descriptorPoolCount, *readStreamPtrPtr, sizeof(uint32_t));
++                *readStreamPtrPtr += sizeof(uint32_t);
++                vkReadStream->alloc((void**)&pDescriptorPools,
++                                    descriptorPoolCount * sizeof(const VkDescriptorPool));
++                if (descriptorPoolCount) {
++                    uint8_t* cgen_var_1_ptr = (uint8_t*)(*readStreamPtrPtr);
++                    *readStreamPtrPtr += 8 * descriptorPoolCount;
++                    for (uint32_t k = 0; k < descriptorPoolCount; ++k) {
++                        uint64_t tmpval;
++                        memcpy(&tmpval, cgen_var_1_ptr + k * 8, sizeof(uint64_t));
++                        *(((VkDescriptorPool*)pDescriptorPools) + k) =
++                            tmpval
++                                ? (VkDescriptorPool)unbox_VkDescriptorPool((VkDescriptorPool)tmpval)
++                                : VK_NULL_HANDLE;
++                    }
++                }
++                vkReadStream->alloc((void**)&pDescriptorPoolResetEpochs,
++                                    descriptorPoolCount * sizeof(const uint64_t));
++                if (descriptorPoolCount > 0) {
++                    memcpy((uint64_t*)pDescriptorPoolResetEpochs, *readStreamPtrPtr,
++                           descriptorPoolCount * sizeof(const uint64_t));
++                    *readStreamPtrPtr += descriptorPoolCount * sizeof(const uint64_t);
++                }
++                memcpy((uint32_t*)&descriptorSetCount, *readStreamPtrPtr, sizeof(uint32_t));
++                *readStreamPtrPtr += sizeof(uint32_t);
++                vkReadStream->alloc((void**)&pSetLayouts,
++                                    descriptorSetCount * sizeof(const VkDescriptorSetLayout));
++                if (descriptorSetCount) {
++                    uint8_t* cgen_var_2_ptr = (uint8_t*)(*readStreamPtrPtr);
++                    *readStreamPtrPtr += 8 * descriptorSetCount;
++                    for (uint32_t k = 0; k < descriptorSetCount; ++k) {
++                        uint64_t tmpval;
++                        memcpy(&tmpval, cgen_var_2_ptr + k * 8, sizeof(uint64_t));
++                        *(((VkDescriptorSetLayout*)pSetLayouts) + k) =
++                            tmpval ? (VkDescriptorSetLayout)unbox_VkDescriptorSetLayout(
++                                         (VkDescriptorSetLayout)tmpval)
++                                   : VK_NULL_HANDLE;
++                    }
++                }
++                vkReadStream->alloc((void**)&pDescriptorSetPoolIds,
++                                    descriptorSetCount * sizeof(const uint64_t));
++                if (descriptorSetCount > 0) {
++                    memcpy((uint64_t*)pDescriptorSetPoolIds, *readStreamPtrPtr,
++                           descriptorSetCount * sizeof(const uint64_t));
++                    *readStreamPtrPtr += descriptorSetCount * sizeof(const uint64_t);
++                }
++                vkReadStream->alloc((void**)&pDescriptorSetWhichPool,
++                                    descriptorSetCount * sizeof(const uint32_t));
++                if (descriptorSetCount > 0) {
++                    memcpy((uint32_t*)pDescriptorSetWhichPool, *readStreamPtrPtr,
++                           descriptorSetCount * sizeof(const uint32_t));
++                    *readStreamPtrPtr += descriptorSetCount * sizeof(const uint32_t);
++                }
++                vkReadStream->alloc((void**)&pDescriptorSetPendingAllocation,
++                                    descriptorSetCount * sizeof(const uint32_t));
++                if (descriptorSetCount > 0) {
++                    memcpy((uint32_t*)pDescriptorSetPendingAllocation, *readStreamPtrPtr,
++                           descriptorSetCount * sizeof(const uint32_t));
++                    *readStreamPtrPtr += descriptorSetCount * sizeof(const uint32_t);
++                }
++                vkReadStream->alloc((void**)&pDescriptorWriteStartingIndices,
++                                    descriptorSetCount * sizeof(const uint32_t));
++                if (descriptorSetCount > 0) {
++                    memcpy((uint32_t*)pDescriptorWriteStartingIndices, *readStreamPtrPtr,
++                           descriptorSetCount * sizeof(const uint32_t));
++                    *readStreamPtrPtr += descriptorSetCount * sizeof(const uint32_t);
++                }
++                memcpy((uint32_t*)&pendingDescriptorWriteCount, *readStreamPtrPtr,
++                       sizeof(uint32_t));
++                *readStreamPtrPtr += sizeof(uint32_t);
++                vkReadStream->alloc(
++                    (void**)&pPendingDescriptorWrites,
++                    pendingDescriptorWriteCount * sizeof(const VkWriteDescriptorSet));
++                for (uint32_t i = 0; i < (uint32_t)pendingDescriptorWriteCount; ++i) {
++                    reservedunmarshal_VkWriteDescriptorSet(
++                        vkReadStream, VK_STRUCTURE_TYPE_MAX_ENUM,
++                        (VkWriteDescriptorSet*)(pPendingDescriptorWrites + i), readStreamPtrPtr);
++                }
++                if (pPendingDescriptorWrites) {
++                    for (uint32_t i = 0; i < (uint32_t)pendingDescriptorWriteCount; ++i) {
++                        transform_tohost_VkWriteDescriptorSet(
++                            m_state, (VkWriteDescriptorSet*)(pPendingDescriptorWrites + i));
++                    }
++                }
++                if (m_logCalls) {
++                    GFXSTREAM_INFO(
++                        "stream %p: call vkQueueCommitDescriptorSetUpdates2GOOGLE 0x%llx 0x%llx "
++                        "0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx ",
++                        ioStream, (unsigned long long)queue,
++                        (unsigned long long)descriptorPoolCount,
++                        (unsigned long long)pDescriptorPools,
++                        (unsigned long long)pDescriptorPoolResetEpochs,
++                        (unsigned long long)descriptorSetCount, (unsigned long long)pSetLayouts,
++                        (unsigned long long)pDescriptorSetPoolIds,
++                        (unsigned long long)pDescriptorSetWhichPool,
++                        (unsigned long long)pDescriptorSetPendingAllocation,
++                        (unsigned long long)pDescriptorWriteStartingIndices,
++                        (unsigned long long)pendingDescriptorWriteCount,
++                        (unsigned long long)pPendingDescriptorWrites);
++                }
++                if (CC_LIKELY(vk)) {
++                    m_state->on_vkQueueCommitDescriptorSetUpdates2GOOGLE(
++                        &m_pool, snapshotApiCallHandle, queue, descriptorPoolCount,
++                        pDescriptorPools, pDescriptorPoolResetEpochs, descriptorSetCount,
++                        pSetLayouts, pDescriptorSetPoolIds, pDescriptorSetWhichPool,
++                        pDescriptorSetPendingAllocation, pDescriptorWriteStartingIndices,
++                        pendingDescriptorWriteCount, pPendingDescriptorWrites);
++                }
++                vkStream->unsetHandleMapping();
++                if (m_snapshotsEnabled) {
++                    m_state->snapshot()->vkQueueCommitDescriptorSetUpdates2GOOGLE(
++                        &m_pool, snapshotApiCallHandle, packet, packetLen, queue,
++                        descriptorPoolCount, pDescriptorPools, pDescriptorPoolResetEpochs,
++                        descriptorSetCount, pSetLayouts, pDescriptorSetPoolIds,
++                        pDescriptorSetWhichPool, pDescriptorSetPendingAllocation,
++                        pDescriptorWriteStartingIndices, pendingDescriptorWriteCount,
++                        pPendingDescriptorWrites);
++                }
++                vkReadStream->clearPool();
++                if (m_queueSubmitWithCommandsEnabled)
++                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
++                break;
++            }
+ #endif
+             default: {
+                 if (m_snapshotsEnabled) {
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index f1a8cab..78b500b 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -10085,6 +10085,62 @@ class VkDecoderGlobalState::Impl {
+             pDescriptorWriteStartingIndices, pendingDescriptorWriteCount, pPendingDescriptorWrites);
+     }
+ 
++    // Deferred vkResetDescriptorPool (VulkanBatchedDescriptorSetUpdate): apply the guest's reset
++    // of each pool whose reset epoch is newer than the last applied one, then service the commit,
++    // all under mMutex. Guest commands are executed in the guest's encoding order across streams
++    // (sequence numbers), and a commit of a reset pool always carries that pool's epoch, so the
++    // reset happens exactly once and before any allocation made after it in the guest.
++    void on_vkQueueCommitDescriptorSetUpdates2GOOGLE(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue boxed_queue,
++        uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++        const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++        const VkDescriptorSetLayout* pDescriptorSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++        const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++        const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++        const VkWriteDescriptorSet* pPendingDescriptorWrites) {
++        std::lock_guard<std::mutex> lock(mMutex);
++
++        auto queue = unbox_VkQueue(boxed_queue);
++        auto vk = dispatch_VkQueue(boxed_queue);
++
++        VkDevice device = VK_NULL_HANDLE;
++        auto* queueInfo = gfxstream::base::find(mQueueInfo, queue);
++        if (queueInfo) {
++            device = queueInfo->device;
++        } else {
++            GFXSTREAM_FATAL("VkQueue:%p (boxed-VkQueue:%p) with no device registered.",
++                            queue, boxed_queue);
++        }
++
++        for (uint32_t i = 0; i < descriptorPoolCount; ++i) {
++            auto* poolInfo = gfxstream::base::find(mDescriptorPoolInfo, pDescriptorPools[i]);
++            if (!poolInfo) {
++                GFXSTREAM_ERROR("Cannot find info for VkDescriptorPool:%p", pDescriptorPools[i]);
++                return;
++            }
++            const uint64_t epoch = pDescriptorPoolResetEpochs[i];
++            if (epoch <= poolInfo->appliedResetEpoch) continue;
++            // The application waited for all uses of the pool's sets before
++            // vkResetDescriptorPool() (VUID-vkResetDescriptorPool-descriptorPool-00313).
++            VkResult res = vk->vkResetDescriptorPool(poolInfo->device, pDescriptorPools[i], 0);
++            if (res != VK_SUCCESS) {
++                // The only result the specification defines is VK_SUCCESS; anything else is a
++                // driver failure that the guest can no longer be told about at reset time.
++                GFXSTREAM_ERROR("Deferred vkResetDescriptorPool(%p) failed: %d",
++                                pDescriptorPools[i], res);
++                return;
++            }
++            resetDescriptorPoolInfoLocked(pDescriptorPools[i]);
++            poolInfo->appliedResetEpoch = epoch;
++        }
++
++        on_vkQueueCommitDescriptorSetUpdatesGOOGLELocked(
++            pool, apiCallHandle, vk, device, descriptorPoolCount, pDescriptorPools,
++            descriptorSetCount, pDescriptorSetLayouts, pDescriptorSetPoolIds,
++            pDescriptorSetWhichPool, pDescriptorSetPendingAllocation,
++            pDescriptorWriteStartingIndices, pendingDescriptorWriteCount, pPendingDescriptorWrites);
++    }
++
+     void on_vkQueueCommitDescriptorSetUpdatesGOOGLELocked(
+         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VulkanDispatch* vk,
+         VkDevice device, uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
+@@ -13468,6 +13524,21 @@ void VkDecoderGlobalState::on_vkQueueCommitDescriptorSetUpdatesGOOGLE(
+         pendingDescriptorWriteCount, pPendingDescriptorWrites);
+ }
+ 
++void VkDecoderGlobalState::on_vkQueueCommitDescriptorSetUpdates2GOOGLE(
++    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
++    uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++    const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++    const VkDescriptorSetLayout* pDescriptorSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++    const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++    const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++    const VkWriteDescriptorSet* pPendingDescriptorWrites) {
++    mImpl->on_vkQueueCommitDescriptorSetUpdates2GOOGLE(
++        pool, apiCallHandle, queue, descriptorPoolCount, pDescriptorPools,
++        pDescriptorPoolResetEpochs, descriptorSetCount, pDescriptorSetLayouts,
++        pDescriptorSetPoolIds, pDescriptorSetWhichPool, pDescriptorSetPendingAllocation,
++        pDescriptorWriteStartingIndices, pendingDescriptorWriteCount, pPendingDescriptorWrites);
++}
++
+ void VkDecoderGlobalState::on_vkCollectDescriptorPoolIdsGOOGLE(
+     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+     VkDescriptorPool descriptorPool, uint32_t* pPoolIdCount, uint64_t* pPoolIds) {
+diff --git a/host/vulkan/vk_decoder_global_state.h b/host/vulkan/vk_decoder_global_state.h
+index 720e5f7..6625f09 100644
+--- a/host/vulkan/vk_decoder_global_state.h
++++ b/host/vulkan/vk_decoder_global_state.h
+@@ -940,6 +940,14 @@ class VkDecoderGlobalState {
+         const uint32_t* pDescriptorSetPendingAllocation,
+         const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
+         const VkWriteDescriptorSet* pPendingDescriptorWrites);
++    void on_vkQueueCommitDescriptorSetUpdates2GOOGLE(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
++        uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++        const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++        const VkDescriptorSetLayout* pDescriptorSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++        const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++        const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++        const VkWriteDescriptorSet* pPendingDescriptorWrites);
+     void on_vkCollectDescriptorPoolIdsGOOGLE(gfxstream::base::BumpPool* pool,
+                                              VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                              VkDescriptorPool descriptorPool,
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 1367449..1e5a920 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -533,6 +533,10 @@ struct DescriptorPoolInfo {
+     // underlying host set is VK_NULL_HANDLE. The guest-facing API calls these
+     // "pool ids"; they are descriptor set handles, not descriptor pool handles.
+     std::vector<uint64_t> preallocatedBoxedSets;
++    // Deferred descriptor pool reset: the guest completes vkResetDescriptorPool() locally and
++    // numbers each reset. vkQueueCommitDescriptorSetUpdates2GOOGLE carries the pool's current
++    // reset number; the host resets the pool when it is newer than this value.
++    uint64_t appliedResetEpoch = 0;
+ };
+ 
+ struct DescriptorSetInfo {
+diff --git a/host/vulkan/vk_decoder_snapshot.cpp b/host/vulkan/vk_decoder_snapshot.cpp
+index 057952e..6650fe1 100644
+--- a/host/vulkan/vk_decoder_snapshot.cpp
++++ b/host/vulkan/vk_decoder_snapshot.cpp
+@@ -3041,6 +3041,15 @@ class VkDecoderSnapshot::Impl {
+                                        VkSnapshotApiCallHandle apiCallHandle,
+                                        const uint8_t* apiCallPacket, size_t apiCallPacketSize,
+                                        const VkDebugMetadataGOOGLE* pDebugMetadata) {}
++    void vkQueueCommitDescriptorSetUpdates2GOOGLE(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
++        const uint8_t* apiCallPacket, size_t apiCallPacketSize, VkQueue queue,
++        uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++        const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++        const VkDescriptorSetLayout* pSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++        const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++        const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++        const VkWriteDescriptorSet* pPendingDescriptorWrites) {}
+ #endif
+    private:
+     mutable std::mutex mReconstructionMutex;
+@@ -7288,6 +7297,23 @@ void VkDecoderSnapshot::vkSetDebugMetadataAsyncGOOGLE(gfxstream::base::BumpPool*
+                                          pDebugMetadata);
+ }
+ #endif
++#ifdef VK_GOOGLE_gfxstream
++void VkDecoderSnapshot::vkQueueCommitDescriptorSetUpdates2GOOGLE(
++    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
++    const uint8_t* apiCallPacket, size_t apiCallPacketSize, VkQueue queue,
++    uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++    const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++    const VkDescriptorSetLayout* pSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++    const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++    const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++    const VkWriteDescriptorSet* pPendingDescriptorWrites) {
++    mImpl->vkQueueCommitDescriptorSetUpdates2GOOGLE(
++        pool, apiCallHandle, apiCallPacket, apiCallPacketSize, queue, descriptorPoolCount,
++        pDescriptorPools, pDescriptorPoolResetEpochs, descriptorSetCount, pSetLayouts,
++        pDescriptorSetPoolIds, pDescriptorSetWhichPool, pDescriptorSetPendingAllocation,
++        pDescriptorWriteStartingIndices, pendingDescriptorWriteCount, pPendingDescriptorWrites);
++}
++#endif
+ 
+ }  // namespace vk
+ }  // namespace host
+diff --git a/host/vulkan/vk_decoder_snapshot.h b/host/vulkan/vk_decoder_snapshot.h
+index 5a2f0aa..c7a0e10 100644
+--- a/host/vulkan/vk_decoder_snapshot.h
++++ b/host/vulkan/vk_decoder_snapshot.h
+@@ -2134,6 +2134,15 @@ class VkDecoderSnapshot {
+                                        VkSnapshotApiCallHandle apiCallHandle,
+                                        const uint8_t* apiCallPacket, size_t apiCallPacketSize,
+                                        const VkDebugMetadataGOOGLE* pDebugMetadata);
++    void vkQueueCommitDescriptorSetUpdates2GOOGLE(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
++        const uint8_t* apiCallPacket, size_t apiCallPacketSize, VkQueue queue,
++        uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++        const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++        const VkDescriptorSetLayout* pSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++        const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++        const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++        const VkWriteDescriptorSet* pPendingDescriptorWrites);
+ #endif
+    private:
+     class Impl;
+diff --git a/host/vulkan/vulkan_gfxstream.h b/host/vulkan/vulkan_gfxstream.h
+index 126ee9f..f65060f 100644
+--- a/host/vulkan/vulkan_gfxstream.h
++++ b/host/vulkan/vulkan_gfxstream.h
+@@ -168,6 +168,13 @@ typedef VkResult(VKAPI_PTR* PFN_vkGetSemaphoreGOOGLE)(VkDevice device, VkSemapho
+ typedef void(VKAPI_PTR* PFN_vkTraceAsyncGOOGLE)(uint64_t id);
+ typedef void(VKAPI_PTR* PFN_vkSetDebugMetadataAsyncGOOGLE)(
+     const VkDebugMetadataGOOGLE* pDebugMetadata);
++typedef void(VKAPI_PTR* PFN_vkQueueCommitDescriptorSetUpdates2GOOGLE)(
++    VkQueue queue, uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++    const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++    const VkDescriptorSetLayout* pSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++    const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++    const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++    const VkWriteDescriptorSet* pPendingDescriptorWrites);
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL vkMapMemoryIntoAddressSpaceGOOGLE(VkDevice device,
+                                                                  VkDeviceMemory memory,
+@@ -277,6 +284,14 @@ VKAPI_ATTR void VKAPI_CALL vkTraceAsyncGOOGLE(uint64_t id);
+ VKAPI_ATTR void VKAPI_CALL
+ vkSetDebugMetadataAsyncGOOGLE(const VkDebugMetadataGOOGLE* pDebugMetadata);
+ 
++VKAPI_ATTR void VKAPI_CALL vkQueueCommitDescriptorSetUpdates2GOOGLE(
++    VkQueue queue, uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
++    const uint64_t* pDescriptorPoolResetEpochs, uint32_t descriptorSetCount,
++    const VkDescriptorSetLayout* pSetLayouts, const uint64_t* pDescriptorSetPoolIds,
++    const uint32_t* pDescriptorSetWhichPool, const uint32_t* pDescriptorSetPendingAllocation,
++    const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
++    const VkWriteDescriptorSet* pPendingDescriptorWrites);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.50.1.windows.1
+

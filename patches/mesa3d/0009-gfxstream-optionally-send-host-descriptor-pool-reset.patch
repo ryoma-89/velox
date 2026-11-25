@@ -1,0 +1,298 @@
+From cc4c013d67f9a829bed15d391482ffb86517fcc0 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:18:08 +0900
+Subject: [PATCH 09/12] gfxstream: optionally send host descriptor pool resets
+ without waiting
+
+With VulkanQueueSubmitWithCommands every command carries the process-wide
+sequence number and the host applies commands in that order, so a reset
+sent now is applied before any later command from any thread. The guest
+flushes the reset immediately and leaves the 4-byte status in the
+host-to-guest stream; IOStream::readback() consumes such deferred replies
+before the next reply (renderControl shares the stream), keeps a non-zero
+status, and the next deferred reset returns it. At most 64 replies are
+left unread. Opt-in: debug.velox.async_pool_reset=1.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I6d219a767ca0256f6b62cca2e0f841a3655a6230
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+---
+ .../include/gfxstream/guest/IOStream.h        | 49 ++++++++++++++++---
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 38 ++++++++++++--
+ .../guest/vulkan_enc/ResourceTracker.h        |  1 +
+ .../guest/vulkan_enc/VkEncoder.cpp.inl        | 46 +++++++++++++++++
+ .../guest/vulkan_enc/VkEncoder.h.inl          |  6 +++
+ .../guest/vulkan_enc/VulkanStreamGuest.cpp    |  8 +++
+ .../guest/vulkan_enc/VulkanStreamGuest.h      |  6 +++
+ 7 files changed, 143 insertions(+), 11 deletions(-)
+
+diff --git a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+index 3fb3b8f..0d83c99 100644
+--- a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
++++ b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+@@ -20,6 +20,8 @@ class IOStream {
+         m_bufsize = bufSize;
+         m_free = 0;
+         m_refcount = 1;
++        m_deferredReplies = 0;
++        m_deferredReplyError = 0;
+     }
+ 
+     void incRef() { __atomic_add_fetch(&m_refcount, 1, __ATOMIC_SEQ_CST); }
+@@ -83,13 +85,36 @@ class IOStream {
+     }
+ 
+     const unsigned char* readback(void* buf, size_t len) {
+-        if (m_iostreamBuf && m_free != m_bufsize) {
+-            size_t size = m_bufsize - m_free;
+-            m_iostreamBuf = NULL;
+-            m_free = 0;
+-            return commitBufferAndReadFully(size, buf, len);
++        if (m_deferredReplies && !drainDeferredReplies()) return NULL;
++        return commitAndReadFully(buf, len);
++    }
++
++    // Velox: a caller may send a command whose only reply is a 32-bit status and not wait for it
++    // (the host still writes the reply, in order). Those replies precede every later reply on
++    // this stream, so readback() consumes them first. A non-zero status is kept for
++    // takeDeferredReplyError(). The count is bounded by the caller (see kMaxDeferredReplies).
++    static constexpr uint32_t kMaxDeferredReplies = 64;
++    void deferStatusReply() { ++m_deferredReplies; }
++    uint32_t deferredReplies() const { return m_deferredReplies; }
++    int32_t takeDeferredReplyError() {
++        const int32_t error = m_deferredReplyError;
++        m_deferredReplyError = 0;
++        return error;
++    }
++    bool drainDeferredReplies() {
++        while (m_deferredReplies) {
++            int32_t results[kMaxDeferredReplies];
++            const uint32_t count =
++                m_deferredReplies < kMaxDeferredReplies ? m_deferredReplies : kMaxDeferredReplies;
++            // The read buffer of some transports aliases the write buffer: send pending writes
++            // before reading (commitAndReadFully does).
++            if (!commitAndReadFully(results, count * sizeof(int32_t))) return false;
++            m_deferredReplies -= count;
++            for (uint32_t i = 0; i < count; ++i) {
++                if (results[i] != 0 && m_deferredReplyError == 0) m_deferredReplyError = results[i];
++            }
+         }
+-        return readFully(buf, len);
++        return true;
+     }
+ 
+     // These two methods are defined and used in GLESv2_enc. Any reference
+@@ -108,11 +133,23 @@ class IOStream {
+     }
+ 
+    private:
++    const unsigned char* commitAndReadFully(void* buf, size_t len) {
++        if (m_iostreamBuf && m_free != m_bufsize) {
++            size_t size = m_bufsize - m_free;
++            m_iostreamBuf = NULL;
++            m_free = 0;
++            return commitBufferAndReadFully(size, buf, len);
++        }
++        return readFully(buf, len);
++    }
++
+     unsigned char* m_iostreamBuf;
+     size_t m_bufsizeOrig;
+     size_t m_bufsize;
+     size_t m_free;
+     uint32_t m_refcount;
++    uint32_t m_deferredReplies;
++    int32_t m_deferredReplyError;
+ };
+ 
+ }  // namespace guest
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 75c3090..937d4f3 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1520,6 +1520,18 @@ static bool fenceCompletionCacheAllowed() {
+     return debug_get_bool_option("GFXSTREAM_FENCE_STATUS_HINTS", true);
+ }
+ 
++// Opt-in: debug.velox.async_pool_reset=1 (Android) or GFXSTREAM_ASYNC_DESCRIPTOR_POOL_RESET=true
++// sends host pool resets without waiting for the status reply.
++static bool asyncDescriptorPoolResetAllowed() {
++#if DETECT_OS_ANDROID
++    char value[PROP_VALUE_MAX] = {};
++    if (__system_property_get("debug.velox.async_pool_reset", value) > 0) {
++        return strcmp(value, "1") == 0 || strcmp(value, "true") == 0;
++    }
++#endif
++    return debug_get_bool_option("GFXSTREAM_ASYNC_DESCRIPTOR_POOL_RESET", false);
++}
++
+ // For A/B measurements: debug.velox.defer_pool_reset=0 (Android) or
+ // GFXSTREAM_DEFERRED_DESCRIPTOR_POOL_RESET=false turns the deferred descriptor pool reset off.
+ static bool deferredDescriptorPoolResetAllowed() {
+@@ -1593,14 +1605,17 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+         mFeatureInfo.hasVulkanQueueSubmitWithCommands &&
+         mFeatureInfo.hasVulkanDeferredDescriptorPoolReset && deferredDescriptorPoolResetAllowed();
+ 
++    // Needs the process-wide command order, like the guest-only reset.
++    mAsyncDescriptorPoolReset = mGuestOnlyDescriptorPoolReset && asyncDescriptorPoolResetAllowed();
++
+     mFenceCompletionCache = mFeatureInfo.hasVulkanFenceStatusHint && fenceCompletionCacheAllowed();
+ #if DETECT_OS_ANDROID
+     char value[PROP_VALUE_MAX] = {};
+     mFenceStats = __system_property_get("debug.velox.fence_stats", value) > 0 &&
+                   strcmp(value, "1") == 0;
+     if (mFenceStats) {
+-        mesa_logi("velox-sync-config: guestOnlyPoolReset=%d fenceCache=%d",
+-                  mGuestOnlyDescriptorPoolReset, mFenceCompletionCache);
++        mesa_logi("velox-sync-config: guestOnlyPoolReset=%d asyncPoolReset=%d fenceCache=%d",
++                  mGuestOnlyDescriptorPoolReset, mAsyncDescriptorPoolReset, mFenceCompletionCache);
+     }
+ #endif
+ 
+@@ -5439,9 +5454,22 @@ VkResult ResourceTracker::on_vkResetDescriptorPool(void* context, VkResult, VkDe
+     if (mFenceStats) mStatPoolResets.fetch_add(1, std::memory_order_relaxed);
+     if (!mGuestOnlyDescriptorPoolReset || pool.hasHostAllocations.load(std::memory_order_acquire)) {
+         if (mFenceStats) mStatPoolResetRpc.fetch_add(1, std::memory_order_relaxed);
+-        const VkResult result =
+-            enc->vkResetDescriptorPool(device, descriptorPool, flags, true /* do lock */);
+-        if (result != VK_SUCCESS) return result;
++        if (mAsyncDescriptorPoolReset) {
++            // The host applies the reset in sequence-number order before any later command from
++            // any thread of this process; its status arrives with the next reply on this stream.
++            // vkResetDescriptorPool has no failure code for valid usage. A non-zero status from an
++            // earlier deferred reset is reported here and returned, like a lost device would be.
++            const int32_t earlier =
++                enc->vkResetDescriptorPoolDeferredStatusVELOX(device, descriptorPool, flags);
++            if (earlier != 0) {
++                mesa_loge("velox: deferred vkResetDescriptorPool reported %d", earlier);
++                return static_cast<VkResult>(earlier);
++            }
++        } else {
++            const VkResult result =
++                enc->vkResetDescriptorPool(device, descriptorPool, flags, true /* do lock */);
++            if (result != VK_SUCCESS) return result;
++        }
+         pool.hasHostAllocations.store(false, std::memory_order_relaxed);
+     }
+     clearDescriptorPoolAndUnregisterDescriptorSets(context, device, descriptorPool);
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index 3947342..cae79b7 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -927,6 +927,7 @@ class ResourceTracker {
+ 
+     struct GfxStreamVkFeatureInfo mFeatureInfo = {};
+     bool mGuestOnlyDescriptorPoolReset = false;
++    bool mAsyncDescriptorPoolReset = false;
+     // Several queues can submit command buffers referencing the same descriptor set.
+     std::mutex mDescriptorCommitLock;
+     bool mFenceCompletionCache = false;
+diff --git a/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl b/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
+index 3499964..e8f20b8 100644
+--- a/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
++++ b/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
+@@ -93,3 +93,49 @@ std::string VkEncoder::getPacketContents(const uint8_t* ptr, size_t len) {
+     }
+     return result;
+ }
++
++// Velox: same packet as the generated vkResetDescriptorPool, but the 4-byte VkResult the host
++// writes back is consumed by the next readback() on this stream instead of being waited for here.
++// The command is flushed immediately: with process-wide sequence numbers, an unflushed command
++// would stall every other thread's later commands on the host.
++int32_t VkEncoder::vkResetDescriptorPoolDeferredStatusVELOX(VkDevice device,
++                                                             VkDescriptorPool descriptorPool,
++                                                             VkDescriptorPoolResetFlags flags) {
++    const bool queueSubmitWithCommandsEnabled =
++        sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
++    if (!queueSubmitWithCommandsEnabled) {
++        GFXSTREAM_FATAL("vkResetDescriptorPoolDeferredStatusVELOX needs sequence numbers");
++    }
++    auto stream = mImpl->stream();
++    auto pool = mImpl->pool();
++    const uint32_t packetSize = 4 + 4 + 4 + 8 + 8 + sizeof(VkDescriptorPoolResetFlags);
++    uint8_t* streamPtr = stream->reserve(packetSize);
++    const uint32_t opcode = OP_vkResetDescriptorPool;
++    const uint32_t seqno = ResourceTracker::nextSeqno();
++    const uint64_t hostDevice = gfxstream_vk_device_to_host_u64(device);
++    const uint64_t hostPool = gfxstream_vk_descriptor_pool_to_host_u64(descriptorPool);
++    memcpy(streamPtr, &opcode, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    memcpy(streamPtr, &packetSize, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    memcpy(streamPtr, &seqno, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    memcpy(streamPtr, &hostDevice, 8);
++    streamPtr += 8;
++    memcpy(streamPtr, &hostPool, 8);
++    streamPtr += 8;
++    memcpy(streamPtr, &flags, sizeof(VkDescriptorPoolResetFlags));
++    stream->flush();
++    stream->deferStatusReply();
++    // Bound the replies left in the host-to-guest channel.
++    if (stream->deferredReplies() >= gfxstream::guest::IOStream::kMaxDeferredReplies &&
++        !stream->drainDeferredReplies()) {
++        GFXSTREAM_FATAL("FATAL: could not read deferred status replies");
++    }
++    ++encodeCount;
++    if (0 == encodeCount % POOL_CLEAR_INTERVAL) {
++        pool->freeAll();
++        stream->clearPool();
++    }
++    return stream->takeDeferredReplyError();
++}
+diff --git a/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl b/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl
+index 368533a..fb3d940 100644
+--- a/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl
++++ b/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl
+@@ -12,3 +12,9 @@
+     #define POOL_CLEAR_INTERVAL 10
+     uint32_t encodeCount = 0;
+     uint32_t featureBits = 0;
++    // Velox: vkResetDescriptorPool without waiting for the host's status reply. Only valid when
++    // every command carries the process-wide sequence number (VulkanQueueSubmitWithCommands), so
++    // the host applies the reset before any later command from any thread. Returns a non-zero
++    // status that an earlier deferred reply on this stream reported, or 0.
++    int32_t vkResetDescriptorPoolDeferredStatusVELOX(VkDevice device, VkDescriptorPool descriptorPool,
++                                                      VkDescriptorPoolResetFlags flags);
+diff --git a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
+index 4622b04..fce630e 100644
+--- a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
++++ b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
+@@ -123,6 +123,14 @@ bool VulkanStreamGuest::decStreamRef() { return mStream->decRef(); }
+ 
+ uint8_t* VulkanStreamGuest::reserve(size_t size) { return (uint8_t*)mStream->alloc(size); }
+ 
++void VulkanStreamGuest::deferStatusReply() { mStream->deferStatusReply(); }
++
++uint32_t VulkanStreamGuest::deferredReplies() const { return mStream->deferredReplies(); }
++
++bool VulkanStreamGuest::drainDeferredReplies() { return mStream->drainDeferredReplies(); }
++
++int32_t VulkanStreamGuest::takeDeferredReplyError() { return mStream->takeDeferredReplyError(); }
++
+ VulkanCountingStream::VulkanCountingStream() : VulkanStreamGuest(nullptr) {}
+ VulkanCountingStream::~VulkanCountingStream() = default;
+ 
+diff --git a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
+index 3a8cbee..a00e5c7 100644
+--- a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
++++ b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
+@@ -55,6 +55,12 @@ class VulkanStreamGuest : public gfxstream::aemu::Stream {
+ 
+     uint8_t* reserve(size_t size);
+ 
++    // Velox: status replies that are read later (see IOStream::deferStatusReply).
++    void deferStatusReply();
++    uint32_t deferredReplies() const;
++    bool drainDeferredReplies();
++    int32_t takeDeferredReplyError();
++
+    private:
+     gfxstream::aemu::BumpPool mPool;
+     std::vector<uint8_t> mWriteBuffer;
+-- 
+2.50.1.windows.1
+

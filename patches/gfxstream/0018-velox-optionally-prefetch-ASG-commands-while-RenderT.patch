@@ -1,0 +1,841 @@
+From 1194d2acae3fec72f370b0c161fcc1a48a81e9a1 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:48:06 +0900
+Subject: [PATCH] velox: optionally prefetch ASG commands while RenderThread
+ decodes (patch 0018)
+
+VELOX_ASG_PREFETCH=1 makes the serial receive path (now readRing) write
+into host-private chunks framed on packet boundaries. RenderThread decodes
+published packets in place (no second copy; the 0009 borrow still only sees
+host memory). A prefetch thread reads ahead while RenderThread decodes a
+large view (VELOX_ASG_PREFETCH_AHEAD=2, MIN_KB=64) and polls an empty ring
+sparsely (POLL=1024 pauses); when RenderThread runs out of packets it takes
+the rings over and receives directly, so small synchronous round trips do
+not pay a thread hand-off (and skip all signalling when the rings are free).
+One reader owns the rings at a time, so the ring order, host_state handling,
+replies and all length/range/opcode checks are unchanged. waitForFinished
+joins the prefetch thread before the ASG context frees the rings. Disabled
+after a snapshot load; disabled behaviour is the previous readRaw.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Icb718181fb23f4f864267d151ef8c9f9ce66f7ff
+---
+ host/read_buffer.cpp   |  14 ++
+ host/read_buffer.h     |   4 +
+ host/render_thread.cpp |  14 +-
+ host/ring_stream.cpp   | 500 ++++++++++++++++++++++++++++++++++++++++-
+ host/ring_stream.h     |  90 ++++++++
+ 5 files changed, 614 insertions(+), 8 deletions(-)
+
+diff --git a/host/read_buffer.cpp b/host/read_buffer.cpp
+index 441d6eb..d6135ee 100644
+--- a/host/read_buffer.cpp
++++ b/host/read_buffer.cpp
+@@ -22,6 +22,7 @@
+ #include <algorithm>
+ 
+ #include "gfxstream/common/logging.h"
++#include "ring_stream.h"
+ 
+ namespace gfxstream {
+ namespace host {
+@@ -106,6 +107,19 @@ int ReadBuffer::getData(IOStream* stream, size_t minSize) {
+     return readTotal;
+ }
+ 
++int ReadBuffer::getPrefetchedData(RingStream* stream, size_t minSize) {
++    assert(stream);
++    assert(minSize > m_validData);
++    size_t len = 0;
++    const unsigned char* view = stream->acquirePrefetched(m_validData, minSize, &len);
++    if (!view || len < minSize || len > INT_MAX) return -1;
++    const size_t fresh = len - m_validData;
++    // The view stays valid until the next call; the decoders read and may write it in place.
++    m_readPtr = const_cast<unsigned char*>(view);
++    m_validData = len;
++    return static_cast<int>(fresh);
++}
++
+ void ReadBuffer::consume(size_t amount) {
+     assert(amount <= m_validData);
+     m_validData -= amount;
+diff --git a/host/read_buffer.h b/host/read_buffer.h
+index 1534678..98e6225 100644
+--- a/host/read_buffer.h
++++ b/host/read_buffer.h
+@@ -19,6 +19,7 @@
+ #include "gfxstream/host/iostream.h"
+ 
+ namespace gfxstream {
++class RingStream;
+ namespace host {
+ 
+ class ReadBuffer {
+@@ -28,6 +29,9 @@ public:
+ 
+     void setNeededFreeTailSize(size_t size);
+     int getData(IOStream *stream, size_t minSize); // get fresh data from the stream
++    // Velox VELOX_ASG_PREFETCH: views the stream's prefetched bytes in place instead of
++    // copying them (see RingStream::acquirePrefetched()).
++    int getPrefetchedData(RingStream* stream, size_t minSize);
+     unsigned char *buf() { return m_readPtr; } // return the next read location
+     size_t validData() const { return m_validData; } // return the amount of valid data in readptr
+     void consume(size_t amount); // notify that 'amount' data has been consumed;
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index 57220ed..9f09771 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -271,7 +271,12 @@ bool RenderThread::saveSnapshot(const SnapshotObjects& objects) {
+ void RenderThread::waitForFinished() {
+     mDecodersShouldStop.store(true, std::memory_order_relaxed);
+     // A disconnected guest cannot drain an ASG reply while this thread waits for teardown.
+-    if (mRingStream) mRingStream->requestExit();
++    if (mRingStream) {
++        mRingStream->requestExit();
++        // Velox VELOX_ASG_PREFETCH: the ASG context has already woken a reader sleeping in
++        // onUnavailableRead, and its rings stay mapped until this returns.
++        mRingStream->stopPrefetch(true);
++    }
+     AutoLock lock(mLock);
+     while (!mFinished.load(std::memory_order_relaxed)) {
+         mFinishedSignal.wait(&lock);
+@@ -435,7 +440,9 @@ intptr_t RenderThread::main() {
+         }
+         int stat = 0;
+         if (packetSize > readBuf.validData()) {
+-            stat = readBuf.getData(ioStream, packetSize);
++            stat = (mRingStream && mRingStream->prefetchEnabled())
++                       ? readBuf.getPrefetchedData(mRingStream.get(), packetSize)
++                       : readBuf.getData(ioStream, packetSize);
+             if (stat <= 0) {
+                 if (saveSnapshot(snapshotObjects)) {
+                     continue;
+@@ -608,6 +615,9 @@ intptr_t RenderThread::main() {
+         }
+     }
+ 
++    // Velox VELOX_ASG_PREFETCH: stop receiving; teardown (waitForFinished) joins the thread.
++    if (mRingStream) mRingStream->stopPrefetch(false);
++
+ #if GFXSTREAM_ENABLE_HOST_GLES
+     if (tInfo->m_glInfo) {
+         FrameBuffer::getFB()->drainGlRenderThreadResources();
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 074fdab..40ffd6e 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -17,6 +17,7 @@
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdlib>
++#include <cstring>
+ #include <assert.h>
+ #include <memory.h>
+ 
+@@ -45,6 +46,21 @@ uint64_t asgSpinBudgetNs() {
+     return budget;
+ }
+ 
++// Velox: VELOX_ASG_PREFETCH=1 enables the receive prefetch thread (see ring_stream.h).
++bool asgPrefetchWanted() {
++    const char* value = std::getenv("VELOX_ASG_PREFETCH");
++    return value && !std::strcmp(value, "1");
++}
++
++size_t envSize(const char* name, size_t fallback, size_t lo, size_t hi) {
++    const char* value = std::getenv(name);
++    if (!value || !*value) return fallback;
++    char* end = nullptr;
++    const unsigned long long parsed = std::strtoull(value, &end, 10);
++    if (end == value || *end) return fallback;
++    return static_cast<size_t>(std::clamp<unsigned long long>(parsed, lo, hi));
++}
++
+ uint64_t monotonicNs() {
+     return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+@@ -58,6 +74,15 @@ namespace {
+ 
+ constexpr uint32_t kAsgDuplexVersion = 0x564c0002;
+ 
++// The stream starts with the 4-byte client flags that RenderThread::main() reads before the
++// first packet; every later packet carries its total length at byte offset 4.
++constexpr uint64_t kStreamFlagsSize = 4;
++constexpr uint64_t kPacketHeaderSize = 8;
++// The serial path grows ReadBuffer to any length a guest announces; the Vulkan decoder rejects
++// packets above 400 MiB. The prefetcher refuses anything above 1 GiB up front.
++constexpr uint64_t kMaxPrefetchPacket = 1ull << 30;
++constexpr uint64_t kPrefetchChunkAlign = 64 * 1024;
++
+ bool supportsDuplex(const AsgConsumerCreateInfo& info) {
+     return info.version == kAsgDuplexVersion && info.buffer_size >= 2 * kAsgPageSize &&
+            !(info.buffer_size & (info.buffer_size - 1)) && info.buffer_flush_interval &&
+@@ -142,19 +167,51 @@ RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
+     mCallbacks(info.callbacks),
+     mBufSize(info.buffer_size),
+     mDuplex(supportsDuplex(info)),
+-    mProfileTransfers(gfxstream::base::getEnvironmentVariable("VELOX_ASG_PROFILE") == "1") {}
++    mProfileTransfers(gfxstream::base::getEnvironmentVariable("VELOX_ASG_PROFILE") == "1"),
++    mPrefetchWanted(asgPrefetchWanted()) {
++    if (mPrefetchWanted) {
++        mPrefetchChunkSize =
++            envSize("VELOX_ASG_PREFETCH_CHUNK_KB", 1024, 64, 64 * 1024) * 1024;
++        mPrefetchMaxChunks = envSize("VELOX_ASG_PREFETCH_CHUNKS", 4, 2, 64);
++        // 0: no prefetch thread (RenderThread receives into the chunks itself), 1: read ahead
++        // whenever there is data, 2: read ahead only while RenderThread decodes a view of at
++        // least VELOX_ASG_PREFETCH_MIN_KB (a large command batch). Small synchronous round
++        // trips then never hand the rings between threads.
++        mPrefetchAhead = static_cast<int>(envSize("VELOX_ASG_PREFETCH_AHEAD", 2, 0, 2));
++        // Pauses between two polls of an empty ring by the prefetch thread.
++        mPrefetchPollPauses =
++            static_cast<uint32_t>(envSize("VELOX_ASG_PREFETCH_POLL", 1024, 0, 65536));
++        mPrefetchMinView = envSize("VELOX_ASG_PREFETCH_MIN_KB", 64, 0, 64 * 1024) * 1024;
++    }
++}
+ 
+ RingStream::~RingStream() {
++    stopPrefetch(true);
+     if (mProfileTransfers && mXmits) {
+         GFXSTREAM_INFO("VELOX_ASG_RX duplex=%d reads=%zu bytes=%zu type1=%llu type3_reads=%llu "
+                        "type1_bytes=%llu type3_bytes=%llu",
+                        mDuplex, mXmits, mTotalRecv, mType1Transfers, mType3Reads,
+                        mType1Bytes, mType3Bytes);
+     }
++    if (mProfileTransfers && mPrefetchStarted) {
++        GFXSTREAM_INFO("VELOX_ASG_PREFETCH ahead=%d poll=%u min_kb=%zu gate_opens=%llu chunk_kb=%zu chunks=%zu acquires=%llu misses=%llu "
++                       "takeovers_blocked=%llu ahead_reads=%llu ahead_bytes=%llu "
++                       "direct_reads=%llu direct_bytes=%llu rolls=%llu relocated_bytes=%llu "
++                       "joins=%llu join_bytes=%llu producer_stalls=%llu producer_sleeps=%llu",
++                       mPrefetchAhead, mPrefetchPollPauses, mPrefetchMinView / 1024,
++                       mPrefetchGateOpens, mPrefetchChunkSize / 1024,
++                       mPrefetchMaxChunks,
++                       mPrefetchAcquires,
++                       mPrefetchMisses, mPrefetchTakeoverBlocks, mPrefetchProducerReads,
++                       mPrefetchProducerBytes, mPrefetchDirectReads, mPrefetchDirectBytes,
++                       mPrefetchRolls, mPrefetchRelocatedBytes, mPrefetchJoins,
++                       mPrefetchJoinBytes, mPrefetchProducerStalls, mPrefetchProducerSleeps);
++    }
+ }
+ 
+ void RingStream::requestExit() {
+     mShouldExit.store(true, std::memory_order_release);
++    if (mPrefetchWanted) wakePrefetchWaiters();
+ }
+ 
+ void RingStream::protocolError() {
+@@ -247,6 +304,21 @@ uint32_t RingStream::availableCommandBytes(const ring_buffer* ring, const ring_b
+ }
+ 
+ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
++    if (!prefetchEnabled()) return readRing(buf, inout_len);
++
++    // Only RenderThread::main() reads through here (the client flags before the first
++    // packet); ReadBuffer borrows larger views with acquirePrefetched().
++    size_t len = 0;
++    const unsigned char* view = acquirePrefetched(0, 1, &len);
++    if (!view) return nullptr;
++    const size_t count = std::min(*inout_len, len);
++    memcpy(buf, view, count);
++    mConsViewEnd -= len - count;
++    *inout_len = count;
++    return static_cast<const unsigned char*>(buf);
++}
++
++const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+     size_t wanted = *inout_len;
+     size_t count = 0U;
+     auto dst = static_cast<char*>(buf);
+@@ -280,7 +352,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+             break;
+         }
+ 
+-        if (exitRequested()) return nullptr;
++        if (exitRequested() || mPrefetchStop.load(std::memory_order_relaxed)) return nullptr;
+         __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_RELEASE);
+ 
+         ringAvailable = availableCommandBytes(mContext.to_host, nullptr, mCommandConsumed);
+@@ -312,6 +384,19 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+                 inLargeXfer = false;
+             }
+         } else {
++            // Velox prefetch: the prefetch thread lets RenderThread receive directly (never
++            // set on the serial path).
++            if (mReaderIsProducer) {
++                if (producerShouldYield()) {
++                    *inout_len = 0;
++                    return static_cast<const unsigned char*>(buf);
++                }
++                // Poll an empty ring less often than the serial path does: every poll reads
++                // the ring indices and stores host_state, cache lines the guest writes.
++                for (uint32_t i = 0; i < mPrefetchPollPauses && !producerShouldYield(); ++i) {
++                    ring_buffer_yield();
++                }
++            }
+             if (!mDuplex && inLargeXfer &&
+                 __atomic_load_n(&mContext.ring_config->transfer_size, __ATOMIC_ACQUIRE)) {
+                 if (spins < maxSpins) {
+@@ -331,7 +416,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+                 spins = 0;
+             }
+ 
+-            if (exitRequested()) return nullptr;
++            if (exitRequested() || mPrefetchStop.load(std::memory_order_relaxed)) return nullptr;
+ 
+             if (const uint64_t budget = asgSpinBudgetNs();
+                 budget && monotonicNs() - mLastDataNs < budget) {
+@@ -488,6 +573,380 @@ void RingStream::type3Read(
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// Velox receive prefetch (VELOX_ASG_PREFETCH=1).
++//
++// readRing() (the serial receive path, with all of its ring, transfer and host_state handling)
++// now writes into the tail of a host-private chunk. The bytes are framed by the packet length
++// at offset 4, and the end of the last complete packet is published. A packet never straddles
++// two chunks: when the packet being received does not fit, its received bytes move to a new
++// chunk before they are published. RenderThread decodes published bytes in place and releases
++// a chunk once it has moved past it, so the decoder never sees guest-writable memory and
++// nothing is copied a second time.
++//
++// One reader at a time owns the rings (mRingReaderMutex guards readRing() and the framing
++// state). While RenderThread decodes, the prefetch thread reads ahead. When RenderThread runs
++// out of published packets it takes the rings over (the prefetch thread gives them up while it
++// polls an empty ring) and receives directly, as the serial path does, so a synchronous round
++// trip does not pay a thread hand-off. Replies (commitBuffer) stay on RenderThread unchanged.
++// ---------------------------------------------------------------------------------------------
++
++bool RingStream::producerShouldYield() const {
++    return mConsumerWantsRing.load(std::memory_order_acquire) ||
++           (mPrefetchAhead == 2 && !mConsumerBusy.load(std::memory_order_acquire));
++}
++
++// RenderThread is about to decode a view: with VELOX_ASG_PREFETCH_AHEAD=2 the prefetch thread
++// reads ahead from now until RenderThread asks for data again, if the view is large.
++void RingStream::consumerBusy(size_t viewSize) {
++    if (mPrefetchAhead == 2 && viewSize < mPrefetchMinView) return;
++    ++mPrefetchGateOpens;
++    mConsumerBusy.store(true, std::memory_order_seq_cst);
++    if (mPrefetchAhead == 2 && mProducerWaiting.load(std::memory_order_seq_cst)) {
++        std::lock_guard<std::mutex> lock(mPrefetchMutex);
++        mProducerCv.notify_one();
++    }
++}
++
++bool RingStream::prefetchStopping() const {
++    return mShouldExit.load(std::memory_order_acquire) ||
++           mPrefetchStop.load(std::memory_order_acquire);
++}
++
++void RingStream::wakePrefetchWaiters() {
++    std::lock_guard<std::mutex> lock(mPrefetchMutex);
++    mProducerCv.notify_all();
++}
++
++bool RingStream::startPrefetch() {
++    if (mPrefetchStarted) return true;
++    if (prefetchStopping()) return false;
++    // The first chunk exists before either reader runs. The client flags are framed as a
++    // packet of their own.
++    mProdChunk = newPrefetchChunk(0, 0);
++    if (!mProdChunk) return false;
++    mProdWritten = 0;
++    mFrameNext = 0;
++    mFrameEnd = kStreamFlagsSize;
++    mPrefetchStarted = true;
++    if (mPrefetchAhead) mPrefetchThread = std::thread([this] { prefetchMain(); });
++    return true;
++}
++
++void RingStream::stopPrefetch(bool join) {
++    if (!mPrefetchWanted) return;
++    mPrefetchStop.store(true, std::memory_order_release);
++    wakePrefetchWaiters();
++    if (join && mPrefetchThread.joinable() &&
++        mPrefetchThread.get_id() != std::this_thread::get_id()) {
++        mPrefetchThread.join();
++    }
++}
++
++RingStream::PrefetchChunk* RingStream::newPrefetchChunk(uint64_t start, uint64_t minCapacity) {
++    const uint64_t wanted = std::max<uint64_t>(minCapacity, mPrefetchChunkSize);
++    const uint64_t capacity = (wanted + kPrefetchChunkAlign - 1) & ~(kPrefetchChunkAlign - 1);
++    std::unique_ptr<PrefetchChunk> chunk;
++    {
++        std::lock_guard<std::mutex> lock(mPrefetchMutex);
++        if (capacity == mPrefetchChunkSize && !mFreeChunks.empty()) {
++            chunk = std::move(mFreeChunks.back());
++            mFreeChunks.pop_back();
++        }
++    }
++    if (!chunk) {
++        chunk = std::make_unique<PrefetchChunk>();
++        chunk->data.reset(new (std::nothrow) unsigned char[capacity]);
++        if (!chunk->data) {
++            GFXSTREAM_ERROR("VELOX_ASG_PREFETCH: failed to allocate %llu bytes",
++                            static_cast<unsigned long long>(capacity));
++            protocolError();
++            return nullptr;
++        }
++        chunk->capacity = capacity;
++    }
++    chunk->start = start;
++    chunk->published.store(start, std::memory_order_relaxed);
++    chunk->sealed.store(false, std::memory_order_relaxed);
++    PrefetchChunk* result = chunk.get();
++    {
++        std::lock_guard<std::mutex> lock(mPrefetchMutex);
++        mPrefetchChunks.push_back(std::move(chunk));
++    }
++    return result;
++}
++
++bool RingStream::rollPrefetchChunk(uint64_t minCapacity) {
++    PrefetchChunk* old = mProdChunk;
++    const uint64_t partial = mProdWritten - mFrameNext;
++    PrefetchChunk* next = newPrefetchChunk(mFrameNext, std::max(minCapacity, partial));
++    if (!next) return false;
++    if (partial) {
++        memcpy(next->data.get(), old->data.get() + (mFrameNext - old->start), partial);
++        mPrefetchRelocatedBytes += partial;
++    }
++    ++mPrefetchRolls;
++    // |old| is published up to mFrameNext; RenderThread moves on once it sees the seal.
++    old->sealed.store(true, std::memory_order_release);
++    mProdChunk = next;
++    return true;
++}
++
++bool RingStream::framePrefetched() {
++    PrefetchChunk* chunk = mProdChunk;
++    for (;;) {
++        if (!mFrameEnd) {
++            if (mProdWritten - mFrameNext < kPacketHeaderSize) break;
++            uint32_t packetSize = 0;
++            memcpy(&packetSize, chunk->data.get() + (mFrameNext - chunk->start) + 4,
++                   sizeof(packetSize));
++            // A length below the header is still handed to the decoders, which reject it.
++            const uint64_t framed = std::max<uint64_t>(packetSize, kPacketHeaderSize);
++            if (framed > kMaxPrefetchPacket) {
++                GFXSTREAM_ERROR("VELOX_ASG_PREFETCH: packet length %u exceeds %llu", packetSize,
++                                static_cast<unsigned long long>(kMaxPrefetchPacket));
++                protocolError();
++                return false;
++            }
++            mFrameEnd = mFrameNext + framed;
++        }
++        if (mFrameEnd > mProdWritten) break;
++        mFrameNext = mFrameEnd;
++        mFrameEnd = 0;
++    }
++    if (mFrameNext > chunk->published.load(std::memory_order_relaxed)) {
++        chunk->published.store(mFrameNext, std::memory_order_release);
++        mPublishedEnd.store(mFrameNext, std::memory_order_release);
++    }
++    const uint64_t chunkEnd = chunk->start + chunk->capacity;
++    const uint64_t needed = mFrameEnd ? mFrameEnd : mFrameNext + kPacketHeaderSize;
++    if (needed > chunkEnd) return rollPrefetchChunk(needed - mFrameNext);
++    return true;
++}
++
++// One receive step by the current ring owner. 1: bytes received, 0: nothing (the prefetch
++// thread gave the rings up), -1: readRing() returned early (exit, error or snapshot).
++int RingStream::pumpPrefetch(bool producer) {
++    PrefetchChunk* chunk = mProdChunk;
++    const uint64_t used = mProdWritten - chunk->start;
++    size_t len = static_cast<size_t>(chunk->capacity - used);
++    if (!len) return rollPrefetchChunk(0) ? 0 : -1;
++    mReaderIsProducer = producer;
++    const unsigned char* got = readRing(chunk->data.get() + used, &len);
++    mReaderIsProducer = false;
++    if (!got) return -1;
++    if (!len) return 0;
++    mProdWritten += len;
++    if (producer) {
++        ++mPrefetchProducerReads;
++        mPrefetchProducerBytes += len;
++    } else {
++        ++mPrefetchDirectReads;
++        mPrefetchDirectBytes += len;
++    }
++    return framePrefetched() ? 1 : -1;
++}
++
++void RingStream::prefetchIdle(bool* sleeping) {
++    const uint64_t takeoverBudget = 4 * std::max<uint64_t>(asgSpinBudgetNs(), 20000);
++    constexpr uint64_t kClosedGateBudget = 2000;
++    const uint64_t start = monotonicNs();
++    while ((producerShouldYield() || mInSnapshotOperation.load(std::memory_order_acquire)) &&
++           !prefetchStopping()) {
++        const bool takeover = mConsumerWantsRing.load(std::memory_order_acquire);
++        if (monotonicNs() - start < (takeover ? takeoverBudget : kClosedGateBudget)) {
++            ring_buffer_yield();
++            continue;
++        }
++        *sleeping = true;
++        std::unique_lock<std::mutex> lock(mPrefetchMutex);
++        mProducerWaiting.store(true, std::memory_order_seq_cst);
++        if (producerShouldYield() || mInSnapshotOperation.load(std::memory_order_seq_cst)) {
++            mProducerCv.wait_for(lock, std::chrono::milliseconds(2));
++        }
++        mProducerWaiting.store(false, std::memory_order_relaxed);
++    }
++}
++
++void RingStream::prefetchMain() {
++    while (!prefetchStopping()) {
++        // RenderThread takes priority for the rings; a pending snapshot stops the read-ahead
++        // (RenderThread still receives on demand, as the serial path does).
++        if (producerShouldYield() || mInSnapshotOperation.load(std::memory_order_acquire)) {
++            bool slept = false;
++            prefetchIdle(&slept);
++            if (slept) ++mPrefetchProducerSleeps;
++            continue;
++        }
++        {
++            // Read ahead at most mPrefetchMaxChunks chunks (a roll inside one step may add one).
++            std::unique_lock<std::mutex> lock(mPrefetchMutex);
++            if (mPrefetchChunks.size() >= mPrefetchMaxChunks) {
++                ++mPrefetchProducerStalls;
++                mProducerWaiting.store(true, std::memory_order_seq_cst);
++                mProducerCv.wait_for(lock, std::chrono::milliseconds(2));
++                mProducerWaiting.store(false, std::memory_order_relaxed);
++                continue;
++            }
++        }
++        std::unique_lock<std::mutex> reader(mRingReaderMutex, std::try_to_lock);
++        if (!reader.owns_lock()) {
++            ring_buffer_yield();
++            continue;
++        }
++        if (producerShouldYield()) continue;
++        if (pumpPrefetch(true) < 0) {
++            reader.unlock();
++            if (prefetchStopping()) break;
++            // A snapshot is pending; readRing() returns early until it resumes.
++            gfxstream::base::sleepUs(1000);
++        }
++    }
++    exitRequested();  // publishes ASG_HOST_STATE_EXIT if that is why the loop ended
++}
++
++RingStream::PrefetchChunk* RingStream::consumerChunkFor(uint64_t pos) {
++    PrefetchChunk* chunk = mConsChunk;
++    if (chunk && (!chunk->sealed.load(std::memory_order_acquire) ||
++                  pos < chunk->published.load(std::memory_order_acquire))) {
++        return chunk;
++    }
++    std::vector<std::unique_ptr<PrefetchChunk>> released;
++    {
++        std::lock_guard<std::mutex> lock(mPrefetchMutex);
++        bool freed = false;
++        while (mPrefetchChunks.size() > 1) {
++            PrefetchChunk* front = mPrefetchChunks.front().get();
++            if (!front->sealed.load(std::memory_order_acquire) ||
++                front->published.load(std::memory_order_acquire) > pos) {
++                break;
++            }
++            if (front->capacity == mPrefetchChunkSize && mFreeChunks.size() < mPrefetchMaxChunks) {
++                mFreeChunks.push_back(std::move(mPrefetchChunks.front()));
++            } else {
++                released.push_back(std::move(mPrefetchChunks.front()));
++            }
++            mPrefetchChunks.pop_front();
++            freed = true;
++        }
++        chunk = mPrefetchChunks.empty() ? nullptr : mPrefetchChunks.front().get();
++        if (freed && mProducerWaiting.load(std::memory_order_seq_cst)) {
++            mProducerCv.notify_one();
++        }
++    }
++    mConsChunk = chunk;
++    return chunk;
++}
++
++// RenderThread receives directly until the stream holds |minSize| published bytes at |pos|.
++bool RingStream::receiveDirect(uint64_t pos, size_t minSize) {
++    ++mPrefetchTakeovers;
++    // Fast path: the prefetch thread is idle (the gate is closed for small round trips), so
++    // the rings are free and nothing has to be signalled.
++    std::unique_lock<std::mutex> reader(mRingReaderMutex, std::try_to_lock);
++    const bool contended = !reader.owns_lock();
++    if (contended) {
++        mConsumerWantsRing.store(true, std::memory_order_seq_cst);
++        // The prefetch thread lets go within one empty poll; it may also be mid-copy, or
++        // asleep in onUnavailableRead until the guest's next ping (then it publishes that
++        // data first).
++        const uint64_t budget = std::max<uint64_t>(asgSpinBudgetNs(), 20000);
++        const uint64_t start = monotonicNs();
++        while (!reader.try_lock()) {
++            if (monotonicNs() - start >= budget) {
++                ++mPrefetchTakeoverBlocks;
++                reader.lock();
++                break;
++            }
++            ring_buffer_yield();
++        }
++    }
++    // Release chunks behind |pos| so that receiving never waits on this thread itself.
++    consumerChunkFor(pos);
++    bool ok = true;
++    while (mPublishedEnd.load(std::memory_order_acquire) - pos < minSize) {
++        if (pumpPrefetch(false) < 0) {
++            ok = false;
++            break;
++        }
++    }
++    reader.unlock();
++    if (contended) mConsumerWantsRing.store(false, std::memory_order_seq_cst);
++    // With AHEAD=2 the gate is closed here (RenderThread is between views); consumerBusy()
++    // wakes the prefetch thread when it opens.
++    if (mPrefetchAhead != 2 && mProducerWaiting.load(std::memory_order_seq_cst)) {
++        std::lock_guard<std::mutex> lock(mPrefetchMutex);
++        mProducerCv.notify_one();
++    }
++    return ok;
++}
++
++// A request that crosses a chunk boundary (only when the decoders asked for more than the
++// complete packets of a sealed chunk, e.g. after an unknown opcode) is served from a copy.
++// The caller has made sure the bytes are published.
++const unsigned char* RingStream::joinPrefetched(uint64_t pos, size_t minSize) {
++    mJoinBuffer.resize(minSize);
++    size_t copied = 0;
++    std::lock_guard<std::mutex> lock(mPrefetchMutex);
++    for (const auto& chunk : mPrefetchChunks) {
++        if (copied == minSize) break;
++        const uint64_t from = pos + copied;
++        const uint64_t published = chunk->published.load(std::memory_order_acquire);
++        if (from < chunk->start || from >= published) continue;
++        const size_t take =
++            static_cast<size_t>(std::min<uint64_t>(published - from, minSize - copied));
++        memcpy(mJoinBuffer.data() + copied, chunk->data.get() + (from - chunk->start), take);
++        copied += take;
++    }
++    if (copied != minSize) return nullptr;
++    ++mPrefetchJoins;
++    mPrefetchJoinBytes += minSize;
++    mConsViewEnd = pos + minSize;
++    return mJoinBuffer.data();
++}
++
++const unsigned char* RingStream::acquirePrefetched(size_t unconsumed, size_t minSize,
++                                                   size_t* outLen) {
++    if (!startPrefetch()) return nullptr;
++    if (unconsumed > mConsViewEnd) {
++        protocolError();
++        return nullptr;
++    }
++    const uint64_t pos = mConsViewEnd - unconsumed;
++    ++mPrefetchAcquires;
++    mConsumerBusy.store(false, std::memory_order_release);
++    for (;;) {
++        if (exitRequested() || mPrefetchStop.load(std::memory_order_acquire)) return nullptr;
++        if (PrefetchChunk* chunk = consumerChunkFor(pos)) {
++            const uint64_t published = chunk->published.load(std::memory_order_acquire);
++            if (pos < chunk->start) {
++                protocolError();
++                return nullptr;
++            }
++            const uint64_t available = published > pos ? published - pos : 0;
++            if (available >= minSize) {
++                mConsViewEnd = published;
++                *outLen = static_cast<size_t>(available);
++                consumerBusy(*outLen);
++                return chunk->data.get() + (pos - chunk->start);
++            }
++            if (chunk->sealed.load(std::memory_order_acquire) &&
++                mPublishedEnd.load(std::memory_order_acquire) - pos >= minSize) {
++                if (const unsigned char* joined = joinPrefetched(pos, minSize)) {
++                    *outLen = minSize;
++                    consumerBusy(minSize);
++                    return joined;
++                }
++                protocolError();
++                return nullptr;
++            }
++            if (mPublishedEnd.load(std::memory_order_acquire) - pos >= minSize) continue;
++        }
++        ++mPrefetchMisses;
++        if (!receiveDirect(pos, minSize)) return nullptr;
++    }
++}
++
+ void* RingStream::getDmaForReading(uint64_t guest_paddr) {
+     return gfxstream::host::g_gfxstream_dma_get_host_addr(guest_paddr);
+ }
+@@ -509,9 +968,37 @@ const unsigned char *RingStream::readFully( void *buf, size_t len) {
+ }
+ 
+ void RingStream::onSave(gfxstream::Stream* stream) {
+-    stream->putBe32(mReadBufferLeft);
+-    stream->write(mReadBuffer.data() + mReadBuffer.size() - mReadBufferLeft,
+-                  mReadBufferLeft);
++    if (mPrefetchStarted) {
++        // RenderThread saved its ReadBuffer view; the prefetch thread does not read ahead
++        // during a snapshot (mInSnapshotOperation) and the rings are locked here.
++        // Save what follows that view in stream order: the prefetched bytes RenderThread has
++        // not taken, then readRing()'s own leftover. After a load the serial path reads them.
++        std::vector<unsigned char> pending;
++        std::lock_guard<std::mutex> reader(mRingReaderMutex);
++        {
++            std::lock_guard<std::mutex> lock(mPrefetchMutex);
++            for (const auto& chunk : mPrefetchChunks) {
++                const uint64_t end = chunk.get() == mProdChunk
++                                         ? mProdWritten
++                                         : chunk->published.load(std::memory_order_acquire);
++                const uint64_t from = std::max(chunk->start, mConsViewEnd);
++                if (end > from) {
++                    const unsigned char* src = chunk->data.get() + (from - chunk->start);
++                    pending.insert(pending.end(), src, src + (end - from));
++                }
++            }
++        }
++        const unsigned char* left =
++            reinterpret_cast<const unsigned char*>(mReadBuffer.data()) +
++            (mReadBuffer.size() - mReadBufferLeft);
++        pending.insert(pending.end(), left, left + mReadBufferLeft);
++        stream->putBe32(static_cast<uint32_t>(pending.size()));
++        stream->write(pending.data(), pending.size());
++    } else {
++        stream->putBe32(mReadBufferLeft);
++        stream->write(mReadBuffer.data() + mReadBuffer.size() - mReadBufferLeft,
++                      mReadBufferLeft);
++    }
+ 
+     gfxstream::host::saveBuffer(stream, mWriteBuffer);
+ 
+@@ -525,6 +1012,7 @@ void RingStream::onSave(gfxstream::Stream* stream) {
+ }
+ 
+ unsigned char* RingStream::onLoad(gfxstream::Stream* stream) {
++    mLoadedFromSnapshot = true;  // the loaded stream state belongs to the serial path
+     gfxstream::host::loadBuffer(stream, &mReadBuffer);
+     mReadBufferLeft = mReadBuffer.size();
+ 
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index 5ddd279..361a39e 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -15,7 +15,14 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
+ #include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
+ 
+ #include "gfxstream/host/address_space_graphics_types.h"
+ #include "gfxstream/host/iostream.h"
+@@ -48,6 +55,19 @@ class RingStream final : public IOStream {
+     void requestExit();
+     void protocolError();
+ 
++    // Velox (VELOX_ASG_PREFETCH=1): a second thread copies the command stream out of the
++    // shared ASG rings into host-private chunks while this RenderThread decodes, and the
++    // decoder reads the chunks in place (no second copy). The byte order is the ring order;
++    // chunk boundaries fall on packet boundaries. Disabled after a snapshot load.
++    bool prefetchEnabled() const { return mPrefetchWanted && !mLoadedFromSnapshot; }
++    // Returns a contiguous view that starts at the first byte the caller still needs:
++    // |unconsumed| is how many bytes at the end of the previous view were not consumed.
++    // Blocks until the view holds at least |minSize| bytes. nullptr on exit or snapshot.
++    const unsigned char* acquirePrefetched(size_t unconsumed, size_t minSize, size_t* outLen);
++    // Stops the prefetch thread; |join| waits for it (teardown only: the ASG context must
++    // already have woken a thread sleeping in onUnavailableRead).
++    void stopPrefetch(bool join);
++
+   protected:
+     virtual void* allocBuffer(size_t minSize) override final;
+     virtual int commitBuffer(size_t size) override final;
+@@ -58,6 +78,7 @@ class RingStream final : public IOStream {
+     void onSave(gfxstream::Stream* stream) override;
+     unsigned char* onLoad(gfxstream::Stream* stream) override;
+ 
++    const unsigned char* readRing(void* buf, size_t* inout_len);
+     void type1Read(size_t* count, char* current, const char* ptrEnd);
+     void type3Read(uint32_t available, size_t* count, char* current, const char* ptrEnd);
+     uint32_t availableCommandBytes(const ring_buffer* ring, const ring_buffer_view* view,
+@@ -100,6 +121,75 @@ class RingStream final : public IOStream {
+     std::atomic<bool> mShouldExit{false};
+     bool mShouldExitForSnapshot = false;
+     std::atomic<bool> mInSnapshotOperation{false};
++
++    // Velox prefetch (see prefetchEnabled()).
++    struct PrefetchChunk {
++        std::unique_ptr<unsigned char[]> data;
++        size_t capacity = 0;
++        uint64_t start = 0;                 // stream offset of data[0]
++        std::atomic<uint64_t> published{0};  // stream offset after the last complete packet
++        std::atomic<bool> sealed{false};     // no more bytes; the next chunk exists
++    };
++    bool startPrefetch();
++    void prefetchMain();
++    void prefetchIdle(bool* sleeping);
++    int pumpPrefetch(bool producer);
++    bool framePrefetched();
++    bool rollPrefetchChunk(uint64_t minCapacity);
++    PrefetchChunk* newPrefetchChunk(uint64_t start, uint64_t minCapacity);
++    PrefetchChunk* consumerChunkFor(uint64_t pos);
++    bool receiveDirect(uint64_t pos, size_t minSize);
++    const unsigned char* joinPrefetched(uint64_t pos, size_t minSize);
++    void wakePrefetchWaiters();
++    bool prefetchStopping() const;
++    bool producerShouldYield() const;
++    void consumerBusy(size_t viewSize);
++
++    const bool mPrefetchWanted;
++    int mPrefetchAhead = 0;
++    uint32_t mPrefetchPollPauses = 0;
++    size_t mPrefetchMinView = 0;
++    std::atomic<bool> mConsumerBusy{false};
++    bool mLoadedFromSnapshot = false;
++    bool mPrefetchStarted = false;  // RenderThread only
++    std::thread mPrefetchThread;
++    std::atomic<bool> mPrefetchStop{false};
++    std::atomic<bool> mConsumerWantsRing{false};
++    std::atomic<bool> mProducerWaiting{false};
++    std::atomic<uint64_t> mPublishedEnd{0};
++    // The ring owner: guards readRing() and the framing state below.
++    std::mutex mRingReaderMutex;
++    bool mReaderIsProducer = false;
++    PrefetchChunk* mProdChunk = nullptr;
++    uint64_t mProdWritten = 0;
++    uint64_t mFrameNext = 0;  // start of the first incomplete packet
++    uint64_t mFrameEnd = 0;   // its end once the header is known, otherwise 0
++    unsigned long long mPrefetchRolls = 0;
++    unsigned long long mPrefetchRelocatedBytes = 0;
++    unsigned long long mPrefetchProducerReads = 0;
++    unsigned long long mPrefetchProducerBytes = 0;
++    unsigned long long mPrefetchDirectReads = 0;
++    unsigned long long mPrefetchDirectBytes = 0;
++    // Chunk list.
++    std::mutex mPrefetchMutex;
++    std::condition_variable mProducerCv;
++    std::deque<std::unique_ptr<PrefetchChunk>> mPrefetchChunks;  // guarded by mPrefetchMutex
++    std::vector<std::unique_ptr<PrefetchChunk>> mFreeChunks;    // guarded by mPrefetchMutex
++    size_t mPrefetchChunkSize = 0;
++    size_t mPrefetchMaxChunks = 0;
++    unsigned long long mPrefetchProducerStalls = 0;
++    unsigned long long mPrefetchProducerSleeps = 0;
++    // RenderThread only.
++    PrefetchChunk* mConsChunk = nullptr;
++    uint64_t mConsViewEnd = 0;
++    std::vector<unsigned char> mJoinBuffer;
++    unsigned long long mPrefetchAcquires = 0;
++    unsigned long long mPrefetchMisses = 0;
++    unsigned long long mPrefetchTakeovers = 0;
++    unsigned long long mPrefetchTakeoverBlocks = 0;
++    unsigned long long mPrefetchJoins = 0;
++    unsigned long long mPrefetchJoinBytes = 0;
++    unsigned long long mPrefetchGateOpens = 0;
+ };
+ 
+ }  // namespace gfxstream
+-- 
+2.50.1.windows.1
+

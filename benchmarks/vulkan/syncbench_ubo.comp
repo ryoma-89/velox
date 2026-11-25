@@ -1,0 +1,16 @@
+#version 450
+// syncbench: descriptor の内容を GPU で読み、出力バッファの指定位置へ書く（検算用）。
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    uint value;
+    uint index;
+} params;
+
+layout(set = 0, binding = 1, std430) buffer Output {
+    uint words[];
+} outbuf;
+
+void main() {
+    outbuf.words[params.index] = params.value * 2654435761u + 0x9e3779b9u;
+}

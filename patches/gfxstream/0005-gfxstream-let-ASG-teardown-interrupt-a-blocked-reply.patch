@@ -1,0 +1,206 @@
+From e7315ee45f1f968a63b82686a75bc0bd96bcbf75 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:18:16 +0900
+Subject: [PATCH] gfxstream: let ASG teardown interrupt a blocked reply write
+
+When a guest process exits, the vCPU that destroys its address space
+graphics context holds the BQL and waits in RenderThread::waitForFinished.
+If the render thread was writing a reply into the from-host ring, nobody
+drains it and RingStream::commitBuffer spun forever: the whole VM hung
+(observed after force-stopping AnTuTu with hw.gltransport=asg; QEMU reported
+every vCPU and the main loop as hanging). waitForFinished now requests exit
+first; commitBuffer and readRaw check an atomic exit flag, publish
+ASG_HOST_STATE_EXIT and return. The type 1 transfer bounds check no longer
+forms an out-of-range pointer from guest-controlled sizes.
+
+Written by Codex, root cause confirmed and committed by Claude Code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I14ca1e71c74eb76fd2454feebd0a8627c55ea41f
+---
+ host/render_thread.cpp |  2 ++
+ host/ring_stream.cpp   | 53 +++++++++++++++++++++++-------------------
+ host/ring_stream.h     |  7 ++++--
+ 3 files changed, 36 insertions(+), 26 deletions(-)
+
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index 05b1973..7bef4aa 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -270,6 +270,8 @@ bool RenderThread::saveSnapshot(const SnapshotObjects& objects) {
+ 
+ void RenderThread::waitForFinished() {
+     mDecodersShouldStop.store(true, std::memory_order_relaxed);
++    // A disconnected guest cannot drain an ASG reply while this thread waits for teardown.
++    if (mRingStream) mRingStream->requestExit();
+     AutoLock lock(mLock);
+     while (!mFinished.load(std::memory_order_relaxed)) {
+         mFinishedSignal.wait(&lock);
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 1aa1f17..1268bfd 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -97,6 +97,16 @@ RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
+ 
+ RingStream::~RingStream() = default;
+ 
++void RingStream::requestExit() {
++    mShouldExit.store(true, std::memory_order_release);
++}
++
++bool RingStream::exitRequested() {
++    if (!mShouldExit.load(std::memory_order_acquire)) return false;
++    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_EXIT, __ATOMIC_RELEASE);
++    return true;
++}
++
+ void RingStream::reloadRingConfig() {
+     *mContext.ring_config = mSavedRingConfig;
+ }
+@@ -116,21 +126,17 @@ int RingStream::commitBuffer(size_t size) {
+     size_t backedOffIters = 0;
+     const size_t kBackoffIters = 10000000ULL;
+     while (sent < size) {
++        if (exitRequested()) return sent;
+         ++iters;
+         auto avail = ring_buffer_available_write(
+             mContext.from_host_large_xfer.ring,
+             &mContext.from_host_large_xfer.view);
+ 
+-        // Check if the guest process crashed.
+         if (!avail) {
+-            if (*(mContext.host_state) == ASG_HOST_STATE_EXIT) {
+-                return sent;
+-            } else {
+-                ring_buffer_yield();
+-                if (iters > kBackoffIters) {
+-                    gfxstream::base::sleepUs(10);
+-                    ++backedOffIters;
+-                }
++            ring_buffer_yield();
++            if (iters > kBackoffIters) {
++                gfxstream::base::sleepUs(10);
++                ++backedOffIters;
+             }
+             continue;
+         }
+@@ -167,7 +173,8 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+     uint32_t spins = 0;
+     bool inLargeXfer = true;
+ 
+-    *(mContext.host_state) = ASG_HOST_STATE_CAN_CONSUME;
++    if (exitRequested()) return nullptr;
++    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_RELEASE);
+ 
+     while (count < wanted) {
+ 
+@@ -188,11 +195,8 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+             break;
+         }
+ 
+-        *(mContext.host_state) = ASG_HOST_STATE_CAN_CONSUME;
+-
+-        if (mShouldExit) {
+-            return nullptr;
+-        }
++        if (exitRequested()) return nullptr;
++        __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_RELEASE);
+ 
+         ringAvailable =
+             ring_buffer_available_read(mContext.to_host, 0);
+@@ -248,9 +252,7 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+                 spins = 0;
+             }
+ 
+-            if (mShouldExit) {
+-                return nullptr;
+-            }
++            if (exitRequested()) return nullptr;
+ 
+             if (mShouldExitForSnapshot && mInSnapshotOperation) {
+                 return nullptr;
+@@ -280,13 +282,14 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+                     const AsgOnUnavailableReadStatus status = mCallbacks.onUnavailableRead();
+                     switch (status) {
+                         case AsgOnUnavailableReadStatus::kContinue: {
+-                            *(mContext.host_state) = ASG_HOST_STATE_CAN_CONSUME;
++                            __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME,
++                                             __ATOMIC_RELEASE);
+                             break;
+                         }
+                         case AsgOnUnavailableReadStatus::kExit: {
+-                            *(mContext.host_state) = ASG_HOST_STATE_EXIT;
+-                            mShouldExit = true;
+-                            break;
++                            requestExit();
++                            exitRequested();
++                            return nullptr;
+                         }
+                         case AsgOnUnavailableReadStatus::kSleep: {
+                             sleeping = true;
+@@ -311,7 +314,8 @@ const unsigned char* RingStream::readRaw(void* buf, size_t* inout_len) {
+     ++mXmits;
+     mTotalRecv += count;
+ 
+-    *(mContext.host_state) = ASG_HOST_STATE_RENDERING;
++    if (exitRequested()) return nullptr;
++    __atomic_store_n(mContext.host_state, ASG_HOST_STATE_RENDERING, __ATOMIC_RELEASE);
+     return (const unsigned char*)buf;
+ }
+ 
+@@ -346,10 +350,11 @@ void RingStream::type1Read(
+             GFXSTREAM_ERROR("Invalid type1 xfer: offset %u, size %u, buffer_size %u\n",
+                             xfer.offset, xfer.size, buffer_size);
+             __atomic_store_n(&mContext.ring_config->in_error, 1, __ATOMIC_RELEASE);
++            requestExit();
+             return;
+         }
+ 
+-        if (*current + xfer.size > ptrEnd) {
++        if (xfer.size > static_cast<size_t>(ptrEnd - *current)) {
+             // Save in a temp buffer or we'll get stuck
+             if (begin == *current && i == 0) {
+                 const char* src = mContext.buffer + xfer.offset;
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index 5a9de9e..478a649 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -14,6 +14,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <functional>
+ #include <vector>
+ 
+@@ -45,6 +46,7 @@ class RingStream final : public IOStream {
+     }
+ 
+     void reloadRingConfig();
++    void requestExit();
+ 
+   protected:
+     virtual void* allocBuffer(size_t minSize) override final;
+@@ -59,6 +61,7 @@ class RingStream final : public IOStream {
+     void type1Read(uint32_t available, char* begin, size_t* count, char** current, const char* ptrEnd);
+     void type2Read(uint32_t available, size_t* count, char** current, const char* ptrEnd);
+     void type3Read(uint32_t available, size_t* count, char** current, const char* ptrEnd);
++    bool exitRequested();
+ 
+     struct asg_context mContext;
+     struct asg_ring_config mSavedRingConfig;
+@@ -81,9 +84,9 @@ class RingStream final : public IOStream {
+     size_t mXmits = 0;
+     size_t mTotalRecv = 0;
+     bool mBenchmarkEnabled = false;
+-    bool mShouldExit = false;
++    std::atomic<bool> mShouldExit{false};
+     bool mShouldExitForSnapshot = false;
+-    bool mInSnapshotOperation = false;
++    std::atomic<bool> mInSnapshotOperation{false};
+ };
+ 
+ }  // namespace gfxstream
+-- 
+2.50.1.windows.1
+

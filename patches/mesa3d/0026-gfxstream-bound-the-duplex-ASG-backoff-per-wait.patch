@@ -1,0 +1,77 @@
+From ac1ae4305b557f5923be76567e579207254bb7cc Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:35:49 +0900
+Subject: [PATCH] gfxstream: bound the duplex ASG backoff per wait
+
+Velox-local change (biblioklept). With the experimental duplex ASG
+(debug.velox.asg_duplex, Mesa 0015) the backoff slept once its iteration
+count passed 128, but reads never reset the count, so after the first few
+waits every wait of a long-lived stream slept immediately (vk-render draws
+about 400 fps, sync about 450 fps). Each wait now polls for up to 200 us
+(a gap of more than 20 us between calls starts a new wait) before it sleeps.
+The version 1 path is unchanged.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I91a682098c90f4c734a67f48202e552dca262d1d
+---
+ .../GoldfishAddressSpace/AddressSpaceStream.cpp  | 16 +++++++++++++++-
+ .../include/AddressSpaceStream.h                 |  3 +++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+index 568c44c..35e07c4 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
++++ b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+@@ -4,6 +4,8 @@
+  */
+ #include "AddressSpaceStream.h"
+ 
++#include <time.h>
++
+ #include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -503,7 +505,18 @@ int AddressSpaceStream::type1Write(uint32_t bufferOffset, size_t size) {
+ 
+ void AddressSpaceStream::backoff() {
+     if (m_version == kAsgDuplexVersion) {
+-        if (++m_backoffIters > 128) usleep(1);
++        // Velox: m_backoffIters is not reset after every wait (reads never reset it), so the
++        // old "sleep after 128 iterations" made every wait of a long-lived stream sleep at once
++        // (draws 400 fps, sync 450 fps). Each wait now polls for up to kSpinNs before it sleeps.
++        // A gap of more than kNewWaitNs since the previous call starts a new wait.
++        constexpr uint64_t kSpinNs = 200000;
++        constexpr uint64_t kNewWaitNs = 20000;
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        const uint64_t now = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
++        if (!m_backoffStartNs || now - m_backoffLastNs > kNewWaitNs) m_backoffStartNs = now;
++        m_backoffLastNs = now;
++        if (now - m_backoffStartNs > kSpinNs) usleep(1);
+         return;
+     }
+     static const uint32_t kBackoffItersThreshold = 50000000;
+@@ -524,4 +537,5 @@ void AddressSpaceStream::backoff() {
+ void AddressSpaceStream::resetBackoff() {
+     m_backoffIters = 0;
+     m_backoffFactor = 1;
++    m_backoffStartNs = 0;
+ }
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+index a35b81f..a86653f 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
++++ b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+@@ -80,6 +80,9 @@ class AddressSpaceStream : public IOStream {
+ 
+     uint64_t m_backoffIters;
+     uint64_t m_backoffFactor;
++    // Velox (duplex): start and last call of the current wait, CLOCK_MONOTONIC ns.
++    uint64_t m_backoffStartNs = 0;
++    uint64_t m_backoffLastNs = 0;
+ 
+     uint32_t m_resourceId = 0;
+ };
+-- 
+2.50.1.windows.1
+

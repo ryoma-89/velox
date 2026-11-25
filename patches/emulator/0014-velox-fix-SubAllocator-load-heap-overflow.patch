@@ -1,0 +1,30 @@
+﻿diff --git a/android/android-emu-base/android/base/SubAllocator.cpp b/android/android-emu-base/android/base/SubAllocator.cpp
+index f02efa1f..b9f1c516 100644
+--- a/android/android-emu-base/android/base/SubAllocator.cpp
++++ b/android/android-emu-base/android/base/SubAllocator.cpp
+@@ -86,9 +86,22 @@ public:
+         address_space_allocator_iter_func_t allocatorLoader =
+             [](void* context, struct address_space_allocator* allocator) {
+                 Stream* stream = reinterpret_cast<Stream*>(context);
+-                allocator->size = stream->getBe32();
+-                allocator->capacity = stream->getBe32();
+-                allocator->total_bytes = stream->getBe64();
++                int savedSize = static_cast<int>(stream->getBe32());
++                int savedCapacity = static_cast<int>(stream->getBe32());
++                uint64_t savedTotalBytes = stream->getBe64();
++                if (savedCapacity < savedSize) {
++                    savedCapacity = savedSize;
++                }
++                if (savedCapacity > allocator->capacity) {
++                    allocator->blocks = static_cast<struct address_block*>(
++                        address_space_realloc(
++                            allocator->blocks,
++                            sizeof(struct address_block) * static_cast<size_t>(savedCapacity)));
++                    address_space_assert(allocator->blocks != nullptr);
++                }
++                allocator->size = savedSize;
++                allocator->capacity = savedCapacity;
++                allocator->total_bytes = savedTotalBytes;
+             };
+         address_block_iter_func_t allocatorBlockLoader =
+             [](void* context, struct address_block* block) {

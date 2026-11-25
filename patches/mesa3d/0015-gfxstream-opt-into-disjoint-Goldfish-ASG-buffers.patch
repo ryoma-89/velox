@@ -1,0 +1,610 @@
+From 8bf59fb964669a8533026ae665498a1e1dcec52d Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:44:30 +0900
+Subject: [PATCH] gfxstream: opt into disjoint Goldfish ASG buffers
+
+Generated-by: LLM
+AI-Prose-Marker: biblioklept
+Change-Id: Id94870533054744333497c5d6d32e03f577edb9d
+---
+ .../AddressSpaceStream.cpp                    | 203 +++++++-----------
+ .../GoldfishAddressSpaceStream.cpp            | 100 +++++++--
+ .../include/AddressSpaceStream.h              |   6 +-
+ .../include/address_space_graphics_types.h    |   3 +
+ 4 files changed, 170 insertions(+), 142 deletions(-)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+index 3e0c230..610a385 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
++++ b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+@@ -19,7 +19,8 @@ static const size_t kWriteOffset = kReadSize;
+ 
+ AddressSpaceStream::AddressSpaceStream(address_space_handle_t handle, uint32_t version,
+                                        struct asg_context context, uint64_t ringOffset,
+-                                       uint64_t writeBufferOffset, struct address_space_ops ops)
++                                       uint64_t writeBufferOffset, struct address_space_ops ops,
++                                       uint64_t mappedBufferSize)
+     : IOStream(context.ring_config->flush_interval),
+       m_ops(ops),
+       m_tmpBuf(0),
+@@ -34,6 +35,7 @@ AddressSpaceStream::AddressSpaceStream(address_space_handle_t handle, uint32_t v
+       m_context(context),
+       m_ringOffset(ringOffset),
+       m_writeBufferOffset(writeBufferOffset),
++      m_mappedBufferSize(mappedBufferSize ? mappedBufferSize : context.ring_config->buffer_size),
+       m_writeBufferSize(context.ring_config->buffer_size),
+       m_writeBufferMask(m_writeBufferSize - 1),
+       m_buf((unsigned char*)context.buffer),
+@@ -42,13 +44,7 @@ AddressSpaceStream::AddressSpaceStream(address_space_handle_t handle, uint32_t v
+       m_notifs(0),
+       m_written(0),
+       m_backoffIters(0),
+-      m_backoffFactor(1),
+-      m_ringStorageSize(sizeof(struct asg_ring_storage) + m_writeBufferSize) {
+-    // We'll use this in the future, but at the moment,
+-    // it's a potential compile Werror.
+-    (void)m_ringStorageSize;
+-    (void)m_version;
+-}
++      m_backoffFactor(1) {}
+ 
+ AddressSpaceStream::~AddressSpaceStream() {
+     flush();
+@@ -57,7 +53,7 @@ AddressSpaceStream::~AddressSpaceStream() {
+ 
+     if (!m_mapping) {
+         m_ops.unmap(m_context.to_host, sizeof(struct asg_ring_storage));
+-        m_ops.unmap(m_context.buffer, m_writeBufferSize);
++        m_ops.unmap(m_context.buffer, m_mappedBufferSize);
+         m_ops.unclaim_shared(m_handle, m_ringOffset);
+         m_ops.unclaim_shared(m_handle, m_writeBufferOffset);
+     }
+@@ -115,13 +111,13 @@ int AddressSpaceStream::commitBuffer(size_t size) {
+     if (size == 0) return 0;
+ 
+     if (m_usingTmpBuf) {
+-        writeFully(m_tmpBuf, size);
++        const int res = writeFully(m_tmpBuf, size);
+         m_tmpBufXferSize = 0;
+         m_usingTmpBuf = false;
+-        return 0;
++        return res;
+     } else {
+         int res = type1Write(m_writeStart - m_buf, size);
+-        advanceWrite();
++        if (!res) advanceWrite();
+         return res;
+     }
+ }
+@@ -141,58 +137,17 @@ const unsigned char* AddressSpaceStream::readFully(void* ptr, size_t totalReadSi
+         return nullptr;
+     }
+ 
+-    // Advance buffered read if not yet consumed.
+     size_t remaining = totalReadSize;
+-    size_t bufferedReadSize = m_readLeft < remaining ? m_readLeft : remaining;
+-
+-    if (bufferedReadSize) {
+-        memcpy(userReadBuf, m_readBuf + (m_read - m_readLeft), bufferedReadSize);
+-        remaining -= bufferedReadSize;
+-        m_readLeft -= bufferedReadSize;
+-    }
+-
+-    if (!remaining) return userReadBuf;
+-
+-    // Read up to kReadSize bytes if all buffered read has been consumed.
+-    size_t maxRead = m_readLeft ? 0 : kReadSize;
+-    ssize_t actual = 0;
+-
+-    if (maxRead) {
+-        actual = speculativeRead(m_readBuf, maxRead);
+-
+-        // Updated buffered read size.
+-        if (actual > 0) {
+-            m_read = m_readLeft = actual;
+-        }
+-
+-        if (actual == 0) {
+-            mesa_logd("%s: end of pipe", __FUNCTION__);
+-            return NULL;
+-        }
+-    }
+-
+-    // Consume buffered read and read more if necessary.
+     while (remaining) {
+-        bufferedReadSize = m_readLeft < remaining ? m_readLeft : remaining;
+-        if (bufferedReadSize) {
+-            memcpy(userReadBuf + (totalReadSize - remaining), m_readBuf + (m_read - m_readLeft),
+-                   bufferedReadSize);
+-            remaining -= bufferedReadSize;
+-            m_readLeft -= bufferedReadSize;
+-            continue;
+-        }
+-
+-        actual = speculativeRead(m_readBuf, kReadSize);
+-
+-        if (actual == 0) {
+-            mesa_logd("%s: Failed reading from pipe: %d", __FUNCTION__, errno);
+-            return NULL;
+-        }
+-
+-        if (actual > 0) {
++        if (!m_readLeft) {
++            const ssize_t actual = speculativeRead(m_readBuf, kReadSize);
++            if (actual <= 0) return nullptr;
+             m_read = m_readLeft = actual;
+-            continue;
+         }
++        const size_t chunk = m_readLeft < remaining ? m_readLeft : remaining;
++        memcpy(userReadBuf + (totalReadSize - remaining), m_readBuf + (m_read - m_readLeft), chunk);
++        remaining -= chunk;
++        m_readLeft -= chunk;
+     }
+ 
+     resetBackoff();
+@@ -217,9 +172,10 @@ int AddressSpaceStream::writeFully(const void* buf, size_t size) {
+     MESA_TRACE_SCOPE("writeFully");
+     ensureType3Finished();
+     ensureType1Finished();
++    if (size > UINT32_MAX || isInError()) return -1;
+ 
+-    m_context.ring_config->transfer_size = size;
+-    m_context.ring_config->transfer_mode = 3;
++    __atomic_store_n(&m_context.ring_config->transfer_size, size, __ATOMIC_RELEASE);
++    __atomic_store_n(&m_context.ring_config->transfer_mode, 3, __ATOMIC_RELEASE);
+ 
+     size_t sent = 0;
+     size_t preferredChunkSize = m_writeBufferSize / 4;
+@@ -235,8 +191,11 @@ int AddressSpaceStream::writeFully(const void* buf, size_t size) {
+                                                  &m_context.to_host_large_xfer.view,
+                                                  bufferBytes + sent, sendThisTime, 1);
+ 
+-        if (!hostPinged && *(m_context.host_state) != ASG_HOST_STATE_CAN_CONSUME &&
+-            *(m_context.host_state) != ASG_HOST_STATE_RENDERING) {
++        const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
++        if (m_version == kAsgDuplexVersion) {
++            if (sentChunks) notifyAfterWrite();
++        } else if (!hostPinged && state != ASG_HOST_STATE_CAN_CONSUME &&
++                   state != ASG_HOST_STATE_RENDERING) {
+             notifyAvailable();
+             hostPinged = true;
+         }
+@@ -253,21 +212,12 @@ int AddressSpaceStream::writeFully(const void* buf, size_t size) {
+         }
+     }
+ 
+-    // Make the ring write visible before reading host_state (x86 may reorder a store with a later
+-    // load). The host stores NEED_NOTIFY, fences and re-checks the rings before sleeping, so one of
+-    // the two sides always sees the other.
+-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-    bool isRenderingAfter =
+-        ASG_HOST_STATE_RENDERING == __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+-
+-    if (!isRenderingAfter) {
+-        notifyAvailable();
+-    }
++    if (m_version != kAsgDuplexVersion) notifyAfterWrite();
+ 
+     ensureType3Finished();
+ 
+     resetBackoff();
+-    m_context.ring_config->transfer_mode = 1;
++    __atomic_store_n(&m_context.ring_config->transfer_mode, 1, __ATOMIC_RELEASE);
+     m_written += size;
+ 
+     float mb = (float)m_written / 1048576.0f;
+@@ -284,9 +234,10 @@ int AddressSpaceStream::writeFullyAsync(const void* buf, size_t size) {
+     MESA_TRACE_SCOPE("writeFullyAsync");
+     ensureType3Finished();
+     ensureType1Finished();
++    if (size > UINT32_MAX || isInError()) return -1;
+ 
+     __atomic_store_n(&m_context.ring_config->transfer_size, size, __ATOMIC_RELEASE);
+-    m_context.ring_config->transfer_mode = 3;
++    __atomic_store_n(&m_context.ring_config->transfer_mode, 3, __ATOMIC_RELEASE);
+ 
+     size_t sent = 0;
+     size_t preferredChunkSize = m_writeBufferSize / 2;
+@@ -305,8 +256,10 @@ int AddressSpaceStream::writeFullyAsync(const void* buf, size_t size) {
+ 
+         uint32_t hostState = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+ 
+-        if (!pingedHost && hostState != ASG_HOST_STATE_CAN_CONSUME &&
+-            hostState != ASG_HOST_STATE_RENDERING) {
++        if (m_version == kAsgDuplexVersion) {
++            if (sentChunks) notifyAfterWrite();
++        } else if (!pingedHost && hostState != ASG_HOST_STATE_CAN_CONSUME &&
++                   hostState != ASG_HOST_STATE_RENDERING) {
+             pingedHost = true;
+             notifyAvailable();
+         }
+@@ -323,19 +276,10 @@ int AddressSpaceStream::writeFullyAsync(const void* buf, size_t size) {
+         }
+     }
+ 
+-    // Make the ring write visible before reading host_state (x86 may reorder a store with a later
+-    // load). The host stores NEED_NOTIFY, fences and re-checks the rings before sleeping, so one of
+-    // the two sides always sees the other.
+-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-    bool isRenderingAfter =
+-        ASG_HOST_STATE_RENDERING == __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+-
+-    if (!isRenderingAfter) {
+-        notifyAvailable();
+-    }
++    if (m_version != kAsgDuplexVersion) notifyAfterWrite();
+ 
+     resetBackoff();
+-    m_context.ring_config->transfer_mode = 1;
++    __atomic_store_n(&m_context.ring_config->transfer_mode, 1, __ATOMIC_RELEASE);
+     m_written += size;
+ 
+     float mb = (float)m_written / 1048576.0f;
+@@ -351,26 +295,27 @@ int AddressSpaceStream::writeFullyAsync(const void* buf, size_t size) {
+ const unsigned char* AddressSpaceStream::commitBufferAndReadFully(size_t writeSize,
+                                                                   void* userReadBufPtr,
+                                                                   size_t totalReadSize) {
+-    if (m_usingTmpBuf) {
+-        writeFully(m_tmpBuf, writeSize);
+-        m_usingTmpBuf = false;
+-        m_tmpBufXferSize = 0;
+-        return readFully(userReadBufPtr, totalReadSize);
+-    } else {
+-        commitBuffer(writeSize);
+-        return readFully(userReadBufPtr, totalReadSize);
+-    }
++    if (commitBuffer(writeSize) < 0) return nullptr;
++    return readFully(userReadBufPtr, totalReadSize);
+ }
+ 
+-bool AddressSpaceStream::isInError() const { return 1 == m_context.ring_config->in_error; }
++bool AddressSpaceStream::isInError() const {
++    if (__atomic_load_n(&m_context.ring_config->in_error, __ATOMIC_ACQUIRE)) return true;
++    const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
++    return state == ASG_HOST_STATE_EXIT || state == ASG_HOST_STATE_ERROR;
++}
+ 
+ ssize_t AddressSpaceStream::speculativeRead(unsigned char* readBuffer, size_t trySize) {
+-    ensureType3Finished();
+-    ensureType1Finished();
++    if (!trySize) return 0;
++    if (m_version != kAsgDuplexVersion) {
++        ensureType3Finished();
++        ensureType1Finished();
++    }
+ 
+     size_t actuallyRead = 0;
+ 
+     while (!actuallyRead) {
++        if (isInError()) return -1;
+         uint32_t readAvail = ring_buffer_available_read(m_context.from_host_large_xfer.ring,
+                                                         &m_context.from_host_large_xfer.view);
+ 
+@@ -398,19 +343,31 @@ ssize_t AddressSpaceStream::speculativeRead(unsigned char* readBuffer, size_t tr
+ 
+ void AddressSpaceStream::notifyAvailable() {
+     MESA_TRACE_SCOPE("PING");
+-    struct address_space_ping request;
++    struct address_space_ping request{};
+     request.metadata = ASG_NOTIFY_AVAILABLE;
+     request.resourceId = m_resourceId;
+-    m_ops.ping(m_handle, &request);
+-    ++m_notifs;
++    if (m_ops.ping(m_handle, &request)) {
++        ++m_notifs;
++    } else {
++        __atomic_store_n(&m_context.ring_config->in_error, 1, __ATOMIC_RELEASE);
++    }
++}
++
++void AddressSpaceStream::notifyAfterWrite() {
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
++    if (m_version == kAsgDuplexVersion ? state == ASG_HOST_STATE_NEED_NOTIFY
++                                      : state != ASG_HOST_STATE_RENDERING) {
++        notifyAvailable();
++    }
+ }
+ 
+ uint32_t AddressSpaceStream::getRelativeBufferPos(uint32_t pos) { return pos & m_writeBufferMask; }
+ 
+ void AddressSpaceStream::advanceWrite() {
+-    m_writeStart += m_context.ring_config->flush_interval;
++    m_writeStart += m_writeStep;
+ 
+-    if (m_writeStart == m_buf + m_context.ring_config->buffer_size) {
++    if (m_writeStart == m_buf + m_writeBufferSize) {
+         m_writeStart = m_buf;
+     }
+ }
+@@ -426,8 +383,8 @@ void AddressSpaceStream::ensureConsumerFinishing() {
+             break;
+         }
+ 
+-        if (*(m_context.host_state) != ASG_HOST_STATE_CAN_CONSUME &&
+-            *(m_context.host_state) != ASG_HOST_STATE_RENDERING) {
++        const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
++        if (state != ASG_HOST_STATE_CAN_CONSUME && state != ASG_HOST_STATE_RENDERING) {
+             notifyAvailable();
+             break;
+         }
+@@ -460,8 +417,9 @@ void AddressSpaceStream::ensureType3Finished() {
+         backoff();
+         availReadLarge = ring_buffer_available_read(m_context.to_host_large_xfer.ring,
+                                                     &m_context.to_host_large_xfer.view);
+-        if (*(m_context.host_state) != ASG_HOST_STATE_CAN_CONSUME &&
+-            *(m_context.host_state) != ASG_HOST_STATE_RENDERING) {
++        const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
++        if (m_version != kAsgDuplexVersion && state != ASG_HOST_STATE_CAN_CONSUME &&
++            state != ASG_HOST_STATE_RENDERING) {
+             notifyAvailable();
+         }
+         if (isInError()) {
+@@ -486,13 +444,16 @@ int AddressSpaceStream::type1Write(uint32_t bufferOffset, size_t size) {
+     uint8_t* writeBufferBytes = (uint8_t*)(&xfer);
+ 
+     uint32_t maxOutstanding = 1;
+-    uint32_t maxSteps = m_context.ring_config->buffer_size / m_context.ring_config->flush_interval;
++    uint32_t maxSteps = m_writeBufferSize / m_writeStep;
+ 
+     if (maxSteps > 1) maxOutstanding = maxSteps - 1;
+ 
+     uint32_t ringAvailReadNow = ring_buffer_available_read(m_context.to_host, 0);
+ 
+     while (ringAvailReadNow >= maxOutstanding * sizeForRing) {
++        if (isInError()) return -1;
++        ring_buffer_yield();
++        backoff();
+         ringAvailReadNow = ring_buffer_available_read(m_context.to_host, 0);
+     }
+ 
+@@ -501,8 +462,9 @@ int AddressSpaceStream::type1Write(uint32_t bufferOffset, size_t size) {
+         long sentChunks =
+             ring_buffer_write(m_context.to_host, writeBufferBytes + sent, sizeForRing - sent, 1);
+ 
+-        if (!hostPinged && *(m_context.host_state) != ASG_HOST_STATE_CAN_CONSUME &&
+-            *(m_context.host_state) != ASG_HOST_STATE_RENDERING) {
++        const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
++        if (m_version != kAsgDuplexVersion && !hostPinged &&
++            state != ASG_HOST_STATE_CAN_CONSUME && state != ASG_HOST_STATE_RENDERING) {
+             notifyAvailable();
+             hostPinged = true;
+         }
+@@ -519,16 +481,7 @@ int AddressSpaceStream::type1Write(uint32_t bufferOffset, size_t size) {
+         }
+     }
+ 
+-    // Make the ring write visible before reading host_state (x86 may reorder a store with a later
+-    // load). The host stores NEED_NOTIFY, fences and re-checks the rings before sleeping, so one of
+-    // the two sides always sees the other.
+-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-    bool isRenderingAfter =
+-        ASG_HOST_STATE_RENDERING == __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+-
+-    if (!isRenderingAfter) {
+-        notifyAvailable();
+-    }
++    notifyAfterWrite();
+ 
+     m_written += size;
+ 
+@@ -545,6 +498,10 @@ int AddressSpaceStream::type1Write(uint32_t bufferOffset, size_t size) {
+ }
+ 
+ void AddressSpaceStream::backoff() {
++    if (m_version == kAsgDuplexVersion) {
++        if (++m_backoffIters > 128) usleep(1);
++        return;
++    }
+     static const uint32_t kBackoffItersThreshold = 50000000;
+     static const uint32_t kBackoffFactorDoublingIncrement = 50000000;
+     ++m_backoffIters;
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/GoldfishAddressSpaceStream.cpp b/src/gfxstream/guest/GoldfishAddressSpace/GoldfishAddressSpaceStream.cpp
+index e61060a..7a01220 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/GoldfishAddressSpaceStream.cpp
++++ b/src/gfxstream/guest/GoldfishAddressSpace/GoldfishAddressSpaceStream.cpp
+@@ -8,10 +8,20 @@
+ #include "goldfish_address_space.h"
+ #include "util/log.h"
+ 
+-AddressSpaceStream* createGoldfishAddressSpaceStream(size_t ignored_bufSize) {
+-    // Ignore incoming ignored_bufSize
+-    (void)ignored_bufSize;
++#ifdef __ANDROID__
++#include <sys/system_properties.h>
++#endif
++
++static bool requestDuplexMapping() {
++#ifdef __ANDROID__
++    char value[PROP_VALUE_MAX];
++    return __system_property_get("debug.velox.asg_duplex", value) == 1 && value[0] == '1';
++#else
++    return false;
++#endif
++}
+ 
++static AddressSpaceStream* createStream(bool tryDuplex) {
+     auto handle = goldfish_address_space_open();
+     address_space_handle_t child_device_handle;
+ 
+@@ -22,7 +32,7 @@ AddressSpaceStream* createGoldfishAddressSpaceStream(size_t ignored_bufSize) {
+         return nullptr;
+     }
+ 
+-    struct address_space_ping request;
++    struct address_space_ping request{};
+     request.metadata = ASG_GET_RING;
+     if (!goldfish_address_space_ping(child_device_handle, &request)) {
+         mesa_loge("AddressSpaceStream::create failed (get ring)\n");
+@@ -31,16 +41,39 @@ AddressSpaceStream* createGoldfishAddressSpaceStream(size_t ignored_bufSize) {
+     }
+ 
+     uint64_t ringOffset = request.metadata;
+-
+-    request.metadata = ASG_GET_BUFFER;
+-    if (!goldfish_address_space_ping(child_device_handle, &request)) {
+-        mesa_loge("AddressSpaceStream::create failed (get buffer)\n");
++    constexpr uint64_t pageSize = 4096;
++    if (request.size < sizeof(asg_ring_storage) || ringOffset % pageSize ||
++        ringOffset > UINT64_MAX - sizeof(asg_ring_storage)) {
++        mesa_loge("AddressSpaceStream::create failed (invalid ring mapping)\n");
+         goldfish_address_space_close(child_device_handle);
+         return nullptr;
+     }
+ 
++    request.metadata = kAsgGetDuplexBuffer;
++    request.size = 0;
++    const bool duplexMapping =
++        tryDuplex && goldfish_address_space_ping(child_device_handle, &request) &&
++        request.metadata != UINT64_MAX && request.size != 0;
++    if (!duplexMapping) {
++        request.metadata = ASG_GET_BUFFER;
++        if (!goldfish_address_space_ping(child_device_handle, &request)) {
++            mesa_loge("AddressSpaceStream::create failed (get buffer)\n");
++            goldfish_address_space_close(child_device_handle);
++            return nullptr;
++        }
++    }
++
+     uint64_t bufferOffset = request.metadata;
+     uint64_t bufferSize = request.size;
++    if (bufferSize < pageSize || bufferSize > (1ull << 30) || (bufferSize & (bufferSize - 1)) ||
++        (duplexMapping && bufferSize < 2 * pageSize) || bufferOffset % pageSize ||
++        bufferOffset > UINT64_MAX - bufferSize ||
++        (ringOffset <= bufferOffset ? bufferOffset - ringOffset < sizeof(asg_ring_storage)
++                                    : ringOffset - bufferOffset < bufferSize)) {
++        mesa_loge("AddressSpaceStream::create failed (invalid mapping)\n");
++        goldfish_address_space_close(child_device_handle);
++        return nullptr;
++    }
+ 
+     if (!goldfish_address_space_claim_shared(child_device_handle, ringOffset,
+                                              sizeof(asg_ring_storage))) {
+@@ -79,22 +112,47 @@ AddressSpaceStream* createGoldfishAddressSpaceStream(size_t ignored_bufSize) {
+         return nullptr;
+     }
+ 
+-    struct asg_context context = asg_context_create(ringPtr, bufferPtr, bufferSize);
++    struct asg_context context =
++        asg_context_create(ringPtr, bufferPtr, duplexMapping ? bufferSize / 2 : bufferSize);
++    auto* replyAck = &context.from_host_large_xfer.ring->config[0];
++    __atomic_store_n(replyAck, 0, __ATOMIC_RELEASE);
+ 
+-    request.metadata = ASG_SET_VERSION;
+-    request.size = 1;  // version 1
+-
+-    if (!goldfish_address_space_ping(child_device_handle, &request)) {
+-        mesa_loge("AddressSpaceStream::create failed (get buffer)\n");
++    const auto closeMapping = [&] {
+         goldfish_address_space_unmap(bufferPtr, bufferSize);
+-        goldfish_address_space_unmap(ringPtr, sizeof(struct asg_ring_storage));
++        goldfish_address_space_unmap(ringPtr, sizeof(asg_ring_storage));
+         goldfish_address_space_unclaim_shared(child_device_handle, bufferOffset);
+         goldfish_address_space_unclaim_shared(child_device_handle, ringOffset);
+         goldfish_address_space_close(child_device_handle);
++    };
++
++    request.metadata = ASG_SET_VERSION;
++    request.size = duplexMapping ? kAsgDuplexVersion : 1;
++
++    if (!goldfish_address_space_ping(child_device_handle, &request) ||
++        (request.size > 1 && request.size != kAsgDuplexVersion)) {
++        mesa_loge("AddressSpaceStream::create failed (set version)\n");
++        closeMapping();
+         return nullptr;
+     }
+ 
+-    uint32_t version = request.size;
++    const bool duplex = duplexMapping && request.size == kAsgDuplexVersion &&
++                        __atomic_load_n(replyAck, __ATOMIC_ACQUIRE) == kAsgDuplexVersion;
++    const uint32_t version = duplex ? kAsgDuplexVersion : (request.size == 0 ? 0 : 1);
++    const uint32_t capacity = context.ring_config->buffer_size;
++    const uint32_t interval = context.ring_config->flush_interval;
++    if (!capacity || capacity > bufferSize || (capacity & (capacity - 1)) ||
++        !interval || capacity % interval || (duplex && capacity != bufferSize / 2)) {
++        mesa_loge("AddressSpaceStream::create failed (invalid ring config)\n");
++        closeMapping();
++        return nullptr;
++    }
++    if (duplexMapping) {
++        auto* data = reinterpret_cast<uint8_t*>(bufferPtr);
++        ring_buffer_init_view_only(&context.to_host_large_xfer.view, data, capacity);
++        ring_buffer_init_view_only(&context.from_host_large_xfer.view,
++                                   data + (duplex ? capacity : 0), capacity);
++    }
++    if (tryDuplex) mesa_logi("Velox ASG duplex %s", duplex ? "negotiated" : "fallback");
+ 
+     context.ring_config->transfer_mode = 1;
+     context.ring_config->host_consumed_pos = 0;
+@@ -112,7 +170,15 @@ AddressSpaceStream* createGoldfishAddressSpaceStream(size_t ignored_bufSize) {
+     };
+ 
+     AddressSpaceStream* res = new AddressSpaceStream(child_device_handle, version, context,
+-                                                     ringOffset, bufferOffset, ops);
++                                                     ringOffset, bufferOffset, ops, bufferSize);
+ 
+     return res;
+ }
++
++AddressSpaceStream* createGoldfishAddressSpaceStream(size_t) {
++    const bool requested = requestDuplexMapping();
++    auto* stream = createStream(requested);
++    if (stream || !requested) return stream;
++    mesa_logi("Velox ASG duplex setup failed, retrying version 1");
++    return createStream(false);
++}
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+index eddcd43..a35b81f 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
++++ b/src/gfxstream/guest/GoldfishAddressSpace/include/AddressSpaceStream.h
+@@ -17,7 +17,8 @@ class AddressSpaceStream : public IOStream {
+    public:
+     explicit AddressSpaceStream(address_space_handle_t handle, uint32_t version,
+                                 struct asg_context context, uint64_t ringOffset,
+-                                uint64_t writeBufferOffset, struct address_space_ops ops);
++                                uint64_t writeBufferOffset, struct address_space_ops ops,
++                                uint64_t mappedBufferSize = 0);
+     ~AddressSpaceStream();
+ 
+     virtual size_t idealAllocSize(size_t len);
+@@ -37,6 +38,7 @@ class AddressSpaceStream : public IOStream {
+     bool isInError() const;
+     ssize_t speculativeRead(unsigned char* readBuffer, size_t trySize);
+     void notifyAvailable();
++    void notifyAfterWrite();
+     uint32_t getRelativeBufferPos(uint32_t pos);
+     void advanceWrite();
+     void ensureConsumerFinishing();
+@@ -65,6 +67,7 @@ class AddressSpaceStream : public IOStream {
+ 
+     uint64_t m_ringOffset;
+     uint64_t m_writeBufferOffset;
++    uint64_t m_mappedBufferSize;
+ 
+     uint32_t m_writeBufferSize;
+     uint32_t m_writeBufferMask;
+@@ -78,7 +81,6 @@ class AddressSpaceStream : public IOStream {
+     uint64_t m_backoffIters;
+     uint64_t m_backoffFactor;
+ 
+-    size_t m_ringStorageSize;
+     uint32_t m_resourceId = 0;
+ };
+ 
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/include/address_space_graphics_types.h b/src/gfxstream/guest/GoldfishAddressSpace/include/address_space_graphics_types.h
+index 37108f0..37cc909 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/include/address_space_graphics_types.h
++++ b/src/gfxstream/guest/GoldfishAddressSpace/include/address_space_graphics_types.h
+@@ -101,6 +101,9 @@ enum asg_host_state {
+ 
+ struct asg_ring_config;
+ 
++inline constexpr uint32_t kAsgDuplexVersion = 0x564c0002;
++inline constexpr uint64_t kAsgGetDuplexBuffer = 0x564c0001;
++
+ // Each context has a pair of ring buffers for communication
+ // to and from the host. There is another ring buffer for large xfers
+ // to the host (all xfers from the host are already considered "large").
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,134 @@
+From bd3889b4034628d16ee27cb7e6c6941ee9e14c70 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:41:12 +0900
+Subject: [PATCH] velox: add adaptive spin with cooperative yield tail to
+ RingStream (patch 0025)
+
+Fixed VELOX_ASG_SPIN_US=50 caused actively rendering contexts (e.g.
+vk-render sync slow frames >50us) to publish NEED_NOTIFY and sleep right
+before the next frame arrived, incurring 15-30us VM exit + wakeup penalties.
+
+Add opt-in VELOX_ASG_ADAPTIVE_SPIN_US (hard-capped at 1000us, default 0):
+- Actively streaming contexts (mHotStreak >= 4) scale spin up to the cap.
+- Sleeping in onUnavailableRead() resets mHotStreak to 0 so idle contexts
+  immediately fall back to base spin (zero idle CPU regression).
+- The extended adaptive tail yields cooperatively every 16 iterations so
+  co-scheduled threads on the same core are never starved.
+
+Change-Id: I16a25b0e9c7d8f4a21e6c90b5d3f81a47e2c0025
+---
+ host/ring_stream.cpp | 53 +++++++++++++++++++++++++++++++++++++++-----
+ host/ring_stream.h   |  5 +++++
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 72a9835..b5ffb86 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -62,6 +62,22 @@ uint64_t asgSpinBudgetNs() {
+     return budget;
+ }
+ 
++// Velox: adaptive spin ceiling for actively streaming contexts (VELOX_ASG_ADAPTIVE_SPIN_US,
++// 0 = disabled, hard-capped at 1000 us). Idle contexts reset mHotStreak on sleep and fall back
++// to asgSpinBudgetNs() immediately; the extended tail yields cooperatively so other threads
++// on the same core are never starved.
++uint64_t asgAdaptiveSpinMaxNs() {
++    static const uint64_t cap = [] {
++        const char* value = std::getenv("VELOX_ASG_ADAPTIVE_SPIN_US");
++        if (!value || !*value) return uint64_t{0};
++        char* end = nullptr;
++        const unsigned long us = std::strtoul(value, &end, 10);
++        if (end == value || *end) return uint64_t{0};
++        return uint64_t{std::min<unsigned long>(us, 1000)} * 1000;
++    }();
++    return cap;
++}
++
+ // Velox: VELOX_ASG_PREFETCH=1 enables the receive prefetch thread (see ring_stream.h).
+ bool asgPrefetchWanted() {
+     const char* value = std::getenv("VELOX_ASG_PREFETCH");
+@@ -522,6 +538,8 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+     const uint32_t maxSpins = 30;
+     uint32_t spins = 0;
+     bool inLargeXfer = true;
++    bool sleptInThisRead = false;
++    bool spunInThisRead = false;
+ 
+     if (exitRequested()) return nullptr;
+     __atomic_store_n(mContext.host_state, ASG_HOST_STATE_CAN_CONSUME, __ATOMIC_RELEASE);
+@@ -624,10 +642,24 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+ 
+             if (exitRequested() || mPrefetchStop.load(std::memory_order_relaxed)) return nullptr;
+ 
+-            if (const uint64_t budget = asgSpinBudgetNs();
+-                budget && monotonicNs() - mLastDataNs < budget) {
+-                ring_buffer_yield();
+-                continue;
++            const uint64_t baseBudget = asgSpinBudgetNs();
++            const uint64_t adaptCap = asgAdaptiveSpinMaxNs();
++            uint64_t budget = baseBudget;
++            if (adaptCap > baseBudget && mHotStreak >= 4) {
++                const uint64_t step = std::min<uint32_t>(mHotStreak - 3, 8);
++                budget = baseBudget + ((adaptCap - baseBudget) * step) / 8;
++            }
++            if (budget && mLastDataNs) {
++                const uint64_t elapsed = monotonicNs() - mLastDataNs;
++                if (elapsed < budget) {
++                    spunInThisRead = true;
++                    if (elapsed >= baseBudget && ((++mAdaptiveYieldCounter & 15u) == 0)) {
++                        std::this_thread::yield();
++                    } else {
++                        ring_buffer_yield();
++                    }
++                    continue;
++                }
+             }
+ 
+             if (mShouldExitForSnapshot && mInSnapshotOperation) {
+@@ -655,6 +687,9 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+                 if (exitRequested()) return nullptr;
+ 
+                 bool sleeping = false;
++                sleptInThisRead = true;
++                mHotStreak = 0;
++                ++mWakeSleeps;
+                 do {
+                     const AsgOnUnavailableReadStatus status = mCallbacks.onUnavailableRead();
+                     switch (status) {
+@@ -690,7 +725,15 @@ const unsigned char* RingStream::readRing(void* buf, size_t* inout_len) {
+     *inout_len = count;
+     ++mXmits;
+     mTotalRecv += count;
+-    if (asgSpinBudgetNs()) mLastDataNs = monotonicNs();
++    if (asgSpinBudgetNs() || asgAdaptiveSpinMaxNs()) {
++        mLastDataNs = monotonicNs();
++        if (sleptInThisRead) {
++            mHotStreak = 0;
++        } else {
++            if (spunInThisRead) ++mSpinHits;
++            if (mHotStreak < 16) ++mHotStreak;
++        }
++    }
+ 
+     if (exitRequested()) return nullptr;
+     __atomic_store_n(mContext.host_state, ASG_HOST_STATE_RENDERING, __ATOMIC_RELEASE);
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index 84d60c1..d1b520a 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -132,6 +132,11 @@ class RingStream final : public IOStream {
+     uint32_t mUnavailableReadCount = 0;
+     // Velox: when the last command bytes were returned (see asgSpinBudgetNs()).
+     uint64_t mLastDataNs = 0;
++    // Velox: adaptive spin streak (reset to 0 when the stream sleeps in onUnavailableRead).
++    uint32_t mHotStreak = 0;
++    uint32_t mAdaptiveYieldCounter = 0;
++    unsigned long long mWakeSleeps = 0;
++    unsigned long long mSpinHits = 0;
+ 
+     size_t mXmits = 0;
+     size_t mTotalRecv = 0;
+-- 
+2.50.1.windows.1
+

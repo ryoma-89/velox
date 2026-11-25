@@ -1,0 +1,56 @@
+From 5ca84c7a98b9a4b4678c6356b228f75b72b70809 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 20:59:08 +0900
+Subject: [PATCH] gfxstream: fence between the ASG ring write and the
+ host_state read
+
+Store the ring, full fence, then load host_state, so that either the
+guest sees NEED_NOTIFY and pings, or the host (which stores
+NEED_NOTIFY, fences and re-checks the rings) sees the data.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I08c13e9d25510b190cbe83884456196495fbb3b3
+---
+ .../GoldfishAddressSpace/AddressSpaceStream.cpp      | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+index 07aa215..3e0c230 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
++++ b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+@@ -253,6 +253,10 @@ int AddressSpaceStream::writeFully(const void* buf, size_t size) {
+         }
+     }
+ 
++    // Make the ring write visible before reading host_state (x86 may reorder a store with a later
++    // load). The host stores NEED_NOTIFY, fences and re-checks the rings before sleeping, so one of
++    // the two sides always sees the other.
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+     bool isRenderingAfter =
+         ASG_HOST_STATE_RENDERING == __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+ 
+@@ -319,6 +323,10 @@ int AddressSpaceStream::writeFullyAsync(const void* buf, size_t size) {
+         }
+     }
+ 
++    // Make the ring write visible before reading host_state (x86 may reorder a store with a later
++    // load). The host stores NEED_NOTIFY, fences and re-checks the rings before sleeping, so one of
++    // the two sides always sees the other.
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+     bool isRenderingAfter =
+         ASG_HOST_STATE_RENDERING == __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+ 
+@@ -511,6 +519,10 @@ int AddressSpaceStream::type1Write(uint32_t bufferOffset, size_t size) {
+         }
+     }
+ 
++    // Make the ring write visible before reading host_state (x86 may reorder a store with a later
++    // load). The host stores NEED_NOTIFY, fences and re-checks the rings before sleeping, so one of
++    // the two sides always sees the other.
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+     bool isRenderingAfter =
+         ASG_HOST_STATE_RENDERING == __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+ 
+-- 
+2.50.1.windows.1
+

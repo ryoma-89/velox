@@ -1,0 +1,17 @@
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index 143fc58..21121d7 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -1300,6 +1300,12 @@ std::unique_ptr<FrameBuffer::Impl> FrameBuffer::Impl::Create(FrameBuffer* frameb
+         vk::ensureVulkanValidationLayersEnabled();
+     }
+
++#if defined(_WIN32)
++    if (gfxstream::base::getEnvironmentVariable("VELOX_VK_CACHED_UPLOAD") == "1") {
++        impl->m_features.VulkanAllocateUncachedHostVisibleAsCached.setEnabled(true);
++        GFXSTREAM_INFO("Velox: cached host-visible Vulkan allocations enabled");
++    }
++#endif
+     vk::VulkanDispatch* vkDispatch = nullptr;
+     if (impl->m_features.Vulkan.enabled()) {
+         vkDispatch = vk::vkDispatch(false /* not for testing */);

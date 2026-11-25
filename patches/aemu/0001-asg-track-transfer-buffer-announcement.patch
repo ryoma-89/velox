@@ -1,0 +1,12 @@
+diff --git a/host-common/include/host-common/address_space_graphics.h b/host-common/include/host-common/address_space_graphics.h
+index 72da109..7752b5c 100644
+--- a/host-common/include/host-common/address_space_graphics.h
++++ b/host-common/include/host-common/address_space_graphics.h
+@@ -91,6 +91,7 @@ private:
+     Allocation mRingAllocation;
+     Allocation mBufferAllocation;
+     Allocation mCombinedAllocation;
++    bool mBufferAnnounced = false;
+ 
+     // Consumer storage
+     gfxstream::ConsumerCallbacks mConsumerCallbacks;

@@ -1,0 +1,47 @@
+From 9686757d6fc37529e76bb8010f84e02786432133 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:41:52 +0900
+Subject: [PATCH] util/perf: compile trace scopes out when no trace backend is
+ enabled
+
+MESA_TRACE_SCOPE expanded to a scope object whenever the compiler supports
+the cleanup attribute, even with perfetto, gpuvis and sysprof all disabled.
+Each entry then formatted the scope name with vsnprintf into a 4 KiB stack
+buffer that nothing consumed. The gfxstream guest uses scopes in its
+transport polling loops; in a draw-heavy Vulkan benchmark the formatting
+took about a third of the guest CPU time. Require a backend for the scope
+implementation; otherwise the macros expand to nothing, as they already do
+for compilers without the cleanup attribute.
+
+On WHPX with the ASG transport (vk-render, 20000 draws per frame): 485 ->
+771 frames/s, guest CPU per frame 1.30 -> 0.52 ms, identical image checksums.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+
+Change-Id: I452eedee63dd2efb62e075a21801e72d39d7b575
+---
+ src/util/perf/cpu_trace.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/perf/cpu_trace.h b/src/util/perf/cpu_trace.h
+index 60c0382..28a2824 100644
+--- a/src/util/perf/cpu_trace.h
++++ b/src/util/perf/cpu_trace.h
+@@ -95,7 +95,10 @@ struct mesa_trace_flow {
+ 
+ #endif /* HAVE_SYSPROF */
+ 
+-#if __has_attribute(cleanup) && __has_attribute(unused)
++/* Without a trace backend, a scope would still format its name with vsnprintf
++ * into a 4 KiB stack buffer on every entry; gfxstream uses scopes in its
++ * transport polling loops. */
++#if __has_attribute(cleanup) && __has_attribute(unused) &&    (defined(HAVE_PERFETTO) || defined(HAVE_GPUVIS) || defined(HAVE_SYSPROF))
+ 
+ #include <stdarg.h>
+ #include <stdio.h>
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,991 @@
+From 5baed8f8bee65ef05d691290626a5157b88360ee Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:42:32 +0900
+Subject: [PATCH] velox: forward KHR cooperative matrix properties
+
+Change-Id: Iaf680558fd65e82977131e02c7649d9cd624334c
+---
+ .../cereal/common/goldfish_vk_deepcopy.cpp    |  90 ++++++++++
+ .../cereal/common/goldfish_vk_deepcopy.h      |  16 ++
+ .../cereal/common/goldfish_vk_dispatch.cpp    |  15 ++
+ .../cereal/common/goldfish_vk_dispatch.h      |   4 +
+ .../common/goldfish_vk_extension_structs.cpp  |  16 +-
+ .../cereal/common/goldfish_vk_marshaling.cpp  | 168 ++++++++++++++++++
+ .../cereal/common/goldfish_vk_marshaling.h    |  26 +++
+ .../goldfish_vk_reserved_marshaling.cpp       | 127 +++++++++++++
+ .../common/goldfish_vk_reserved_marshaling.h  |  14 ++
+ .../goldfish_vk_supported_extensions.cpp      |   1 +
+ .../cereal/common/goldfish_vk_transform.cpp   |  88 +++++++++
+ .../cereal/common/goldfish_vk_transform.h     |  24 +++
+ host/vulkan/vk_decoder.cpp                    | 111 ++++++++++++
+ host/vulkan/vk_decoder_snapshot.cpp           |  18 ++
+ host/vulkan/vk_decoder_snapshot.h             |   7 +
+ 15 files changed, 717 insertions(+), 8 deletions(-)
+
+diff --git a/host/vulkan/cereal/common/goldfish_vk_deepcopy.cpp b/host/vulkan/cereal/common/goldfish_vk_deepcopy.cpp
+index 9a84d97..2c0479c 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_deepcopy.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_deepcopy.cpp
+@@ -7781,6 +7781,76 @@ void deepcopy_VkReleaseSwapchainImagesInfoKHR(Allocator* alloc, VkStructureType
+     }
+ }
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void deepcopy_VkCooperativeMatrixPropertiesKHR(Allocator* alloc, VkStructureType rootType,
++                                               const VkCooperativeMatrixPropertiesKHR* from,
++                                               VkCooperativeMatrixPropertiesKHR* to) {
++    (void)alloc;
++    (void)rootType;
++    *to = *from;
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = from->sType;
++    }
++    const void* from_pNext = from;
++    size_t pNext_size = 0u;
++    while (!pNext_size && from_pNext) {
++        from_pNext = static_cast<const VkBaseOutStructure*>(from_pNext)->pNext;
++        pNext_size = goldfish_vk_extension_struct_size(rootType, from_pNext);
++    }
++    to->pNext = nullptr;
++    if (pNext_size) {
++        to->pNext = (void*)alloc->alloc(pNext_size);
++        deepcopy_extension_struct(alloc, rootType, from_pNext, (void*)(to->pNext));
++    }
++}
++
++void deepcopy_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    Allocator* alloc, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixFeaturesKHR* from,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* to) {
++    (void)alloc;
++    (void)rootType;
++    *to = *from;
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = from->sType;
++    }
++    const void* from_pNext = from;
++    size_t pNext_size = 0u;
++    while (!pNext_size && from_pNext) {
++        from_pNext = static_cast<const VkBaseOutStructure*>(from_pNext)->pNext;
++        pNext_size = goldfish_vk_extension_struct_size(rootType, from_pNext);
++    }
++    to->pNext = nullptr;
++    if (pNext_size) {
++        to->pNext = (void*)alloc->alloc(pNext_size);
++        deepcopy_extension_struct(alloc, rootType, from_pNext, (void*)(to->pNext));
++    }
++}
++
++void deepcopy_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    Allocator* alloc, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixPropertiesKHR* from,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* to) {
++    (void)alloc;
++    (void)rootType;
++    *to = *from;
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = from->sType;
++    }
++    const void* from_pNext = from;
++    size_t pNext_size = 0u;
++    while (!pNext_size && from_pNext) {
++        from_pNext = static_cast<const VkBaseOutStructure*>(from_pNext)->pNext;
++        pNext_size = goldfish_vk_extension_struct_size(rootType, from_pNext);
++    }
++    to->pNext = nullptr;
++    if (pNext_size) {
++        to->pNext = (void*)alloc->alloc(pNext_size);
++        deepcopy_extension_struct(alloc, rootType, from_pNext, (void*)(to->pNext));
++    }
++}
++
+ #endif
+ #ifdef VK_KHR_maintenance6
+ void deepcopy_VkSetDescriptorBufferOffsetsInfoEXT(Allocator* alloc, VkStructureType rootType,
+@@ -11688,6 +11758,26 @@ void deepcopy_extension_struct(Allocator* alloc, VkStructureType rootType,
+             break;
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            deepcopy_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++                alloc, rootType,
++                reinterpret_cast<const VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                    structExtension),
++                reinterpret_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                    structExtension_out));
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            deepcopy_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                alloc, rootType,
++                reinterpret_cast<const VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                    structExtension),
++                reinterpret_cast<VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                    structExtension_out));
++            break;
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             deepcopy_VkPhysicalDeviceMaintenance7FeaturesKHR(
+diff --git a/host/vulkan/cereal/common/goldfish_vk_deepcopy.h b/host/vulkan/cereal/common/goldfish_vk_deepcopy.h
+index bd485b9..27b6c05 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_deepcopy.h
++++ b/host/vulkan/cereal/common/goldfish_vk_deepcopy.h
+@@ -2015,6 +2015,22 @@ DEFINE_ALIAS_FUNCTION(deepcopy_VkPhysicalDeviceShaderFloatControls2Features,
+ DEFINE_ALIAS_FUNCTION(deepcopy_VkPhysicalDeviceIndexTypeUint8Features,
+                       deepcopy_VkPhysicalDeviceIndexTypeUint8FeaturesKHR)
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void deepcopy_VkCooperativeMatrixPropertiesKHR(Allocator* alloc, VkStructureType rootType,
++                                               const VkCooperativeMatrixPropertiesKHR* from,
++                                               VkCooperativeMatrixPropertiesKHR* to);
++
++void deepcopy_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    Allocator* alloc, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixFeaturesKHR* from,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* to);
++
++void deepcopy_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    Allocator* alloc, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixPropertiesKHR* from,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* to);
++
+ #endif
+ #ifdef VK_KHR_line_rasterization
+ DEFINE_ALIAS_FUNCTION(deepcopy_VkPhysicalDeviceLineRasterizationFeatures,
+diff --git a/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp b/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp
+index c56d969..0d269a9 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_dispatch.cpp
+@@ -718,6 +718,11 @@ void init_vulkan_dispatch_from_system_loader(DlOpenFunc dlOpenFunc, DlSymFunc dl
+     out->vkReleaseSwapchainImagesKHR =
+         (PFN_vkReleaseSwapchainImagesKHR)dlSymFunc(lib, "vkReleaseSwapchainImagesKHR");
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++    out->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
++        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)dlSymFunc(
++            lib, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
++#endif
+ #ifdef VK_KHR_line_rasterization
+     out->vkCmdSetLineStippleKHR =
+         (PFN_vkCmdSetLineStippleKHR)dlSymFunc(lib, "vkCmdSetLineStippleKHR");
+@@ -1887,6 +1892,11 @@ void init_vulkan_dispatch_from_instance(VulkanDispatch* vk, VkInstance instance,
+     out->vkReleaseSwapchainImagesKHR = (PFN_vkReleaseSwapchainImagesKHR)vk->vkGetInstanceProcAddr(
+         instance, "vkReleaseSwapchainImagesKHR");
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++    out->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
++        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vk->vkGetInstanceProcAddr(
++            instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
++#endif
+ #ifdef VK_KHR_line_rasterization
+     out->vkCmdSetLineStippleKHR =
+         (PFN_vkCmdSetLineStippleKHR)vk->vkGetInstanceProcAddr(instance, "vkCmdSetLineStippleKHR");
+@@ -3085,6 +3095,11 @@ void init_vulkan_dispatch_from_device(VulkanDispatch* vk, VkDevice device, Vulka
+     out->vkReleaseSwapchainImagesKHR = (PFN_vkReleaseSwapchainImagesKHR)vk->vkGetDeviceProcAddr(
+         device, "vkReleaseSwapchainImagesKHR");
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++    out->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
++        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vk->vkGetDeviceProcAddr(
++            device, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
++#endif
+ #ifdef VK_KHR_line_rasterization
+     out->vkCmdSetLineStippleKHR =
+         (PFN_vkCmdSetLineStippleKHR)vk->vkGetDeviceProcAddr(device, "vkCmdSetLineStippleKHR");
+diff --git a/host/vulkan/cereal/common/goldfish_vk_dispatch.h b/host/vulkan/cereal/common/goldfish_vk_dispatch.h
+index f57bfdb..0919022 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_dispatch.h
++++ b/host/vulkan/cereal/common/goldfish_vk_dispatch.h
+@@ -502,6 +502,10 @@ struct VulkanDispatch {
+ #ifdef VK_KHR_swapchain_maintenance1
+     PFN_vkReleaseSwapchainImagesKHR vkReleaseSwapchainImagesKHR;
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
++        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
++#endif
+ #ifdef VK_KHR_line_rasterization
+     PFN_vkCmdSetLineStippleKHR vkCmdSetLineStippleKHR;
+ #endif
+diff --git a/host/vulkan/cereal/common/goldfish_vk_extension_structs.cpp b/host/vulkan/cereal/common/goldfish_vk_extension_structs.cpp
+index 35f2aa9..3841fb7 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_extension_structs.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_extension_structs.cpp
+@@ -542,6 +542,14 @@ size_t goldfish_vk_extension_struct_size(VkStructureType rootType, const void* s
+             return sizeof(VkSwapchainPresentScalingCreateInfoKHR);
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            return sizeof(VkPhysicalDeviceCooperativeMatrixFeaturesKHR);
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            return sizeof(VkPhysicalDeviceCooperativeMatrixPropertiesKHR);
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             return sizeof(VkPhysicalDeviceMaintenance7FeaturesKHR);
+@@ -1272,14 +1280,6 @@ size_t goldfish_vk_extension_struct_size(VkStructureType rootType, const void* s
+             return sizeof(VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR);
+         }
+ #endif
+-#ifdef VK_KHR_cooperative_matrix
+-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
+-            return sizeof(VkPhysicalDeviceCooperativeMatrixFeaturesKHR);
+-        }
+-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
+-            return sizeof(VkPhysicalDeviceCooperativeMatrixPropertiesKHR);
+-        }
+-#endif
+ #ifdef VK_KHR_compute_shader_derivatives
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR: {
+             return sizeof(VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR);
+diff --git a/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp b/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp
+index 6bce5d8..5d8562b 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_marshaling.cpp
+@@ -16499,6 +16499,137 @@ void unmarshal_VkReleaseSwapchainImagesInfoKHR(VulkanStream* vkStream, VkStructu
+                    forUnmarshaling->imageIndexCount * sizeof(const uint32_t));
+ }
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void marshal_VkCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    const VkCooperativeMatrixPropertiesKHR* forMarshaling) {
++    (void)rootType;
++    vkStream->write((VkStructureType*)&forMarshaling->sType, sizeof(VkStructureType));
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forMarshaling->sType;
++    }
++    marshal_extension_struct(vkStream, rootType, forMarshaling->pNext);
++    vkStream->write((uint32_t*)&forMarshaling->MSize, sizeof(uint32_t));
++    vkStream->write((uint32_t*)&forMarshaling->NSize, sizeof(uint32_t));
++    vkStream->write((uint32_t*)&forMarshaling->KSize, sizeof(uint32_t));
++    vkStream->write((VkComponentTypeKHR*)&forMarshaling->AType, sizeof(VkComponentTypeKHR));
++    vkStream->write((VkComponentTypeKHR*)&forMarshaling->BType, sizeof(VkComponentTypeKHR));
++    vkStream->write((VkComponentTypeKHR*)&forMarshaling->CType, sizeof(VkComponentTypeKHR));
++    vkStream->write((VkComponentTypeKHR*)&forMarshaling->ResultType, sizeof(VkComponentTypeKHR));
++    vkStream->write((VkBool32*)&forMarshaling->saturatingAccumulation, sizeof(VkBool32));
++    vkStream->write((VkScopeKHR*)&forMarshaling->scope, sizeof(VkScopeKHR));
++}
++
++void unmarshal_VkCooperativeMatrixPropertiesKHR(VulkanStream* vkStream, VkStructureType rootType,
++                                                VkCooperativeMatrixPropertiesKHR* forUnmarshaling) {
++    (void)rootType;
++    vkStream->read((VkStructureType*)&forUnmarshaling->sType, sizeof(VkStructureType));
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forUnmarshaling->sType;
++    }
++    size_t pNext_size;
++    pNext_size = vkStream->getBe32();
++    forUnmarshaling->pNext = nullptr;
++    if (pNext_size) {
++        vkStream->alloc((void**)&forUnmarshaling->pNext, sizeof(VkStructureType));
++        vkStream->read((void*)forUnmarshaling->pNext, sizeof(VkStructureType));
++        VkStructureType extType = *(VkStructureType*)(forUnmarshaling->pNext);
++        vkStream->alloc((void**)&forUnmarshaling->pNext,
++                        goldfish_vk_extension_struct_size_with_stream_features(
++                            vkStream->getFeatureBits(), rootType, forUnmarshaling->pNext));
++        *(VkStructureType*)forUnmarshaling->pNext = extType;
++        unmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext));
++    }
++    vkStream->read((uint32_t*)&forUnmarshaling->MSize, sizeof(uint32_t));
++    vkStream->read((uint32_t*)&forUnmarshaling->NSize, sizeof(uint32_t));
++    vkStream->read((uint32_t*)&forUnmarshaling->KSize, sizeof(uint32_t));
++    vkStream->read((VkComponentTypeKHR*)&forUnmarshaling->AType, sizeof(VkComponentTypeKHR));
++    vkStream->read((VkComponentTypeKHR*)&forUnmarshaling->BType, sizeof(VkComponentTypeKHR));
++    vkStream->read((VkComponentTypeKHR*)&forUnmarshaling->CType, sizeof(VkComponentTypeKHR));
++    vkStream->read((VkComponentTypeKHR*)&forUnmarshaling->ResultType, sizeof(VkComponentTypeKHR));
++    vkStream->read((VkBool32*)&forUnmarshaling->saturatingAccumulation, sizeof(VkBool32));
++    vkStream->read((VkScopeKHR*)&forUnmarshaling->scope, sizeof(VkScopeKHR));
++}
++
++void marshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixFeaturesKHR* forMarshaling) {
++    (void)rootType;
++    vkStream->write((VkStructureType*)&forMarshaling->sType, sizeof(VkStructureType));
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forMarshaling->sType;
++    }
++    marshal_extension_struct(vkStream, rootType, forMarshaling->pNext);
++    vkStream->write((VkBool32*)&forMarshaling->cooperativeMatrix, sizeof(VkBool32));
++    vkStream->write((VkBool32*)&forMarshaling->cooperativeMatrixRobustBufferAccess,
++                    sizeof(VkBool32));
++}
++
++void unmarshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* forUnmarshaling) {
++    (void)rootType;
++    vkStream->read((VkStructureType*)&forUnmarshaling->sType, sizeof(VkStructureType));
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forUnmarshaling->sType;
++    }
++    size_t pNext_size;
++    pNext_size = vkStream->getBe32();
++    forUnmarshaling->pNext = nullptr;
++    if (pNext_size) {
++        vkStream->alloc((void**)&forUnmarshaling->pNext, sizeof(VkStructureType));
++        vkStream->read((void*)forUnmarshaling->pNext, sizeof(VkStructureType));
++        VkStructureType extType = *(VkStructureType*)(forUnmarshaling->pNext);
++        vkStream->alloc((void**)&forUnmarshaling->pNext,
++                        goldfish_vk_extension_struct_size_with_stream_features(
++                            vkStream->getFeatureBits(), rootType, forUnmarshaling->pNext));
++        *(VkStructureType*)forUnmarshaling->pNext = extType;
++        unmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext));
++    }
++    vkStream->read((VkBool32*)&forUnmarshaling->cooperativeMatrix, sizeof(VkBool32));
++    vkStream->read((VkBool32*)&forUnmarshaling->cooperativeMatrixRobustBufferAccess,
++                   sizeof(VkBool32));
++}
++
++void marshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixPropertiesKHR* forMarshaling) {
++    (void)rootType;
++    vkStream->write((VkStructureType*)&forMarshaling->sType, sizeof(VkStructureType));
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forMarshaling->sType;
++    }
++    marshal_extension_struct(vkStream, rootType, forMarshaling->pNext);
++    vkStream->write((VkShaderStageFlags*)&forMarshaling->cooperativeMatrixSupportedStages,
++                    sizeof(VkShaderStageFlags));
++}
++
++void unmarshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* forUnmarshaling) {
++    (void)rootType;
++    vkStream->read((VkStructureType*)&forUnmarshaling->sType, sizeof(VkStructureType));
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forUnmarshaling->sType;
++    }
++    size_t pNext_size;
++    pNext_size = vkStream->getBe32();
++    forUnmarshaling->pNext = nullptr;
++    if (pNext_size) {
++        vkStream->alloc((void**)&forUnmarshaling->pNext, sizeof(VkStructureType));
++        vkStream->read((void*)forUnmarshaling->pNext, sizeof(VkStructureType));
++        VkStructureType extType = *(VkStructureType*)(forUnmarshaling->pNext);
++        vkStream->alloc((void**)&forUnmarshaling->pNext,
++                        goldfish_vk_extension_struct_size_with_stream_features(
++                            vkStream->getFeatureBits(), rootType, forUnmarshaling->pNext));
++        *(VkStructureType*)forUnmarshaling->pNext = extType;
++        unmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext));
++    }
++    vkStream->read((VkShaderStageFlags*)&forUnmarshaling->cooperativeMatrixSupportedStages,
++                   sizeof(VkShaderStageFlags));
++}
++
+ #endif
+ #ifdef VK_KHR_maintenance6
+ void marshal_VkSetDescriptorBufferOffsetsInfoEXT(
+@@ -22602,6 +22733,22 @@ void marshal_extension_struct(VulkanStream* vkStream, VkStructureType rootType,
+             break;
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            marshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++                vkStream, rootType,
++                reinterpret_cast<const VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                    structExtension));
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            marshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                vkStream, rootType,
++                reinterpret_cast<const VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                    structExtension));
++            break;
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             marshal_VkPhysicalDeviceMaintenance7FeaturesKHR(
+@@ -24300,6 +24447,22 @@ void unmarshal_extension_struct(VulkanStream* vkStream, VkStructureType rootType
+             break;
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            unmarshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++                vkStream, rootType,
++                reinterpret_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                    structExtension_out));
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            unmarshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                vkStream, rootType,
++                reinterpret_cast<VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                    structExtension_out));
++            break;
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             unmarshal_VkPhysicalDeviceMaintenance7FeaturesKHR(
+@@ -25995,6 +26158,11 @@ const char* api_opcode_to_string(const uint32_t opcode) {
+             return "OP_vkWriteAccelerationStructuresPropertiesKHR";
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case OP_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR: {
++            return "OP_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR";
++        }
++#endif
+ #ifdef VK_KHR_ray_tracing_pipeline
+         case OP_vkCmdTraceRaysIndirectKHR: {
+             return "OP_vkCmdTraceRaysIndirectKHR";
+diff --git a/host/vulkan/cereal/common/goldfish_vk_marshaling.h b/host/vulkan/cereal/common/goldfish_vk_marshaling.h
+index 5dfde25..56d76db 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_marshaling.h
++++ b/host/vulkan/cereal/common/goldfish_vk_marshaling.h
+@@ -3802,6 +3802,32 @@ DEFINE_ALIAS_FUNCTION(marshal_VkPhysicalDeviceIndexTypeUint8Features,
+ DEFINE_ALIAS_FUNCTION(unmarshal_VkPhysicalDeviceIndexTypeUint8Features,
+                       unmarshal_VkPhysicalDeviceIndexTypeUint8FeaturesKHR)
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void marshal_VkCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    const VkCooperativeMatrixPropertiesKHR* forMarshaling);
++
++void unmarshal_VkCooperativeMatrixPropertiesKHR(VulkanStream* vkStream, VkStructureType rootType,
++                                                VkCooperativeMatrixPropertiesKHR* forUnmarshaling);
++
++void marshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixFeaturesKHR* forMarshaling);
++
++void unmarshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* forUnmarshaling);
++
++void marshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    const VkPhysicalDeviceCooperativeMatrixPropertiesKHR* forMarshaling);
++
++void unmarshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* forUnmarshaling);
++
++#define OP_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR 210157400
+ #endif
+ #ifdef VK_KHR_line_rasterization
+ DEFINE_ALIAS_FUNCTION(marshal_VkPhysicalDeviceLineRasterizationFeatures,
+diff --git a/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.cpp b/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.cpp
+index b258bb3..7892e5e 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.cpp
+@@ -13371,6 +13371,115 @@ void reservedunmarshal_VkReleaseSwapchainImagesInfoKHR(
+     }
+ }
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void reservedunmarshal_VkCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkCooperativeMatrixPropertiesKHR* forUnmarshaling, uint8_t** ptr) {
++    memcpy((VkStructureType*)&forUnmarshaling->sType, *ptr, sizeof(VkStructureType));
++    *ptr += sizeof(VkStructureType);
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forUnmarshaling->sType;
++    }
++    uint32_t pNext_size;
++    memcpy((uint32_t*)&pNext_size, *ptr, sizeof(uint32_t));
++    gfxstream::Stream::fromBe32((uint8_t*)&pNext_size);
++    *ptr += sizeof(uint32_t);
++    forUnmarshaling->pNext = nullptr;
++    if (pNext_size) {
++        vkStream->alloc((void**)&forUnmarshaling->pNext, sizeof(VkStructureType));
++        memcpy((void*)forUnmarshaling->pNext, *ptr, sizeof(VkStructureType));
++        *ptr += sizeof(VkStructureType);
++        VkStructureType extType = *(VkStructureType*)(forUnmarshaling->pNext);
++        vkStream->alloc((void**)&forUnmarshaling->pNext,
++                        goldfish_vk_extension_struct_size_with_stream_features(
++                            vkStream->getFeatureBits(), rootType, forUnmarshaling->pNext));
++        *(VkStructureType*)forUnmarshaling->pNext = extType;
++        reservedunmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext),
++                                           ptr);
++    }
++    memcpy((uint32_t*)&forUnmarshaling->MSize, *ptr, sizeof(uint32_t));
++    *ptr += sizeof(uint32_t);
++    memcpy((uint32_t*)&forUnmarshaling->NSize, *ptr, sizeof(uint32_t));
++    *ptr += sizeof(uint32_t);
++    memcpy((uint32_t*)&forUnmarshaling->KSize, *ptr, sizeof(uint32_t));
++    *ptr += sizeof(uint32_t);
++    memcpy((VkComponentTypeKHR*)&forUnmarshaling->AType, *ptr, sizeof(VkComponentTypeKHR));
++    *ptr += sizeof(VkComponentTypeKHR);
++    memcpy((VkComponentTypeKHR*)&forUnmarshaling->BType, *ptr, sizeof(VkComponentTypeKHR));
++    *ptr += sizeof(VkComponentTypeKHR);
++    memcpy((VkComponentTypeKHR*)&forUnmarshaling->CType, *ptr, sizeof(VkComponentTypeKHR));
++    *ptr += sizeof(VkComponentTypeKHR);
++    memcpy((VkComponentTypeKHR*)&forUnmarshaling->ResultType, *ptr, sizeof(VkComponentTypeKHR));
++    *ptr += sizeof(VkComponentTypeKHR);
++    memcpy((VkBool32*)&forUnmarshaling->saturatingAccumulation, *ptr, sizeof(VkBool32));
++    *ptr += sizeof(VkBool32);
++    memcpy((VkScopeKHR*)&forUnmarshaling->scope, *ptr, sizeof(VkScopeKHR));
++    *ptr += sizeof(VkScopeKHR);
++}
++
++void reservedunmarshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* forUnmarshaling, uint8_t** ptr) {
++    memcpy((VkStructureType*)&forUnmarshaling->sType, *ptr, sizeof(VkStructureType));
++    *ptr += sizeof(VkStructureType);
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forUnmarshaling->sType;
++    }
++    uint32_t pNext_size;
++    memcpy((uint32_t*)&pNext_size, *ptr, sizeof(uint32_t));
++    gfxstream::Stream::fromBe32((uint8_t*)&pNext_size);
++    *ptr += sizeof(uint32_t);
++    forUnmarshaling->pNext = nullptr;
++    if (pNext_size) {
++        vkStream->alloc((void**)&forUnmarshaling->pNext, sizeof(VkStructureType));
++        memcpy((void*)forUnmarshaling->pNext, *ptr, sizeof(VkStructureType));
++        *ptr += sizeof(VkStructureType);
++        VkStructureType extType = *(VkStructureType*)(forUnmarshaling->pNext);
++        vkStream->alloc((void**)&forUnmarshaling->pNext,
++                        goldfish_vk_extension_struct_size_with_stream_features(
++                            vkStream->getFeatureBits(), rootType, forUnmarshaling->pNext));
++        *(VkStructureType*)forUnmarshaling->pNext = extType;
++        reservedunmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext),
++                                           ptr);
++    }
++    memcpy((VkBool32*)&forUnmarshaling->cooperativeMatrix, *ptr, sizeof(VkBool32));
++    *ptr += sizeof(VkBool32);
++    memcpy((VkBool32*)&forUnmarshaling->cooperativeMatrixRobustBufferAccess, *ptr,
++           sizeof(VkBool32));
++    *ptr += sizeof(VkBool32);
++}
++
++void reservedunmarshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* forUnmarshaling, uint8_t** ptr) {
++    memcpy((VkStructureType*)&forUnmarshaling->sType, *ptr, sizeof(VkStructureType));
++    *ptr += sizeof(VkStructureType);
++    if (rootType == VK_STRUCTURE_TYPE_MAX_ENUM) {
++        rootType = forUnmarshaling->sType;
++    }
++    uint32_t pNext_size;
++    memcpy((uint32_t*)&pNext_size, *ptr, sizeof(uint32_t));
++    gfxstream::Stream::fromBe32((uint8_t*)&pNext_size);
++    *ptr += sizeof(uint32_t);
++    forUnmarshaling->pNext = nullptr;
++    if (pNext_size) {
++        vkStream->alloc((void**)&forUnmarshaling->pNext, sizeof(VkStructureType));
++        memcpy((void*)forUnmarshaling->pNext, *ptr, sizeof(VkStructureType));
++        *ptr += sizeof(VkStructureType);
++        VkStructureType extType = *(VkStructureType*)(forUnmarshaling->pNext);
++        vkStream->alloc((void**)&forUnmarshaling->pNext,
++                        goldfish_vk_extension_struct_size_with_stream_features(
++                            vkStream->getFeatureBits(), rootType, forUnmarshaling->pNext));
++        *(VkStructureType*)forUnmarshaling->pNext = extType;
++        reservedunmarshal_extension_struct(vkStream, rootType, (void*)(forUnmarshaling->pNext),
++                                           ptr);
++    }
++    memcpy((VkShaderStageFlags*)&forUnmarshaling->cooperativeMatrixSupportedStages, *ptr,
++           sizeof(VkShaderStageFlags));
++    *ptr += sizeof(VkShaderStageFlags);
++}
++
+ #endif
+ #ifdef VK_KHR_maintenance6
+ void reservedunmarshal_VkSetDescriptorBufferOffsetsInfoEXT(
+@@ -18570,6 +18679,24 @@ void reservedunmarshal_extension_struct(VulkanStream* vkStream, VkStructureType
+             break;
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            reservedunmarshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++                vkStream, rootType,
++                reinterpret_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                    structExtension_out),
++                ptr);
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            reservedunmarshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                vkStream, rootType,
++                reinterpret_cast<VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                    structExtension_out),
++                ptr);
++            break;
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             reservedunmarshal_VkPhysicalDeviceMaintenance7FeaturesKHR(
+diff --git a/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.h b/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.h
+index f9fe419..6364413 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.h
++++ b/host/vulkan/cereal/common/goldfish_vk_reserved_marshaling.h
+@@ -2016,6 +2016,20 @@ DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkPhysicalDeviceShaderFloatControls2Feat
+ DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkPhysicalDeviceIndexTypeUint8Features,
+                       reservedunmarshal_VkPhysicalDeviceIndexTypeUint8FeaturesKHR)
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void reservedunmarshal_VkCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkCooperativeMatrixPropertiesKHR* forUnmarshaling, uint8_t** ptr);
++
++void reservedunmarshal_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* forUnmarshaling, uint8_t** ptr);
++
++void reservedunmarshal_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VulkanStream* vkStream, VkStructureType rootType,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* forUnmarshaling, uint8_t** ptr);
++
+ #endif
+ #ifdef VK_KHR_line_rasterization
+ DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkPhysicalDeviceLineRasterizationFeatures,
+diff --git a/host/vulkan/cereal/common/goldfish_vk_supported_extensions.cpp b/host/vulkan/cereal/common/goldfish_vk_supported_extensions.cpp
+index 9d0fa3c..df15cef 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_supported_extensions.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_supported_extensions.cpp
+@@ -110,6 +110,7 @@ const std::unordered_set<std::string>& GetDeviceExtensionsSupportedByCodegen() {
+             "VK_KHR_acceleration_structure",
+             "VK_KHR_bind_memory2",
+             "VK_KHR_buffer_device_address",
++            "VK_KHR_cooperative_matrix",
+             "VK_KHR_copy_commands2",
+             "VK_KHR_create_renderpass2",
+             "VK_KHR_dedicated_allocation",
+diff --git a/host/vulkan/cereal/common/goldfish_vk_transform.cpp b/host/vulkan/cereal/common/goldfish_vk_transform.cpp
+index 2ab7736..1fd9292 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_transform.cpp
++++ b/host/vulkan/cereal/common/goldfish_vk_transform.cpp
+@@ -5470,6 +5470,66 @@ void transform_fromhost_VkReleaseSwapchainImagesInfoKHR(
+     }
+ }
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void transform_tohost_VkCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker, VkCooperativeMatrixPropertiesKHR* toTransform) {
++    (void)resourceTracker;
++    (void)toTransform;
++    if (toTransform->pNext) {
++        transform_tohost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
++    }
++}
++
++void transform_fromhost_VkCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker, VkCooperativeMatrixPropertiesKHR* toTransform) {
++    (void)resourceTracker;
++    (void)toTransform;
++    if (toTransform->pNext) {
++        transform_fromhost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
++    }
++}
++
++void transform_tohost_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* toTransform) {
++    (void)resourceTracker;
++    (void)toTransform;
++    if (toTransform->pNext) {
++        transform_tohost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
++    }
++}
++
++void transform_fromhost_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* toTransform) {
++    (void)resourceTracker;
++    (void)toTransform;
++    if (toTransform->pNext) {
++        transform_fromhost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
++    }
++}
++
++void transform_tohost_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* toTransform) {
++    (void)resourceTracker;
++    (void)toTransform;
++    if (toTransform->pNext) {
++        transform_tohost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
++    }
++}
++
++void transform_fromhost_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* toTransform) {
++    (void)resourceTracker;
++    (void)toTransform;
++    if (toTransform->pNext) {
++        transform_fromhost_extension_struct(resourceTracker, (void*)(toTransform->pNext));
++    }
++}
++
+ #endif
+ #ifdef VK_KHR_maintenance6
+ void transform_tohost_VkSetDescriptorBufferOffsetsInfoEXT(
+@@ -8538,6 +8598,20 @@ void transform_tohost_extension_struct(VkDecoderGlobalState* resourceTracker,
+             break;
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            transform_tohost_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++                resourceTracker, reinterpret_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                                     structExtension_out));
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            transform_tohost_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                resourceTracker, reinterpret_cast<VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                                     structExtension_out));
++            break;
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             transform_tohost_VkPhysicalDeviceMaintenance7FeaturesKHR(
+@@ -10094,6 +10168,20 @@ void transform_fromhost_extension_struct(VkDecoderGlobalState* resourceTracker,
+             break;
+         }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR: {
++            transform_fromhost_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++                resourceTracker, reinterpret_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR*>(
++                                     structExtension_out));
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR: {
++            transform_fromhost_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                resourceTracker, reinterpret_cast<VkPhysicalDeviceCooperativeMatrixPropertiesKHR*>(
++                                     structExtension_out));
++            break;
++        }
++#endif
+ #ifdef VK_KHR_maintenance7
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_7_FEATURES_KHR: {
+             transform_fromhost_VkPhysicalDeviceMaintenance7FeaturesKHR(
+diff --git a/host/vulkan/cereal/common/goldfish_vk_transform.h b/host/vulkan/cereal/common/goldfish_vk_transform.h
+index 304fd30..144cf6b 100644
+--- a/host/vulkan/cereal/common/goldfish_vk_transform.h
++++ b/host/vulkan/cereal/common/goldfish_vk_transform.h
+@@ -3369,6 +3369,30 @@ DEFINE_ALIAS_FUNCTION(transform_tohost_VkPhysicalDeviceIndexTypeUint8Features,
+ DEFINE_ALIAS_FUNCTION(transform_fromhost_VkPhysicalDeviceIndexTypeUint8Features,
+                       transform_fromhost_VkPhysicalDeviceIndexTypeUint8FeaturesKHR)
+ 
++#endif
++#ifdef VK_KHR_cooperative_matrix
++void transform_tohost_VkCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker, VkCooperativeMatrixPropertiesKHR* toTransform);
++
++void transform_fromhost_VkCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker, VkCooperativeMatrixPropertiesKHR* toTransform);
++
++void transform_tohost_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* toTransform);
++
++void transform_fromhost_VkPhysicalDeviceCooperativeMatrixFeaturesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixFeaturesKHR* toTransform);
++
++void transform_tohost_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* toTransform);
++
++void transform_fromhost_VkPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    VkDecoderGlobalState* resourceTracker,
++    VkPhysicalDeviceCooperativeMatrixPropertiesKHR* toTransform);
++
+ #endif
+ #ifdef VK_KHR_line_rasterization
+ DEFINE_ALIAS_FUNCTION(transform_tohost_VkPhysicalDeviceLineRasterizationFeatures,
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index aa688db..b0aebd8 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -18322,6 +18322,117 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 break;
+             }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++            case OP_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR: {
++                GFXSTREAM_TRACE_EVENT(
++                    GFXSTREAM_TRACE_DECODER_CATEGORY,
++                    "VkDecoder vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
++                VkPhysicalDevice physicalDevice;
++                uint32_t* pPropertyCount;
++                VkCooperativeMatrixPropertiesKHR* pProperties;
++                // Begin non wrapped dispatchable handle unboxing for physicalDevice;
++                uint64_t cgen_var_0;
++                memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
++                *readStreamPtrPtr += 1 * 8;
++                *(VkPhysicalDevice*)&physicalDevice =
++                    (VkPhysicalDevice)(VkPhysicalDevice)((VkPhysicalDevice)(*&cgen_var_0));
++                auto unboxed_physicalDevice = unbox_VkPhysicalDevice(physicalDevice);
++                auto vk = dispatch_VkPhysicalDevice(physicalDevice);
++                // End manual dispatchable handle unboxing for physicalDevice;
++                // Begin manual dispatchable handle unboxing for pPropertyCount;
++                vkReadStream->unsetHandleMapping();
++                // WARNING PTR CHECK
++                memcpy((uint32_t**)&pPropertyCount, (*readStreamPtrPtr), 8);
++                gfxstream::Stream::fromBe64((uint8_t*)&pPropertyCount);
++                *readStreamPtrPtr += 8;
++                if (pPropertyCount) {
++                    vkReadStream->alloc((void**)&pPropertyCount, sizeof(uint32_t));
++                    memcpy((uint32_t*)pPropertyCount, *readStreamPtrPtr, sizeof(uint32_t));
++                    *readStreamPtrPtr += sizeof(uint32_t);
++                }
++                // Begin manual dispatchable handle unboxing for pProperties;
++                vkReadStream->unsetHandleMapping();
++                // WARNING PTR CHECK
++                memcpy((VkCooperativeMatrixPropertiesKHR**)&pProperties, (*readStreamPtrPtr), 8);
++                gfxstream::Stream::fromBe64((uint8_t*)&pProperties);
++                *readStreamPtrPtr += 8;
++                if (pProperties) {
++                    vkReadStream->alloc(
++                        (void**)&pProperties,
++                        (*pPropertyCount) * sizeof(VkCooperativeMatrixPropertiesKHR));
++                    for (uint32_t i = 0; i < (uint32_t)(*pPropertyCount); ++i) {
++                        reservedunmarshal_VkCooperativeMatrixPropertiesKHR(
++                            vkReadStream, VK_STRUCTURE_TYPE_MAX_ENUM,
++                            (VkCooperativeMatrixPropertiesKHR*)(pProperties + i), readStreamPtrPtr);
++                    }
++                }
++                if (pPropertyCount) {
++                    if (pProperties) {
++                        for (uint32_t i = 0; i < (uint32_t)(*pPropertyCount); ++i) {
++                            transform_tohost_VkCooperativeMatrixPropertiesKHR(
++                                m_state, (VkCooperativeMatrixPropertiesKHR*)(pProperties + i));
++                        }
++                    }
++                }
++                if (m_logCalls) {
++                    GFXSTREAM_INFO(
++                        "stream %p: call vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR 0x%llx "
++                        "0x%llx 0x%llx ",
++                        ioStream, (unsigned long long)physicalDevice,
++                        (unsigned long long)pPropertyCount, (unsigned long long)pProperties);
++                }
++                VkResult vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_VkResult_return =
++                    VK_ERROR_OUT_OF_HOST_MEMORY;
++                if (CC_LIKELY(vk)) {
++                    vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_VkResult_return =
++                        vk->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                            unboxed_physicalDevice, pPropertyCount, pProperties);
++                }
++                if ((vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_VkResult_return) ==
++                    VK_ERROR_DEVICE_LOST)
++                    m_state->on_DeviceLost();
++                vkStream->unsetHandleMapping();
++                // WARNING PTR CHECK
++                uint64_t cgen_var_3 = (uint64_t)(uintptr_t)pPropertyCount;
++                vkStream->putBe64(cgen_var_3);
++                if (pPropertyCount) {
++                    vkStream->write((uint32_t*)pPropertyCount, sizeof(uint32_t));
++                }
++                if (pPropertyCount) {
++                    if (pProperties) {
++                        for (uint32_t i = 0; i < (uint32_t)(*pPropertyCount); ++i) {
++                            transform_fromhost_VkCooperativeMatrixPropertiesKHR(
++                                m_state, (VkCooperativeMatrixPropertiesKHR*)(pProperties + i));
++                        }
++                    }
++                }
++                // WARNING PTR CHECK
++                uint64_t cgen_var_4 = (uint64_t)(uintptr_t)pProperties;
++                vkStream->putBe64(cgen_var_4);
++                if (pProperties) {
++                    if (pPropertyCount) {
++                        for (uint32_t i = 0; i < (uint32_t)(*pPropertyCount); ++i) {
++                            marshal_VkCooperativeMatrixPropertiesKHR(
++                                vkStream, VK_STRUCTURE_TYPE_MAX_ENUM,
++                                (VkCooperativeMatrixPropertiesKHR*)(pProperties + i));
++                        }
++                    }
++                }
++                vkStream->write(&vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_VkResult_return,
++                                sizeof(VkResult));
++                vkStream->commitWrite();
++                if (m_snapshotsEnabled) {
++                    m_state->snapshot()->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++                        &m_pool, snapshotApiCallHandle, packet, packetLen,
++                        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR_VkResult_return,
++                        physicalDevice, pPropertyCount, pProperties);
++                }
++                vkReadStream->clearPool();
++                if (m_queueSubmitWithCommandsEnabled)
++                    seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
++                break;
++            }
++#endif
+ #ifdef VK_KHR_line_rasterization
+             case OP_vkCmdSetLineStippleKHR: {
+                 GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY,
+diff --git a/host/vulkan/vk_decoder_snapshot.cpp b/host/vulkan/vk_decoder_snapshot.cpp
+index bbd797f..fb1f320 100644
+--- a/host/vulkan/vk_decoder_snapshot.cpp
++++ b/host/vulkan/vk_decoder_snapshot.cpp
+@@ -2416,6 +2416,13 @@ class VkDecoderSnapshot::Impl {
+                                      VkResult input_result, VkDevice device,
+                                      const VkReleaseSwapchainImagesInfoKHR* pReleaseInfo) {}
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++    void vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
++        const uint8_t* apiCallPacket, size_t apiCallPacketSize, VkResult input_result,
++        VkPhysicalDevice physicalDevice, uint32_t* pPropertyCount,
++        VkCooperativeMatrixPropertiesKHR* pProperties) {}
++#endif
+ #ifdef VK_KHR_line_rasterization
+     void vkCmdSetLineStippleKHR(gfxstream::base::BumpPool* pool,
+                                 VkSnapshotApiCallHandle apiCallHandle, const uint8_t* apiCallPacket,
+@@ -6558,6 +6565,17 @@ void VkDecoderSnapshot::vkReleaseSwapchainImagesKHR(
+                                        input_result, device, pReleaseInfo);
+ }
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++void VkDecoderSnapshot::vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
++    const uint8_t* apiCallPacket, size_t apiCallPacketSize, VkResult input_result,
++    VkPhysicalDevice physicalDevice, uint32_t* pPropertyCount,
++    VkCooperativeMatrixPropertiesKHR* pProperties) {
++    mImpl->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++        pool, apiCallHandle, apiCallPacket, apiCallPacketSize, input_result, physicalDevice,
++        pPropertyCount, pProperties);
++}
++#endif
+ #ifdef VK_KHR_line_rasterization
+ void VkDecoderSnapshot::vkCmdSetLineStippleKHR(
+     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
+diff --git a/host/vulkan/vk_decoder_snapshot.h b/host/vulkan/vk_decoder_snapshot.h
+index 4d9ba06..db7201f 100644
+--- a/host/vulkan/vk_decoder_snapshot.h
++++ b/host/vulkan/vk_decoder_snapshot.h
+@@ -1657,6 +1657,13 @@ class VkDecoderSnapshot {
+                                      VkResult input_result, VkDevice device,
+                                      const VkReleaseSwapchainImagesInfoKHR* pReleaseInfo);
+ #endif
++#ifdef VK_KHR_cooperative_matrix
++    void vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
++        const uint8_t* apiCallPacket, size_t apiCallPacketSize, VkResult input_result,
++        VkPhysicalDevice physicalDevice, uint32_t* pPropertyCount,
++        VkCooperativeMatrixPropertiesKHR* pProperties);
++#endif
+ #ifdef VK_KHR_line_rasterization
+     void vkCmdSetLineStippleKHR(gfxstream::base::BumpPool* pool,
+                                 VkSnapshotApiCallHandle apiCallHandle, const uint8_t* apiCallPacket,

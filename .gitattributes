@@ -1,0 +1,2 @@
+# パッチは git apply で再適用するため、改行を LF のまま保つ
+*.patch text eol=lf

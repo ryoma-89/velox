@@ -1,0 +1,364 @@
+From 388a6255eb550406f282b9287adb23de342ed5db Mon Sep 17 00:00:00 2001
+From: Velox <velox@local>
+Date: Wed, 25 Nov 2026 03:12:55 +0900
+Subject: [PATCH] velox: lock post-load GL context bind with fallback surface
+ and mark pre-snapshot GLsyncs stale (patch 0029)
+
+---
+ host/frame_buffer.cpp                         | 18 +++++
+ host/frame_buffer.h                           |  2 +
+ host/gl/emulation_gl.cpp                      | 53 ++++++++++++++
+ host/gl/emulation_gl.h                        |  2 +
+ .../gl/glestranslator/gles_v2/gles_v2_imp.cpp |  7 ++
+ .../glestranslator/gles_v2/gles_v30_imp.cpp   | 69 ++++++++++++++++++-
+ host/gl/render_thread_info_gl.cpp             |  8 +++
+ host/render_thread_info.cpp                   |  8 ++-
+ 8 files changed, 165 insertions(+), 2 deletions(-)
+
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index 21121d7..33e1b59 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -774,6 +774,8 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
+     // Note: if all handle values are 0, this is an unbind operation.
+     bool bindContext(HandleType p_context, HandleType p_drawSurface,
+                      HandleType p_readSurface) override;
++    bool postLoadBindContext(HandleType p_context, HandleType p_drawSurface,
++                             HandleType p_readSurface);
+ 
+     // create a Y texture and a UV texture with width and height, the created
+     // texture ids are stored in textures respectively
+@@ -4596,6 +4598,17 @@ bool FrameBuffer::Impl::bindContext(HandleType p_context, HandleType p_drawSurfa
+     return m_emulationGl->bindContext(p_context, p_drawSurface, p_readSurface);
+ }
+ 
++bool FrameBuffer::Impl::postLoadBindContext(HandleType p_context, HandleType p_drawSurface,
++                                            HandleType p_readSurface) NO_THREAD_SAFETY_ANALYSIS {
++    ENSURE_GL_EMULATION_VALUE(false);
++    if (m_shuttingDown) {
++        return false;
++    }
++
++    AutoLock mutex(m_lock);
++    return m_emulationGl->postLoadBindContext(p_context, p_drawSurface, p_readSurface);
++}
++
+ void FrameBuffer::Impl::createYUVTextures(uint32_t type, uint32_t count, int width, int height,
+                                           uint32_t* output) NO_THREAD_SAFETY_ANALYSIS {
+     ENSURE_GL_EMULATION_VOID();
+@@ -5284,6 +5297,11 @@ bool FrameBuffer::bindContext(HandleType p_context, HandleType p_drawSurface,
+     return mImpl->bindContext(p_context, p_drawSurface, p_readSurface);
+ }
+ 
++bool FrameBuffer::postLoadBindContext(HandleType p_context, HandleType p_drawSurface,
++                                      HandleType p_readSurface) {
++    return mImpl->postLoadBindContext(p_context, p_drawSurface, p_readSurface);
++}
++
+ void FrameBuffer::createYUVTextures(uint32_t type, uint32_t count, int width, int height,
+                                     uint32_t* output) {
+     mImpl->createYUVTextures(type, count, width, height, output);
+diff --git a/host/frame_buffer.h b/host/frame_buffer.h
+index d9283db..c649580 100644
+--- a/host/frame_buffer.h
++++ b/host/frame_buffer.h
+@@ -573,6 +573,8 @@ class FrameBuffer : public gfxstream::base::EventNotificationSupport<FrameBuffer
+     // Returns true on success, false on failure.
+     // Note: if all handle values are 0, this is an unbind operation.
+     bool bindContext(HandleType p_context, HandleType p_drawSurface, HandleType p_readSurface);
++    bool postLoadBindContext(HandleType p_context, HandleType p_drawSurface,
++                             HandleType p_readSurface);
+ 
+     // create a Y texture and a UV texture with width and height, the created
+     // texture ids are stored in textures respectively
+diff --git a/host/gl/emulation_gl.cpp b/host/gl/emulation_gl.cpp
+index c4a3f65..604443f 100644
+--- a/host/gl/emulation_gl.cpp
++++ b/host/gl/emulation_gl.cpp
+@@ -1213,6 +1213,59 @@ bool EmulationGl::bindContext(HandleType contextHandle, HandleType drawSurfaceHa
+     return true;
+ }
+ 
++bool EmulationGl::postLoadBindContext(HandleType contextHandle, HandleType drawSurfaceHandle,
++                                      HandleType readSurfaceHandle) {
++    if (!contextHandle) {
++        return bindContext(0, 0, 0);
++    }
++    EmulatedEglContextPtr ctx = getContext(contextHandle);
++    if (!ctx) {
++        return false;
++    }
++
++    HandleType effectiveDraw = (drawSurfaceHandle && getWindowSurface(drawSurfaceHandle))
++                                   ? drawSurfaceHandle
++                                   : 0;
++    HandleType effectiveRead = (readSurfaceHandle && getWindowSurface(readSurfaceHandle))
++                                   ? readSurfaceHandle
++                                   : 0;
++
++    // EGL spec §3.5.5 allows eglDestroySurface() while a surface is still current on a thread:
++    // the surface is erased from mWindows (so it is not saved in snapshots), yet the thread
++    // keeps its context bound until the next eglMakeCurrent(). If snapshot load restores a
++    // thread whose bound surface was deferred-deleted, create a compatible 1x1 fallback
++    // pbuffer surface so eglMakeCurrent() succeeds instead of leaving TLS glesContext null.
++    if (!effectiveDraw || !effectiveRead) {
++        const size_t numConfigs = mEmulatedEglConfigs ? mEmulatedEglConfigs->size() : 0;
++        for (size_t i = 0; i < numConfigs; ++i) {
++            const auto* cfg = mEmulatedEglConfigs->get(static_cast<uint32_t>(i));
++            if (!cfg) continue;
++            HandleType fallbackHandle = mGlobalState->genHandleLocked();
++            auto fallbackWin = EmulatedEglWindowSurface::create(
++                mEglDisplay, cfg->getHostEglConfig(), 1, 1, fallbackHandle);
++            if (!fallbackWin) continue;
++            mWindows[fallbackHandle] = {std::move(fallbackWin), 0};
++            const HandleType tryDraw = effectiveDraw ? effectiveDraw : fallbackHandle;
++            const HandleType tryRead = effectiveRead ? effectiveRead : fallbackHandle;
++            if (bindContext(contextHandle, tryDraw, tryRead)) {
++                RenderThreadInfoGl* tinfo = RenderThreadInfoGl::get();
++                if (tinfo) {
++                    if (tinfo->m_puid) {
++                        mProcOwnedEmulatedEglWindowSurfaces[tinfo->m_puid].insert(fallbackHandle);
++                    } else {
++                        tinfo->m_windowSet.insert(fallbackHandle);
++                    }
++                }
++                return true;
++            }
++            mWindows.erase(fallbackHandle);
++        }
++        return false;
++    }
++
++    return bindContext(contextHandle, effectiveDraw, effectiveRead);
++}
++
+ void EmulationGl::preSave(Stream* stream, const gfxstream::ITextureSaverPtr& textureSaver) {
+     if (s_egl.eglPreSaveContext && s_egl.eglSaveAllImages) {
+         for (const auto& ctx : mContexts) {
+diff --git a/host/gl/emulation_gl.h b/host/gl/emulation_gl.h
+index 4b2f933..e3f5197 100644
+--- a/host/gl/emulation_gl.h
++++ b/host/gl/emulation_gl.h
+@@ -164,6 +164,8 @@ class EmulationGl {
+     bool bindColorBufferToRenderbuffer(IColorBuffer* colorBuffer);
+     bool bindContext(HandleType contextHandle, HandleType drawSurfaceHandle,
+                      HandleType readSurfaceHandle);
++    bool postLoadBindContext(HandleType contextHandle, HandleType drawSurfaceHandle,
++                             HandleType readSurfaceHandle);
+     bool bindColorBufferToWindowSurface(HandleType surfaceHandle, HandleType colorBufferHandle,
+                                         HandleType* outOldColorBufferHandle);
+     HandleType getWindowSurfaceColorBufferHandle(HandleType surfaceHandle) const;
+diff --git a/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp b/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
+index 1d3b27d..44ad15c 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
+@@ -31,6 +31,7 @@
+ #include <numeric>
+ #include <optional>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ #include "angle_shader_parser.h"
+ #include "gles_v2_context.h"
+@@ -95,6 +96,8 @@ static GLenum internal_glClientWaitSync(GLsync wait_on, GLbitfield flags, GLuint
+ static void internal_glWaitSync(GLsync wait_on, GLbitfield flags, GLuint64 timeout);
+ static void internal_glDeleteSync(GLsync to_delete);
+ static void internal_glGetSynciv(GLsync sync, GLenum pname, GLsizei bufsize, GLsizei *length, GLint *values);
++static void markGuestSyncsPreSnapshotSave();
++static void markGuestSyncsOnSnapshotLoad();
+ 
+ } // namespace translator
+ } // namespace gles2
+@@ -258,6 +261,9 @@ static GLEScontext* createGLESContext() {
+ }
+ static GLEScontext* createGLESxContext(int maj, int min,
+         GlobalNameSpace* globalNameSpace, gfxstream::Stream* stream) {
++    if (stream) {
++        translator::gles2::markGuestSyncsOnSnapshotLoad();
++    }
+     return new GLESv2Context(maj, min, globalNameSpace, stream,
+             s_eglIface->eglGetGlLibrary());
+ }
+@@ -362,6 +368,7 @@ static __translatorMustCastToProperFunctionPointerType getProcAddressGles2(const
+ }
+ 
+ static void preSaveTexture() {
++    translator::gles2::markGuestSyncsPreSnapshotSave();
+     SaveableTexture::preSave();
+ }
+ 
+diff --git a/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp b/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
+index 1d798d0..f99e3eb 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v30_imp.cpp
+@@ -404,12 +404,34 @@ public:
+ 
+     GLsync create(GLsync newHostSync) {
+         GLsync res = (GLsync)(uintptr_t)mNameCounter;
++        mStaleSyncs.erase(res);
+         mSyncs[res] = newHostSync;
+         mNameCounter++;
+         if (!mNameCounter) mNameCounter = 0x1000;
+         return res;
+     }
+ 
++    void markPreSnapshotSave() {
++        for (const auto& kv : mSyncs) {
++            mStaleSyncs.insert(kv.first);
++        }
++    }
++
++    void onSnapshotLoad() {
++        for (const auto& kv : mSyncs) {
++            mStaleSyncs.insert(kv.first);
++        }
++        mSyncs.clear();
++    }
++
++    bool isStale(GLsync guestSync) const {
++        return mStaleSyncs.find(guestSync) != mStaleSyncs.end();
++    }
++
++    bool removeStale(GLsync guestSync) {
++        return mStaleSyncs.erase(guestSync) > 0;
++    }
++
+     GLsync lookupWithError(GLsync guestSync, GLint* err) {
+         *err = GL_NO_ERROR;
+         GLsync host = (GLsync)0x0;
+@@ -445,13 +467,15 @@ public:
+     }
+ 
+     bool isSync(GLsync guestSync) {
+-        return mSyncs.find(guestSync) != mSyncs.end();
++        return mSyncs.find(guestSync) != mSyncs.end() ||
++               mStaleSyncs.find(guestSync) != mStaleSyncs.end();
+     }
+ 
+     gfxstream::base::Lock& lock() { return mLock; }
+ 
+ private:
+     std::unordered_map<GLsync, GLsync> mSyncs;
++    std::unordered_set<GLsync> mStaleSyncs;
+     mutable gfxstream::base::Lock mLock;
+     uint32_t mNameCounter = 0x1;
+ };
+@@ -461,6 +485,16 @@ static GuestSyncs* sSyncs() {
+     return s;
+ }
+ 
++static void markGuestSyncsPreSnapshotSave() {
++    gfxstream::base::AutoLock lock(sSyncs()->lock());
++    sSyncs()->markPreSnapshotSave();
++}
++
++static void markGuestSyncsOnSnapshotLoad() {
++    gfxstream::base::AutoLock lock(sSyncs()->lock());
++    sSyncs()->onSnapshotLoad();
++}
++
+ static GLsync internal_glFenceSync(GLenum condition, GLbitfield flags) {
+     GET_CTX_V2_RET(0);
+     if (!ctx->dispatcher().glFenceSync) {
+@@ -539,6 +573,10 @@ GL_APICALL GLenum GL_APIENTRY glClientWaitSync(GLsync wait_on, GLbitfield flags,
+ 
+     gfxstream::base::AutoLock lock(sSyncs()->lock());
+     GLsync hostSync = sSyncs()->lookupWithError(wait_on, &err);
++    if (err != GL_NO_ERROR && sSyncs()->isStale(wait_on)) {
++        // Pre-snapshot syncs were already completed by finishBeforeSnapshot() -> glFinish().
++        return GL_ALREADY_SIGNALED;
++    }
+     RET_AND_SET_ERROR_IF(err != GL_NO_ERROR, err, GL_WAIT_FAILED);
+     return internal_glClientWaitSync(hostSync, flags, timeout);
+ }
+@@ -549,6 +587,9 @@ GL_APICALL void GL_APIENTRY glWaitSync(GLsync wait_on, GLbitfield flags, GLuint6
+ 
+     gfxstream::base::AutoLock lock(sSyncs()->lock());
+     GLsync hostSync = sSyncs()->lookupWithError(wait_on, &err);
++    if (err != GL_NO_ERROR && sSyncs()->isStale(wait_on)) {
++        return;
++    }
+     SET_ERROR_IF(err != GL_NO_ERROR, err);
+     internal_glWaitSync(hostSync, flags, timeout);
+ }
+@@ -559,6 +600,9 @@ GL_APICALL void GL_APIENTRY glDeleteSync(GLsync to_delete) {
+ 
+     gfxstream::base::AutoLock lock(sSyncs()->lock());
+     GLsync hostSync = sSyncs()->removeWithError(to_delete, &err);
++    if (err != GL_NO_ERROR && sSyncs()->removeStale(to_delete)) {
++        return;
++    }
+     SET_ERROR_IF(err != GL_NO_ERROR, err);
+     internal_glDeleteSync(hostSync);
+ }
+@@ -576,6 +620,29 @@ GL_APICALL void GL_APIENTRY glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSi
+ 
+     gfxstream::base::AutoLock lock(sSyncs()->lock());
+     GLsync hostSync = sSyncs()->lookupWithError(sync, &err);
++    if (err != GL_NO_ERROR && sSyncs()->isStale(sync)) {
++        if (bufSize < 1 || !values) return;
++        if (length) *length = 1;
++        switch (pname) {
++            case GL_OBJECT_TYPE:
++                *values = GL_SYNC_FENCE;
++                break;
++            case GL_SYNC_CONDITION:
++                *values = GL_SYNC_GPU_COMMANDS_COMPLETE;
++                break;
++            case GL_SYNC_FLAGS:
++                *values = 0;
++                break;
++            case GL_SYNC_STATUS:
++                *values = GL_SIGNALED;
++                break;
++            default:
++                if (length) *length = 0;
++                ctx->setGLerror(GL_INVALID_ENUM);
++                break;
++        }
++        return;
++    }
+     SET_ERROR_IF(err != GL_NO_ERROR, err);
+     ctx->dispatcher().glGetSynciv(hostSync, pname, bufSize, length, values);
+ }
+diff --git a/host/gl/render_thread_info_gl.cpp b/host/gl/render_thread_info_gl.cpp
+index 3b4fdb4..2fdbe60 100644
+--- a/host/gl/render_thread_info_gl.cpp
++++ b/host/gl/render_thread_info_gl.cpp
+@@ -55,6 +55,14 @@ void RenderThreadInfoGl::finishBeforeSnapshot() {
+     if (!currContext) {
+         return;
+     }
++    // A thread restored from an earlier snapshot that stayed idle until the next savevm
++    // has currContext populated from onLoad() before postLoadRefreshCurrentContextSurfacePtrs()
++    // ever bound it via eglMakeCurrent(). In that state no commands were submitted on this
++    // thread since the prior snapshot, and calling glFinish() with a null TLS context logs
++    // spurious "error null ctx".
++    if (s_egl.eglGetCurrentContext && s_egl.eglGetCurrentContext() == EGL_NO_CONTEXT) {
++        return;
++    }
+     // The snapshot is taken from a different context (and thread). Pending
+     // commands in this context - texture uploads, draws into EGLImage
+     // backed textures - are not guaranteed to be visible there until they
+diff --git a/host/render_thread_info.cpp b/host/render_thread_info.cpp
+index a8a3fd9..17a72a7 100644
+--- a/host/render_thread_info.cpp
++++ b/host/render_thread_info.cpp
+@@ -148,7 +148,13 @@ bool RenderThreadInfo::onLoad(Stream* stream) {
+ void RenderThreadInfo::postLoadRefreshCurrentContextSurfacePtrs() {
+ #if GFXSTREAM_ENABLE_HOST_GLES
+     if (m_glInfo) {
+-        m_glInfo->postLoadRefreshCurrentContextSurfacePtrs();
++        if (auto* fb = FrameBuffer::getFB()) {
++            fb->postLoadBindContext(m_glInfo->currContextHandleFromLoad,
++                                    m_glInfo->currDrawSurfHandleFromLoad,
++                                    m_glInfo->currReadSurfHandleFromLoad);
++        } else {
++            m_glInfo->postLoadRefreshCurrentContextSurfacePtrs();
++        }
+     }
+ #endif
+ }
+-- 
+2.50.1.windows.1
+

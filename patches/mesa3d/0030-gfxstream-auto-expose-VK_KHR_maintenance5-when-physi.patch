@@ -1,0 +1,36 @@
+From 5ad2b3ec8c3f71abb9aff09b0f8b23998c42fe63 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:15:13 +0900
+Subject: [PATCH] gfxstream: auto-expose VK_KHR_maintenance5 when physical
+ device reports Vulkan 1.4
+
+---
+ src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 9d56858..a7543a6 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -2085,8 +2085,18 @@ VkResult ResourceTracker::on_vkEnumerateDeviceExtensionProperties(
+             }
+         }
+     }
++    bool exposeMaintenance5 = false;
+     char maintenance5[PROP_VALUE_MAX];
+     if (__system_property_get("debug.velox.maintenance5", maintenance5) == 1 && maintenance5[0] == '1') {
++        exposeMaintenance5 = true;
++    } else {
++        VkPhysicalDeviceProperties physProps = {};
++        enc->vkGetPhysicalDeviceProperties(physdev, &physProps, true /* do lock */);
++        if (physProps.apiVersion >= VK_API_VERSION_1_4) {
++            exposeMaintenance5 = true;
++        }
++    }
++    if (exposeMaintenance5) {
+         int index = getHostDeviceExtensionIndex(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+         if (index != -1) filteredExts.push_back(mHostDeviceExtensions[index]);
+     }
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,396 @@
+diff --git a/host/render_thread.cpp b/host/render_thread.cpp
+index 7bef4aa..57220ed 100644
+--- a/host/render_thread.cpp
++++ b/host/render_thread.cpp
+@@ -474,6 +474,7 @@ intptr_t RenderThread::main() {
+         }
+
+         bool progress = false;
++        bool invalidPacket = false;
+         anyProgress = false;
+         do {
+             anyProgress |= progress;
+@@ -514,9 +515,11 @@ intptr_t RenderThread::main() {
+                     .processName = contextName,
+                     .gfxApiLogger = &gfxLogger,
+                     .shouldExit = &mDecodersShouldStop,
++                    .invalidPacket = &invalidPacket,
+                 };
+                 last = tInfo->m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
+                                                       processResources.get(), context);
++                if (invalidPacket) break;
+                 if (last > 0) {
+                     if (!processResources) {
+                         GFXSTREAM_ERROR(
+@@ -595,6 +598,11 @@ intptr_t RenderThread::main() {
+ #endif
+         } while (progress);
+
++        if (invalidPacket) {
++            if (mRingStream) mRingStream->protocolError();
++            if (mChannel) mChannel->stopFromHost();
++            break;
++        }
+         if (processResources && processResources->isGuestProcessDead()) {
+             break;
+         }
+diff --git a/host/ring_stream.cpp b/host/ring_stream.cpp
+index 6c91ecb..074fdab 100644
+--- a/host/ring_stream.cpp
++++ b/host/ring_stream.cpp
+@@ -141,9 +141,17 @@ RingStream::RingStream(const AsgConsumerCreateInfo& info, size_t bufsize) :
+     mSavedRingConfig(*mContext.ring_config),
+     mCallbacks(info.callbacks),
+     mBufSize(info.buffer_size),
+-    mDuplex(supportsDuplex(info)) {}
+-
+-RingStream::~RingStream() = default;
++    mDuplex(supportsDuplex(info)),
++    mProfileTransfers(gfxstream::base::getEnvironmentVariable("VELOX_ASG_PROFILE") == "1") {}
++
++RingStream::~RingStream() {
++    if (mProfileTransfers && mXmits) {
++        GFXSTREAM_INFO("VELOX_ASG_RX duplex=%d reads=%zu bytes=%zu type1=%llu type3_reads=%llu "
++                       "type1_bytes=%llu type3_bytes=%llu",
++                       mDuplex, mXmits, mTotalRecv, mType1Transfers, mType3Reads,
++                       mType1Bytes, mType3Bytes);
++    }
++}
+
+ void RingStream::requestExit() {
+     mShouldExit.store(true, std::memory_order_release);
+@@ -436,6 +444,10 @@ void RingStream::type1Read(size_t* count, char* current, const char* ptrEnd) {
+         return;
+     }
+     __atomic_fetch_add(&mContext.ring_config->host_consumed_pos, xfer.size, __ATOMIC_RELEASE);
++    if (mProfileTransfers) {
++        ++mType1Transfers;
++        mType1Bytes += xfer.size;
++    }
+ }
+
+ void RingStream::type3Read(
+@@ -470,6 +482,10 @@ void RingStream::type3Read(
+         return;
+     }
+     *count += readSize;
++    if (mProfileTransfers) {
++        ++mType3Reads;
++        mType3Bytes += readSize;
++    }
+ }
+
+ void* RingStream::getDmaForReading(uint64_t guest_paddr) {
+diff --git a/host/ring_stream.h b/host/ring_stream.h
+index fc6fb85..5ddd279 100644
+--- a/host/ring_stream.h
++++ b/host/ring_stream.h
+@@ -46,6 +46,7 @@ class RingStream final : public IOStream {
+
+     void reloadRingConfig();
+     void requestExit();
++    void protocolError();
+
+   protected:
+     virtual void* allocBuffer(size_t minSize) override final;
+@@ -63,7 +64,6 @@ class RingStream final : public IOStream {
+                                    uint32_t consumed);
+     uint32_t availableReplyBytes();
+     bool writeReply(const uint8_t* data, uint32_t size);
+-    void protocolError();
+     bool exitRequested();
+
+     struct asg_context mContext;
+@@ -91,6 +91,11 @@ class RingStream final : public IOStream {
+
+     size_t mXmits = 0;
+     size_t mTotalRecv = 0;
++    const bool mProfileTransfers;
++    unsigned long long mType1Transfers = 0;
++    unsigned long long mType3Reads = 0;
++    unsigned long long mType1Bytes = 0;
++    unsigned long long mType3Bytes = 0;
+     bool mBenchmarkEnabled = false;
+     std::atomic<bool> mShouldExit{false};
+     bool mShouldExitForSnapshot = false;
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index 562f892..2c0d423 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -30,6 +30,7 @@
+
+ #include "vk_decoder.h"
+
++#include <chrono>
+ #include <cstring>
+ #include <functional>
+ #include <optional>
+@@ -72,7 +73,19 @@ class VkDecoder::Impl {
+           m_prevSeqno(std::nullopt),
+           m_queueSubmitWithCommandsEnabled(
+               m_state->getFeatures().VulkanQueueSubmitWithCommands.enabled()),
+-          m_snapshotsEnabled(m_state->snapshotsEnabled()) {}
++          m_snapshotsEnabled(m_state->snapshotsEnabled()),
++          m_borrowFlushedCommands(!m_snapshotsEnabled &&
++              gfxstream::base::getEnvironmentVariable("VELOX_VK_FLUSH_NO_COPY") == "1"),
++          m_profileFlushedCommands(
++              gfxstream::base::getEnvironmentVariable("VELOX_VK_FLUSH_PROFILE") == "1") {}
++    ~Impl() {
++        if (m_flushCount) {
++            GFXSTREAM_INFO("VELOX_VK_FLUSH packets=%llu borrowed=%llu bytes=%llu "
++                           "prepare_ns=%llu dispatch_ns=%llu",
++                           m_flushCount, m_flushBorrowCount, m_flushBytes,
++                           m_flushPrepareNs, m_flushDispatchNs);
++        }
++    }
+     VulkanStream* stream() { return &m_vkStream; }
+     VulkanMemReadingStream* readStream() { return &m_vkMemReadingStream; }
+
+@@ -94,6 +107,13 @@ class VkDecoder::Impl {
+     std::optional<uint32_t> m_prevSeqno;
+     bool m_queueSubmitWithCommandsEnabled = false;
+     const bool m_snapshotsEnabled = false;
++    const bool m_borrowFlushedCommands;
++    const bool m_profileFlushedCommands;
++    unsigned long long m_flushCount = 0;
++    unsigned long long m_flushBorrowCount = 0;
++    unsigned long long m_flushBytes = 0;
++    unsigned long long m_flushPrepareNs = 0;
++    unsigned long long m_flushDispatchNs = 0;
+ };
+
+ VkDecoder::VkDecoder() : mImpl(new VkDecoder::Impl()) {}
+@@ -129,6 +149,20 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+         uint32_t packetLen;
+         std::memcpy(&packetLen, ptr + 4, sizeof(uint32_t));
+
++        constexpr uint32_t kFlushFieldsSize = 2 * sizeof(uint64_t) + sizeof(VkDeviceSize);
++        const auto rejectFlush = [&](const char* reason) {
++            GFXSTREAM_ERROR("Invalid vkQueueFlushCommandsGOOGLE: %s", reason);
++            if (context.invalidPacket) *context.invalidPacket = true;
++            if (processResources) processResources->setGuestProcessDead();
++            if (m_forSnapshotLoad) m_state->setSnapshotLoadError();
++            return static_cast<size_t>(ptr - static_cast<unsigned char*>(buf));
++        };
++        if (opcode == OP_vkQueueFlushCommandsGOOGLE &&
++            (packetLen < 8 + kFlushFieldsSize + (m_queueSubmitWithCommandsEnabled ? 4 : 0) ||
++             packetLen > MAX_PACKET_LENGTH)) {
++            return rejectFlush("packet length out of range");
++        }
++
+         // packetLen should be at least 8 (op code and packet length) and should not be excessively
+         // large
+         if (packetLen < 8 || packetLen > MAX_PACKET_LENGTH) {
+@@ -22360,6 +22394,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+             case OP_vkQueueFlushCommandsGOOGLE: {
+                 GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY,
+                                       "VkDecoder vkQueueFlushCommandsGOOGLE");
++                using Clock = std::chrono::steady_clock;
++                const auto prepareStart = m_profileFlushedCommands ? Clock::now() : Clock::time_point{};
+                 VkQueue queue;
+                 VkCommandBuffer commandBuffer;
+                 VkDeviceSize dataSize;
+@@ -22369,8 +22405,6 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 8);
+                 *readStreamPtrPtr += 8;
+                 *(VkQueue*)&queue = (VkQueue)(VkQueue)((VkQueue)(*&cgen_var_0));
+-                auto vk = dispatch_VkQueue(queue);
+-                // No unbox for commandBuffer
+                 uint64_t cgen_var_1;
+                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 8);
+                 *readStreamPtrPtr += 8;
+@@ -22378,11 +22412,24 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                     (VkCommandBuffer)(VkCommandBuffer)((VkCommandBuffer)(*&cgen_var_1));
+                 memcpy((VkDeviceSize*)&dataSize, *readStreamPtrPtr, sizeof(VkDeviceSize));
+                 *readStreamPtrPtr += sizeof(VkDeviceSize);
+-                vkReadStream->alloc((void**)&pData, dataSize * sizeof(const uint8_t));
+-                if (dataSize > 0) {
+-                    memcpy((void*)pData, *readStreamPtrPtr, dataSize * sizeof(const uint8_t));
+-                    *readStreamPtrPtr += dataSize * sizeof(const uint8_t);
++                if (dataSize != static_cast<VkDeviceSize>(ptr + packetLen - *readStreamPtrPtr)) {
++                    return rejectFlush("command data length does not match packet");
++                }
++                using HandleStore = BoxedHandleManager::Store::EM;
++                if (HandleStore::getHandleType(cgen_var_0) != Tag_VkQueue ||
++                    HandleStore::getHandleType(cgen_var_1) != Tag_VkCommandBuffer ||
++                    !dispatch_VkQueue(queue) || !try_unbox_VkCommandBuffer(commandBuffer)) {
++                    return rejectFlush("invalid queue or command buffer handle");
++                }
++                const bool borrowed = m_borrowFlushedCommands && !m_forSnapshotLoad;
++                if (borrowed) {
++                    // RenderThread owns this buffer until decode returns. It is not the ASG mapping.
++                    pData = *readStreamPtrPtr;
++                } else {
++                    vkReadStream->alloc((void**)&pData, dataSize);
++                    if (dataSize > 0) memcpy((void*)pData, *readStreamPtrPtr, dataSize);
+                 }
++                *readStreamPtrPtr += dataSize;
+                 if (m_logCalls) {
+                     GFXSTREAM_INFO(
+                         "stream %p: call vkQueueFlushCommandsGOOGLE 0x%llx 0x%llx 0x%llx 0x%llx ",
+@@ -22391,9 +22438,19 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 }
+                 if (m_queueSubmitWithCommandsEnabled)
+                     seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+-                if (CC_LIKELY(vk)) {
+-                    m_state->on_vkQueueFlushCommandsGOOGLE(&m_pool, snapshotApiCallHandle, queue,
+-                                                           commandBuffer, dataSize, pData, context);
++                const auto dispatchStart = m_profileFlushedCommands ? Clock::now() : Clock::time_point{};
++                m_state->on_vkQueueFlushCommandsGOOGLE(&m_pool, snapshotApiCallHandle, queue,
++                                                       commandBuffer, dataSize, pData, context);
++                if (context.invalidPacket && *context.invalidPacket) {
++                    return rejectFlush("command buffer decode did not complete");
++                }
++                if (m_profileFlushedCommands) {
++                    using Ns = std::chrono::nanoseconds;
++                    ++m_flushCount;
++                    m_flushBorrowCount += borrowed;
++                    m_flushBytes += dataSize;
++                    m_flushPrepareNs += std::chrono::duration_cast<Ns>(dispatchStart - prepareStart).count();
++                    m_flushDispatchNs += std::chrono::duration_cast<Ns>(Clock::now() - dispatchStart).count();
+                 }
+                 vkStream->unsetHandleMapping();
+                 if (m_snapshotsEnabled) {
+diff --git a/host/vulkan/vk_decoder_context.h b/host/vulkan/vk_decoder_context.h
+index b69fd14..1792fb3 100644
+--- a/host/vulkan/vk_decoder_context.h
++++ b/host/vulkan/vk_decoder_context.h
+@@ -28,6 +28,7 @@ struct VkDecoderContext {
+     const char* processName = nullptr;
+     host::GfxApiLogger* gfxApiLogger = nullptr;
+     std::atomic_bool* shouldExit = nullptr;
++    bool* invalidPacket = nullptr;
+ };
+
+ }  // namespace vk
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 25990f9..1e4df8d 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -9986,13 +9986,39 @@ class VkDecoderGlobalState::Impl {
+                                        VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
+                                        VkCommandBuffer boxed_commandBuffer, VkDeviceSize dataSize,
+                                        const void* pData, const VkDecoderContext& context) {
+-        (void)queue;
++        if (!dataSize) return;
+
+         VkCommandBuffer commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
+         VulkanDispatch* vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
+         VulkanMemReadingStream* readStream = readstream_VkCommandBuffer(boxed_commandBuffer);
+-        subDecode(readStream, vk, apiCallHandle, boxed_commandBuffer, commandBuffer, dataSize,
+-                  pData, context);
++        uint32_t maxPushConstantsSize = 0;
++        const VkQueue hostQueue = try_unbox_VkQueue(queue);
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            const auto* cmdInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
++            const auto* queueInfo = gfxstream::base::find(mQueueInfo, hostQueue);
++            if (cmdInfo && queueInfo && cmdInfo->device == queueInfo->device) {
++                const auto* device = gfxstream::base::find(mDeviceInfo, cmdInfo->device);
++                if (device) {
++                    const auto* physical = gfxstream::base::find(mPhysdevInfo, device->physicalDevice);
++                    if (physical) maxPushConstantsSize = physical->props.limits.maxPushConstantsSize;
++                }
++            }
++        }
++        if (!readStream || !vk || !commandBuffer || !maxPushConstantsSize) {
++            if (context.invalidPacket) *context.invalidPacket = true;
++            if (isSnapshotCurrentlyLoading()) setSnapshotLoadError();
++            return;
++        }
++        const auto consumed = subDecode(readStream, vk, apiCallHandle, boxed_commandBuffer,
++                                        commandBuffer, dataSize, pData, maxPushConstantsSize, context);
++        readStream->setBuf(nullptr);
++        if (consumed != dataSize) {
++            GFXSTREAM_ERROR("Incomplete Vulkan command buffer: %zu of %" PRIu64 " bytes decoded",
++                            consumed, static_cast<uint64_t>(dataSize));
++            if (context.invalidPacket) *context.invalidPacket = true;
++            if (isSnapshotCurrentlyLoading()) setSnapshotLoadError();
++        }
+     }
+
+     void on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(gfxstream::base::BumpPool* pool,
+diff --git a/host/vulkan/vk_sub_decoder.cpp b/host/vulkan/vk_sub_decoder.cpp
+index b1c6e04..99af4f6 100644
+--- a/host/vulkan/vk_sub_decoder.cpp
++++ b/host/vulkan/vk_sub_decoder.cpp
+@@ -34,7 +34,7 @@
+ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                  VkSnapshotApiCallHandle snapshotApiCallHandle, void* boxed_dispatchHandle,
+                  void* dispatchHandle, VkDeviceSize subDecodeDataSize, const void* pSubDecodeData,
+-                 const VkDecoderContext& context) {
++                 uint32_t maxPushConstantsSize, const VkDecoderContext& context) {
+     uint32_t count = 0;
+     unsigned char* buf = (unsigned char*)pSubDecodeData;
+     gfxstream::base::BumpPool* pool = readStream->pool();
+@@ -42,13 +42,16 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+     const unsigned char* const end = (const unsigned char*)buf + subDecodeDataSize;
+     VkDecoderGlobalState* globalstate = VkDecoderGlobalState::get();
+     while (end - ptr >= 8) {
+-        uint32_t opcode = *(uint32_t*)ptr;
+-        uint32_t packetLen = *(uint32_t*)(ptr + 4);
++        uint32_t opcode;
++        uint32_t packetLen;
++        memcpy(&opcode, ptr, sizeof(opcode));
++        memcpy(&packetLen, ptr + sizeof(opcode), sizeof(packetLen));
+
+         // packetLen should be at least 8 (op code and packet length) and should not be excessively
+         // large
+         if (packetLen < 8 || packetLen > MAX_PACKET_LENGTH) {
+-            GFXSTREAM_WARNING("Bad packet length %d detected, subdecode may fail", packetLen);
++            GFXSTREAM_WARNING("Bad subdecode packet length %u", packetLen);
++            break;
+         }
+
+         if (end - ptr < packetLen) return ptr - (unsigned char*)buf;
+@@ -991,6 +994,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+             case OP_vkCmdPushConstants: {
+                 GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY,
+                                       "VkSubDecoder vkCmdPushConstants");
++                constexpr uint32_t kHeaderSize = 8 + sizeof(uint64_t) + 3 * sizeof(uint32_t);
++                if (CC_UNLIKELY(packetLen < kHeaderSize)) return ptr - buf;
+                 VkPipelineLayout layout;
+                 VkShaderStageFlags stageFlags;
+                 uint32_t offset;
+@@ -1000,8 +1005,6 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 uint64_t cgen_var_0;
+                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 8);
+                 *readStreamPtrPtr += 8;
+-                *(VkPipelineLayout*)&layout =
+-                    (VkPipelineLayout)unbox_VkPipelineLayout((VkPipelineLayout)(*&cgen_var_0));
+                 memcpy((VkShaderStageFlags*)&stageFlags, *readStreamPtrPtr,
+                        sizeof(VkShaderStageFlags));
+                 *readStreamPtrPtr += sizeof(VkShaderStageFlags);
+@@ -1009,6 +1012,14 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 *readStreamPtrPtr += sizeof(uint32_t);
+                 memcpy((uint32_t*)&size, *readStreamPtrPtr, sizeof(uint32_t));
+                 *readStreamPtrPtr += sizeof(uint32_t);
++                if (CC_UNLIKELY(size != packetLen - kHeaderSize || !size || (size | offset) % 4 ||
++                                offset >= maxPushConstantsSize || size > maxPushConstantsSize - offset ||
++                                BoxedHandleManager::Store::EM::getHandleType(cgen_var_0) !=
++                                    Tag_VkPipelineLayout)) {
++                    return ptr - buf;
++                }
++                layout = try_unbox_VkPipelineLayout((VkPipelineLayout)cgen_var_0);
++                if (CC_UNLIKELY(!layout)) return ptr - buf;
+                 if (size <= MAX_STACK_ITEMS) {
+                     pValues = (void*)stack_pValues;
+                 } else {
+@@ -1310,6 +1321,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+             }
+             case OP_vkCmdDraw: {
+                 GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY, "VkSubDecoder vkCmdDraw");
++                if (CC_UNLIKELY(packetLen != 8 + 4 * sizeof(uint32_t))) return ptr - buf;
+                 uint32_t vertexCount;
+                 uint32_t instanceCount;
+                 uint32_t firstVertex;
+@@ -4701,7 +4713,8 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+             }
+ #endif
+             default: {
+-                GFXSTREAM_FATAL("Unrecognized opcode %" PRIu32, opcode);
++                GFXSTREAM_ERROR("Unrecognized subdecode opcode %" PRIu32, opcode);
++                return ptr - buf;
+             }
+         }
+         ++count;

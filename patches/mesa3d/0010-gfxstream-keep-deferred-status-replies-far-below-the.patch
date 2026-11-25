@@ -1,0 +1,42 @@
+From 97d7343d03a95db9196cb3fbce3902a5e65186e7 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:43:19 +0900
+Subject: [PATCH 10/12] gfxstream: keep deferred status replies far below the
+ host queue size
+
+The goldfish pipe RenderChannel holds 16 host-to-guest messages. With up to
+64 unread deferred replies the host render thread blocked in its reply write
+and, with process-wide sequence numbers, every other thread's commands waited
+behind it (observed as a frozen AnTuTu run: one host render thread in
+ChannelStream::commitBuffer, another spinning on the sequence number, the
+guest waiting for a vkGetBufferDeviceAddress reply). Drain after 4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Id418181187ef2b32291b5a310cfbfd934da68cfe
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+---
+ .../guest/iostream/include/gfxstream/guest/IOStream.h       | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+index 0d83c99..c96c3e1 100644
+--- a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
++++ b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+@@ -93,7 +93,11 @@ class IOStream {
+     // (the host still writes the reply, in order). Those replies precede every later reply on
+     // this stream, so readback() consumes them first. A non-zero status is kept for
+     // takeDeferredReplyError(). The count is bounded by the caller (see kMaxDeferredReplies).
+-    static constexpr uint32_t kMaxDeferredReplies = 64;
++    // Every unread reply occupies one slot of the host's host-to-guest queue (16 messages for the
++    // goldfish pipe RenderChannel). When it is full the host render thread blocks in the reply
++    // write, and with process-wide sequence numbers every other thread's commands wait behind it:
++    // a deadlock if this thread then waits for another thread. Keep the bound far below 16.
++    static constexpr uint32_t kMaxDeferredReplies = 4;
+     void deferStatusReply() { ++m_deferredReplies; }
+     uint32_t deferredReplies() const { return m_deferredReplies; }
+     int32_t takeDeferredReplyError() {
+-- 
+2.50.1.windows.1
+

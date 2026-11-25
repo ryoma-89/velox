@@ -1,0 +1,307 @@
+From 123638cb7429c7a67593e18fc400d6d245c48651 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:29:08 +0900
+Subject: [PATCH] velox: keep fence watcher waits and teardown outside global
+ mMutex and under graphicsDriverLock (patch 0023)
+
+Avoid blocking inside VkDecoderGlobalState::mMutex during vkResetFences, vkDestroyFence, and vkDestroyDevice. Move VeloxFenceWatcher cancel waits outside mMutex after non-blocking removePending(), detach the watcher in extractDeviceAndDependenciesLocked(), destroy device objects outside mMutex in on_vkDestroyDevice (matching destroyInstanceObjects), and join the watcher OS thread under graphicsDriverLock() before destroying fences or the device.
+
+Change-Id: I9c4d7e12a3b6f805e1a24c78d90f3b1e5a7c8203
+---
+ host/vulkan/velox_fence_shared.h          | 72 ++++++++++++++++++--
+ host/vulkan/vk_decoder_global_state.cpp   | 82 ++++++++++++++++++++---
+ host/vulkan/vk_decoder_internal_structs.h |  1 +
+ 3 files changed, 139 insertions(+), 16 deletions(-)
+
+diff --git a/host/vulkan/velox_fence_shared.h b/host/vulkan/velox_fence_shared.h
+index 40c8ff0..6c1ad5a 100644
+--- a/host/vulkan/velox_fence_shared.h
++++ b/host/vulkan/velox_fence_shared.h
+@@ -164,16 +164,55 @@ class VeloxFenceWatcher {
+                       std::chrono::microseconds delay)
+         : mDevice(device), mWait(wait), mStatus(status), mDelay(delay), mThread([this] { run(); }) {}
+ 
+-    ~VeloxFenceWatcher() { stop(); }
++    ~VeloxFenceWatcher() {
++        requestStop();
++        waitLoopFinished();
++        allowExitAndJoin();
++    }
+ 
+-    void stop() {
++    // Non-blocking: tells the watcher loop to stop taking new batches and clears pending fences.
++    // Safe to call while the caller holds VkDecoderGlobalState::mMutex.
++    void requestStop() {
+         {
+             std::lock_guard<std::mutex> lock(mMutex);
+             mStop = true;
+             mPending.clear();
+         }
+         mCv.notify_all();
+-        if (mThread.joinable()) mThread.join();
++    }
++
++    // Waits until the watcher loop has exited and will issue no further native Vulkan calls
++    // (does not terminate the OS thread yet). Must be called outside VkDecoderGlobalState::mMutex.
++    void waitLoopFinished() {
++        std::unique_lock<std::mutex> lock(mMutex);
++        mStop = true;
++        mPending.clear();
++        mCv.notify_all();
++        if (mThread.joinable() && mThread.get_id() == std::this_thread::get_id()) return;
++        mCv.wait(lock, [&] { return mLoopDone; });
++    }
++
++    // Permits the OS thread to exit and joins it without holding mMutex.
++    // Call under graphicsDriverLock() so DLL_THREAD_DETACH never races with vkDestroyDevice.
++    void allowExitAndJoin() {
++        std::thread toJoin;
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            mStop = true;
++            mPending.clear();
++            mCanExit = true;
++            if (mThread.joinable() && mThread.get_id() != std::this_thread::get_id()) {
++                toJoin = std::move(mThread);
++            }
++        }
++        mCv.notify_all();
++        if (toJoin.joinable()) toJoin.join();
++    }
++
++    void stop() {
++        requestStop();
++        waitLoopFinished();
++        allowExitAndJoin();
+     }
+ 
+     // Never wakes the watcher: a submission must not pay for a thread wake-up. The watcher
+@@ -203,14 +242,21 @@ class VeloxFenceWatcher {
+         }
+     }
+ 
+-    void cancel(VkFence fence) {
+-        std::unique_lock<std::mutex> lock(mMutex);
++    // Non-blocking: remove |fence| from mPending so the watcher neither starts waiting on it
++    // nor publishes a stale completion from an in-flight batch. Safe under global mMutex.
++    void removePending(VkFence fence) {
++        std::lock_guard<std::mutex> lock(mMutex);
+         for (size_t i = 0; i < mPending.size(); ++i) {
+             if (mPending[i].fence == fence) {
+                 mPending.erase(mPending.begin() + i);
+-                break;
++                return;
+             }
+         }
++    }
++
++    // Waits until no native call on |fence| is in progress. Call outside global mMutex.
++    void waitNotInUse(VkFence fence) {
++        std::unique_lock<std::mutex> lock(mMutex);
+         mCv.wait(lock, [&] {
+             for (VkFence f : mInWait) {
+                 if (f == fence) return false;
+@@ -219,6 +265,11 @@ class VeloxFenceWatcher {
+         });
+     }
+ 
++    void cancel(VkFence fence) {
++        removePending(fence);
++        waitNotInUse(fence);
++    }
++
+     unsigned long long completions() const { return mCompletions.load(std::memory_order_relaxed); }
+ 
+    private:
+@@ -230,7 +281,12 @@ class VeloxFenceWatcher {
+             {
+                 std::unique_lock<std::mutex> lock(mMutex);
+                 for (;;) {
+-                    if (mStop) return;
++                    if (mStop) {
++                        mLoopDone = true;
++                        mCv.notify_all();
++                        mCv.wait(lock, [&] { return mCanExit; });
++                        return;
++                    }
+                     const auto now = std::chrono::steady_clock::now();
+                     auto next = now + kPollPeriod;
+                     batch.clear();
+@@ -302,6 +358,8 @@ class VeloxFenceWatcher {
+     std::vector<Entry> mPending;
+     std::vector<VkFence> mInWait;
+     bool mStop = false;
++    bool mLoopDone = false;
++    bool mCanExit = false;
+     bool mLost = false;
+     std::atomic<unsigned long long> mCompletions{0};
+     std::thread mThread;
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 0f0a205..40c7aa5 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -3574,9 +3574,21 @@ class VkDecoderGlobalState::Impl {
+ 
+         processDelayedRemovesForDevice(device);
+ 
+-        std::lock_guard<std::mutex> lock(mMutex);
+-
+-        destroyDeviceLocked(device);
++        InstanceObjects::DeviceObjects deviceObjects;
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            auto deviceInfoIt = mDeviceInfo.find(device);
++            if (deviceInfoIt == mDeviceInfo.end()) {
++                GFXSTREAM_WARNING("Could not find device:%p to destroy", device);
++                return;
++            }
++            deviceObjects.device = mDeviceInfo.extract(deviceInfoIt);
++            extractDeviceAndDependenciesLocked(device, deviceObjects);
++        }
++        // Destroy outside mMutex (same as destroyInstanceObjects) so watcher teardown,
++        // vkDeviceWaitIdle, and graphicsDriverLock()-guarded vkDestroyDevice never block
++        // unrelated Vulkan threads on the global state mutex.
++        destroyDeviceObjects(deviceObjects);
+     }
+ 
+     VkResult on_vkCreateBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
+@@ -4669,9 +4681,14 @@ class VkDecoderGlobalState::Impl {
+         std::vector<VkFence> externalFences;
+ 
+         std::vector<DeviceOpWaitable> pendingUses;
++        std::shared_ptr<VeloxFenceWatcher> watcherToWait;
++        std::vector<VkFence> fencesToCancel;
+ 
+         {
+             std::lock_guard<std::mutex> lock(mMutex);
++            if (auto wIt = mVeloxFenceWatchers.find(device); wIt != mVeloxFenceWatchers.end()) {
++                watcherToWait = wIt->second;
++            }
+ 
+             for (uint32_t i = 0; i < fenceCount; i++) {
+                 VkFence fence = pFences[i];
+@@ -4683,7 +4700,13 @@ class VkDecoderGlobalState::Impl {
+                     continue;
+                 }
+                 FenceInfo& fenceInfo = fenceInfoIt->second;
+-                veloxForgetFenceLocked(device, fence, fenceInfo);
++                if (watcherToWait) {
++                    watcherToWait->removePending(fence);
++                    fencesToCancel.push_back(fence);
++                }
++                if (fenceInfo.veloxTable) {
++                    fenceInfo.veloxTable->clear(reinterpret_cast<uint64_t>(fenceInfo.boxed));
++                }
+                 ++fenceInfo.veloxEpoch;
+ 
+                 if (fenceInfo.latestUse) {
+@@ -4704,6 +4727,13 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
++        // Wait outside mMutex until the watcher has no native call in flight on these fences.
++        if (watcherToWait) {
++            for (VkFence f : fencesToCancel) {
++                watcherToWait->waitNotInUse(f);
++            }
++        }
++
+         // Ensure that any host operations that reference this fence have completed
+         // before resetting.
+         while (!pendingUses.empty()) {
+@@ -5280,6 +5310,27 @@ class VkDecoderGlobalState::Impl {
+         auto device = unbox_VkDevice(boxed_device);
+         auto deviceDispatch = dispatch_VkDevice(boxed_device);
+ 
++        std::shared_ptr<VeloxFenceWatcher> watcherToWait;
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            auto fenceInfoIt = mFenceInfo.find(fence);
++            if (fenceInfoIt != mFenceInfo.end()) {
++                if (auto wIt = mVeloxFenceWatchers.find(device);
++                    wIt != mVeloxFenceWatchers.end()) {
++                    watcherToWait = wIt->second;
++                    watcherToWait->removePending(fence);
++                }
++                if (fenceInfoIt->second.veloxTable) {
++                    fenceInfoIt->second.veloxTable->clear(
++                        reinterpret_cast<uint64_t>(fenceInfoIt->second.boxed));
++                }
++            }
++        }
++        // Wait outside mMutex until any in-flight native wait on |fence| completes.
++        if (watcherToWait) {
++            watcherToWait->waitNotInUse(fence);
++        }
++
+         std::lock_guard<std::mutex> lock(mMutex);
+         destroyFenceLocked(device, deviceDispatch, fence, /*allowExternalFenceRecycling=*/true);
+     }
+@@ -8623,7 +8674,7 @@ class VkDecoderGlobalState::Impl {
+                     fenceInfo->veloxTable = tVeloxCurrentFenceTable;
+                     auto& watcher = mVeloxFenceWatchers[device];
+                     if (!watcher) {
+-                        watcher = std::make_unique<VeloxFenceWatcher>(
++                        watcher = std::make_shared<VeloxFenceWatcher>(
+                             device, fenceInfo->vk->vkWaitForFences,
+                             fenceInfo->vk->vkGetFenceStatus, veloxFenceWatchDelay());
+                     }
+@@ -11896,11 +11947,12 @@ class VkDecoderGlobalState::Impl {
+ 
+     void extractDeviceAndDependenciesLocked(VkDevice device,
+                                             InstanceObjects::DeviceObjects& deviceObjects) REQUIRES(mMutex) {
+-        // Velox: no native fence call of the watcher may outlive the device's fences. The
+-        // watcher never takes mMutex, and it waits in short slices, so this returns promptly.
++        // Velox: detach and signal stop without blocking under mMutex; destroyDeviceObjects()
++        // waits for the watcher loop and joins the OS thread under graphicsDriverLock().
+         if (auto it = mVeloxFenceWatchers.find(device); it != mVeloxFenceWatchers.end()) {
+-            it->second->stop();
++            deviceObjects.veloxFenceWatcher = std::move(it->second);
+             mVeloxFenceWatchers.erase(it);
++            deviceObjects.veloxFenceWatcher->requestStop();
+         }
+         extractInfosWithDeviceInto(device, mBufferInfo, deviceObjects.buffers);
+         extractInfosWithDeviceInto(device, mCommandBufferInfo, deviceObjects.commandBuffers);
+@@ -11959,6 +12011,18 @@ class VkDecoderGlobalState::Impl {
+     }
+ 
+     void destroyDeviceObjects(InstanceObjects::DeviceObjects& deviceObjects) {
++            // Velox: stop the fence watcher before destroying any fences or the device, and
++            // join its OS thread under graphicsDriverLock() so DLL_THREAD_DETACH never races
++            // with concurrent vkDestroyDevice calls on Windows NVIDIA drivers.
++            if (deviceObjects.veloxFenceWatcher) {
++                deviceObjects.veloxFenceWatcher->waitLoopFinished();
++                {
++                    AutoLock driverLock(*graphicsDriverLock());
++                    deviceObjects.veloxFenceWatcher->allowExitAndJoin();
++                }
++                deviceObjects.veloxFenceWatcher.reset();
++            }
++
+             VkDevice device = deviceObjects.device.key();
+             DeviceInfo& deviceInfo = deviceObjects.device.mapped();
+             VulkanDispatch* deviceDispatch = dispatch_VkDevice(deviceInfo.boxed);
+@@ -12351,7 +12415,7 @@ class VkDecoderGlobalState::Impl {
+     std::unordered_map<VkFence, FenceInfo> mFenceInfo GUARDED_BY(mMutex);
+     // Velox fence completion watchers, one per device that submitted a fence from a context
+     // with a fence table (VELOX_FENCE_SHARED=1).
+-    std::unordered_map<VkDevice, std::unique_ptr<VeloxFenceWatcher>> mVeloxFenceWatchers
++    std::unordered_map<VkDevice, std::shared_ptr<VeloxFenceWatcher>> mVeloxFenceWatchers
+         GUARDED_BY(mMutex);
+     std::unordered_map<VkFramebuffer, FramebufferInfo> mFramebufferInfo GUARDED_BY(mMutex);
+     std::unordered_map<VkImage, ImageInfo> mImageInfo GUARDED_BY(mMutex);
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 2051a8d..324ad87 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -674,6 +674,7 @@ struct InstanceObjects {
+     std::unordered_map<VkPhysicalDevice, PhysicalDeviceInfo> physicalDevices;
+     struct DeviceObjects {
+         std::unordered_map<VkDevice, DeviceInfo>::node_type device;
++        std::shared_ptr<gfxstream::VeloxFenceWatcher> veloxFenceWatcher;
+ 
+         std::unordered_map<VkBuffer, BufferInfo> buffers;
+         std::unordered_map<VkCommandBuffer, CommandBufferInfo> commandBuffers;
+-- 
+2.50.1.windows.1
+

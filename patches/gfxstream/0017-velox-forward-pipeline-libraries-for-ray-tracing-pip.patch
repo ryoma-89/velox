@@ -1,0 +1,51 @@
+From d1c20b95468dda0f6c80356a927bed5e4579b073 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:31:17 +0900
+Subject: [PATCH] velox: forward pipeline libraries for ray tracing pipelines
+ (patch 0017)
+
+Library handles are unboxed by the decoder; a null library handle is
+rejected instead of reaching the driver. Capture/replay stays rejected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I31c3fecce20a16a5aef3121a5a5d6919134df29a
+---
+ host/vulkan/vk_decoder_global_state.cpp | 22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index a450e64..f46d7af 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -9313,14 +9313,20 @@ class VkDecoderGlobalState::Impl {
+             const auto& info = pCreateInfos[i];
+             // Pipeline libraries are not exposed, and capture/replay handles would be guest
+             // pointers here.
+-            // pLibraryInterface only carries the maximum payload and attribute sizes and is valid
+-            // without pipeline libraries (KI-31: rejecting it returned null pipelines that dEQP
+-            // later queried). Libraries themselves are not exposed.
+-            if ((info.pLibraryInfo && info.pLibraryInfo->libraryCount) ||
+-                (info.flags & (VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+-                               VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR))) {
+-                GFXSTREAM_ERROR("vkCreateRayTracingPipelinesKHR: libraries and capture/replay are "
+-                                "not exposed");
++            // Pipeline libraries (VK_KHR_pipeline_library) are forwarded: the library handles in
++            // pLibraryInfo are unboxed by the decoder, and pLibraryInterface only carries sizes.
++            // A null library handle would reach the driver, so reject it (KI-31).
++            if (info.pLibraryInfo) {
++                for (uint32_t l = 0; l < info.pLibraryInfo->libraryCount; ++l) {
++                    if (!info.pLibraryInfo->pLibraries ||
++                        info.pLibraryInfo->pLibraries[l] == VK_NULL_HANDLE) {
++                        GFXSTREAM_ERROR("vkCreateRayTracingPipelinesKHR: null pipeline library");
++                        return VK_ERROR_OUT_OF_HOST_MEMORY;
++                    }
++                }
++            }
++            if (info.flags & VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) {
++                GFXSTREAM_ERROR("vkCreateRayTracingPipelinesKHR: capture/replay is not exposed");
+                 return VK_ERROR_OUT_OF_HOST_MEMORY;
+             }
+             for (uint32_t g = 0; g < info.groupCount; ++g) {
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,87 @@
+From ac0b8ceb70fc4c5e51b35fa0d82eaf181507c1b2 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 19:43:04 +0900
+Subject: [PATCH] gfxstream: make the descriptor set layout refcount atomic
+
+With VulkanBatchedDescriptorSetUpdate every descriptor set holds a
+reference on its set layout. The count was a plain uint32_t that
+vkAllocateDescriptorSets, vkFreeDescriptorSets, vkResetDescriptorPool
+and vkDestroyDescriptorSetLayout modify without a lock.
+
+A set layout is not externally synchronized, so two threads that use
+the same layout with their own pools race on the count. A lost update
+destroys the layout while sets still reference it; the next allocation
+reads the freed layout (VK_ERROR_INITIALIZATION_FAILED) or a descriptor
+write overruns the set's write table (SIGSEGV in
+doEmulatedDescriptorWrite).
+
+Reproducer: 8 threads, one pool each, sharing one layout, each looping
+reset/allocate 32 sets/update. Before: 6/6 runs crashed or failed.
+After: 10/10 runs (160k frames) passed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I21c4c5fc9e1ca1bc82ab1f591a49d38c99506944
+---
+ .../guest/vulkan_enc/DescriptorSetVirtualization.h         | 7 ++++++-
+ src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp         | 6 +++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h b/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h
+index 9fa5404..28095ac 100644
+--- a/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h
++++ b/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h
+@@ -6,6 +6,7 @@
+ 
+ #include <vulkan/vulkan.h>
+ 
++#include <atomic>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -88,7 +89,11 @@ struct DescriptorPoolAllocationInfo {
+ 
+ struct DescriptorSetLayoutInfo {
+     std::vector<VkDescriptorSetLayoutBinding> bindings;
+-    uint32_t refcount;
++    // A set layout is not externally synchronized: different threads may allocate and free
++    // descriptor sets with the same layout from different pools at the same time. In the
++    // batched descriptor update mode every set holds a reference, so the count must be atomic,
++    // otherwise lost updates destroy the layout while sets still use it.
++    std::atomic<uint32_t> refcount;
+ };
+ 
+ void clearReifiedDescriptorSet(ReifiedDescriptorSet* set);
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 1079987..ee8609a 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1030,7 +1030,7 @@ static void decDescriptorSetLayoutRef(void* context, VkDevice device,
+     struct goldfish_VkDescriptorSetLayout* setLayout =
+         gfxstream_vk_descriptor_set_layout_from_handle(descriptorSetLayout);
+ 
+-    if (0 == --setLayout->layoutInfo->refcount) {
++    if (setLayout->layoutInfo->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+         VkEncoder* enc = (VkEncoder*)context;
+         enc->vkDestroyDescriptorSetLayout(device, descriptorSetLayout, pAllocator,
+                                           true /* do lock */);
+@@ -5368,7 +5368,7 @@ VkResult ResourceTracker::on_vkAllocateDescriptorSets(
+             // same time
+             struct goldfish_VkDescriptorSetLayout* dsl =
+                 gfxstream_vk_descriptor_set_layout_from_handle(setLayout);
+-            ++dsl->layoutInfo->refcount;
++            dsl->layoutInfo->refcount.fetch_add(1, std::memory_order_relaxed);
+         }
+     } else {
+         VkResult allocRes = enc->vkAllocateDescriptorSets(device, ci, sets, true /* do lock */);
+@@ -5475,7 +5475,7 @@ VkResult ResourceTracker::on_vkCreateDescriptorSetLayout(
+     for (uint32_t i = 0; i < pCreateInfo->bindingCount; ++i) {
+         dsl->layoutInfo->bindings.push_back(pCreateInfo->pBindings[i]);
+     }
+-    dsl->layoutInfo->refcount = 1;
++    dsl->layoutInfo->refcount.store(1, std::memory_order_relaxed);
+ 
+     return res;
+ }
+-- 
+2.50.1.windows.1
+

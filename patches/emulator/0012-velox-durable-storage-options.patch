@@ -1,0 +1,102 @@
+From: Velox <velox@local>
+Subject: [PATCH 12] velox: add durable storage options (raw userdata, native AIO, multi-queue, full L2 cache)
+
+Adds opt-in durable storage tuning for userdata in android-qemu2-glue/main.cpp
+(never enabling cache=unsafe or bypassing guest flushes):
+- VELOX_USERDATA_RAW=1: attaches raw userdata-qemu.img with format=raw,cache=writeback
+  (only when -no-snapstorage is set and the file is not qcow2).
+- VELOX_DRIVE_CACHE=none|writethrough: selects durable host cache mode (unsafe rejected).
+- VELOX_DRIVE_AIO=native: enables Windows IOCP overlapped AIO (aio=native).
+- VELOX_VIRTIO_BLK_QUEUES=N: enables multi-queue virtio-blk-pci (num-queues=N,queue-size=256).
+- Fixes qcow2 L2 cache sizing to consider virtual disk_dataPartition_size (4 MiB for 32 GiB).
+
+diff --git a/android-qemu2-glue/main.cpp b/android-qemu2-glue/main.cpp
+--- a/android-qemu2-glue/main.cpp
++++ b/android-qemu2-glue/main.cpp
+@@ -739,15 +739,44 @@ private:
+                 deviceParam = StringFormat("%s,drive=cache",
+                                            kTarget.storageDeviceType);
+                 break;
+-            case IMAGE_TYPE_USER_DATA:
++            case IMAGE_TYPE_USER_DATA: {
+                 filePath = m_hw->disk_dataPartition_path;
+-                bufferString = StringFormat("%s.qcow2", filePath.data());
+-                driveParam +=
+-                        StringFormat("index=%d,id=userdata,file=%s",
+-                                     m_driveIndex++, bufferString.c_str());
++                const char* rawEnv = getenv("VELOX_USERDATA_RAW");
++                const bool wantRaw = rawEnv && strcmp(rawEnv, "1") == 0 &&
++                                     getConsoleAgents()->settings->android_cmdLineOptions()->no_snapstorage &&
++                                     !System::get()->pathIsQcow2(filePath);
++                if (wantRaw) {
++                    qCow2Format = false;
++                    const char* cacheEnv = getenv("VELOX_DRIVE_CACHE");
++                    const char* cacheMode = "writeback";
++                    if (cacheEnv && (strcmp(cacheEnv, "none") == 0 || strcmp(cacheEnv, "writethrough") == 0)) {
++                        cacheMode = cacheEnv;
++                    }
++                    driveParam += StringFormat(
++                            "index=%d,id=userdata,format=raw,cache=%s,file=%s",
++                            m_driveIndex++, cacheMode, filePath.data());
++                    dprint("VELOX_STORAGE: userdata attached as durable raw (%s, cache=%s)\n",
++                           filePath.data(), cacheMode);
++                } else {
++                    bufferString = StringFormat("%s.qcow2", filePath.data());
++                    driveParam +=
++                            StringFormat("index=%d,id=userdata,file=%s",
++                                         m_driveIndex++, bufferString.c_str());
++                }
++                if (const char* aioEnv = getenv("VELOX_DRIVE_AIO");
++                    aioEnv && strcmp(aioEnv, "native") == 0) {
++                    driveParam += ",aio=native";
++                }
+                 deviceParam = StringFormat("%s,drive=userdata",
+                                            kTarget.storageDeviceType);
++                if (const char* qEnv = getenv("VELOX_VIRTIO_BLK_QUEUES"); qEnv && *qEnv) {
++                    const int q = std::max(1, std::min(8, atoi(qEnv)));
++                    if (q > 1) {
++                        deviceParam += StringFormat(",num-queues=%d,queue-size=256", q);
++                    }
++                }
+                 break;
++            }
+             case IMAGE_TYPE_SD_CARD:
+                 if (m_hw->hw_sdCard_path != NULL &&
+                     strcmp(m_hw->hw_sdCard_path, "")) {
+@@ -790,18 +819,27 @@ private:
+         }
+ 
+         if (qCow2Format) {
+             // Keep host caching while honoring guest flushes and qcow2 overlap checks.
+-            driveParam += ",cache=writeback";
++            const char* cacheEnv = getenv("VELOX_DRIVE_CACHE");
++            const char* cacheMode = "writeback";
++            if (type == IMAGE_TYPE_USER_DATA && cacheEnv &&
++                (strcmp(cacheEnv, "none") == 0 || strcmp(cacheEnv, "writethrough") == 0)) {
++                cacheMode = cacheEnv;
++            }
++            driveParam += StringFormat(",cache=%s", cacheMode);
+ 
+-            // Default qcow2's L2 cache size is up to 8GB. Let's increase it for
+-            // larger images.
+-            System::FileSize diskSize;
+-            if (System::get()->pathFileSize(filePath, &diskSize)) {
+-                // L2 cache size should be "disk_size_GB / 131072" as per QEMU
+-                // docs with a default of 1MB. Round it up just in case.
++            // Default qcow2's L2 cache size is up to 8GB. Size it from the virtual
++            // partition size (not just the sparse backing file) so 32GB userdata fits in L2 cache.
++            System::FileSize diskSize = 0;
++            System::get()->pathFileSize(filePath, &diskSize);
++            if (type == IMAGE_TYPE_USER_DATA && m_hw->disk_dataPartition_size > 0) {
++                diskSize = std::max<System::FileSize>(
++                        diskSize, static_cast<System::FileSize>(m_hw->disk_dataPartition_size));
++            }
++            if (diskSize > 0) {
+                 const int l2CacheSize =
+-                        std::max<int>((diskSize + (1024 * 1024 * 1024 - 1)) /
+-                                              (1024 * 1024 * 1024) * 131072,
++                        std::max<int>((diskSize + (1024ULL * 1024 * 1024 - 1)) /
++                                              (1024ULL * 1024 * 1024) * 131072,
+                                       1024 * 1024);
+                 driveParam += StringFormat(",l2-cache-size=%d", l2CacheSize);
+             }

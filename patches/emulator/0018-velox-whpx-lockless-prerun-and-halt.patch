@@ -1,0 +1,92 @@
+diff --git a/target/i386/whpx-all.c b/target/i386/whpx-all.c
+index e6361ef..411afca 100644
+--- a/target/i386/whpx-all.c
++++ b/target/i386/whpx-all.c
+@@ -28,6 +28,7 @@
+ #include "qemu/main-loop.h"
+ #include "qemu/timer.h"
+ #include "hw/boards.h"
++#include "hw/i386/apic_internal.h"
+ #include "qemu/error-report.h"
+ #include "qemu/queue.h"
+ #include "qapi/error.h"
+@@ -854,8 +855,6 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
+ {
+     HRESULT hr;
+     struct whpx_vcpu *vcpu = get_whpx_vcpu(cpu);
+-    struct whpx_vcpu vcpu_copy = *vcpu;
+-    WHV_MEMORY_ACCESS_CONTEXT ctx_copy = *ctx;
+     WHV_EMULATOR_STATUS emu_status;
+ 
+     hr = whp_dispatch.WHvEmulatorTryMmioEmulation(
+@@ -877,6 +876,8 @@ static int whpx_handle_mmio(CPUState *cpu, WHV_MEMORY_ACCESS_CONTEXT *ctx)
+             return 0;
+         }
+ 
++        struct whpx_vcpu vcpu_copy = *vcpu;
++        WHV_MEMORY_ACCESS_CONTEXT ctx_copy = *ctx;
+         /* each byte takes 3 characters to print: "XX " */
+         char instruction[sizeof(ctx_copy.InstructionBytes) * 3 + 1];
+         int i;
+@@ -964,11 +965,21 @@ static int whpx_handle_portio(CPUState *cpu,
+     return 0;
+ }
+ 
++static bool whpx_prerun_fast = true;
++
+ static int whpx_handle_halt(CPUState *cpu)
+ {
+     struct CPUX86State *env = (CPUArchState *)(cpu->env_ptr);
+     int ret = 0;
+ 
++    if (whpx_prerun_fast) {
++        int req = atomic_mb_read(&cpu->interrupt_request);
++        if (((req & CPU_INTERRUPT_HARD) && (env->eflags & IF_MASK)) ||
++            (req & CPU_INTERRUPT_NMI)) {
++            return 0;
++        }
++    }
++
+     qemu_mutex_lock_iothread();
+     if (!((cpu->interrupt_request & CPU_INTERRUPT_HARD) &&
+           (env->eflags & IF_MASK)) &&
+@@ -996,6 +1007,21 @@ static void whpx_vcpu_pre_run(CPUState *cpu)
+     WHV_REGISTER_VALUE reg_values[3];
+     WHV_REGISTER_NAME reg_names[3];
+ 
++    if (whpx_prerun_fast && atomic_mb_read(&cpu->interrupt_request) == 0) {
++        DeviceState *apic_dev = x86_cpu->apic_state;
++        if (!apic_dev) {
++            if (vcpu->tpr == 0) {
++                return;
++            }
++        } else {
++            APICCommonState *apic = APIC_COMMON(apic_dev);
++            if (apic->vapic_paddr == 0 &&
++                (uint8_t)(atomic_read(&apic->tpr) >> 4) == vcpu->tpr) {
++                return;
++            }
++        }
++    }
++
+     memset(&new_int, 0, sizeof(new_int));
+     memset(reg_values, 0, sizeof(reg_values));
+ 
+@@ -1841,7 +1867,8 @@ static void whpx_memory_init(void)
+ 
+ static void whpx_handle_interrupt(CPUState *cpu, int mask)
+ {
+-    cpu->interrupt_request |= mask;
++    atomic_or(&cpu->interrupt_request, mask);
++    smp_mb();
+ 
+     if (!qemu_cpu_is_self(cpu)) {
+         qemu_cpu_kick(cpu);
+@@ -2011,6 +2038,7 @@ static int whpx_accel_init(MachineState *ms)
+     whpx_memory_init();
+ 
+     cpu_interrupt_handler = whpx_handle_interrupt;
++    whpx_prerun_fast = g_strcmp0(g_getenv("VELOX_WHPX_PRERUN_FAST"), "0") != 0;
+     whpx_collect_exit_counts = g_strcmp0(g_getenv("VELOX_WHPX_EXIT_STATS"), "1") == 0;
+     if (whpx_collect_exit_counts) {
+         timer_init_ms(&whpx_exit_counts_timer, QEMU_CLOCK_REALTIME, whpx_log_exit_counts, NULL);

@@ -1,0 +1,156 @@
+diff --git a/android/android-emu/android/emulation/address_space_graphics.cpp b/android/android-emu/android/emulation/address_space_graphics.cpp
+--- a/android/android-emu/android/emulation/address_space_graphics.cpp
++++ b/android/android-emu/android/emulation/address_space_graphics.cpp
+@@ -14,6 +14,8 @@
+ 
+ #include "host-common/address_space_graphics.h"
+ 
++#include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <optional>
+ 
+@@ -21,6 +23,7 @@
+ #include "aemu/base/SubAllocator.h"
+ #include "aemu/base/memory/LazyInstance.h"
+ #include "aemu/base/synchronization/Lock.h"
++#include "android/cmdline-option.h"
+ #include "android/console.h"
+ #include "android/snapshot/GfxstreamStreamAdapter.h"
+ #include "host-common/address_space_device.h"
+@@ -54,6 +57,9 @@
+ namespace android {
+ namespace emulation {
+ namespace asg {
++
++constexpr uint32_t kAsgDuplexVersion = 0x564c0002;
++constexpr uint64_t kAsgGetDuplexBuffer = 0x564c0001;
+ 
+ struct AllocationCreateInfo {
+     bool virtioGpu;
+@@ -245,6 +251,27 @@
+         struct AllocationCreateInfo create = {0};
+         create.size = mPerContextBufferSize;
+         return newAllocation(create, mBufferBlocks);
++    }
++
++    Allocation expandUnpublishedBuffer(const Allocation& alloc, uint64_t size) {
++        AutoLock lock(mLock);
++        if (alloc.blockIndex >= mBufferBlocks.size()) return {};
++        auto& block = mBufferBlocks[alloc.blockIndex];
++        if (block.isEmpty) return {};
++
++        // Stay inside the same backing block. Graphics pings can run without
++        // the BQL, and this path must not add or remove a GPA mapping.
++        auto* buffer = static_cast<char*>(block.subAlloc->alloc(size));
++        if (!buffer) return {};
++        if (!block.subAlloc->free(alloc.buffer)) {
++            block.subAlloc->free(buffer);
++            return {};
++        }
++        Allocation expanded = alloc;
++        expanded.buffer = buffer;
++        expanded.size = size;
++        expanded.offsetIntoPhys = block.offsetIntoPhys + block.subAlloc->getOffset(buffer);
++        return expanded;
+     }
+ 
+     void freeBuffer(const Allocation& alloc) {
+@@ -667,15 +694,35 @@
+ }
+ 
+ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
+-    switch (static_cast<asg_command>(info->metadata)) {
++    switch (info->metadata) {
+     case ASG_GET_RING:
+         info->metadata = mRingAllocation.offsetIntoPhys;
+         info->size = mRingAllocation.size;
+         break;
+     case ASG_GET_BUFFER:
++        mBufferAnnounced = true;
+         info->metadata = mBufferAllocation.offsetIntoPhys;
+         info->size = mBufferAllocation.size;
+         break;
++    case kAsgGetDuplexBuffer: {
++        info->metadata = UINT64_MAX;
++        info->size = 0;
++        const uint64_t size = sGlobals->perContextBufferSize();
++        const char* enabled = std::getenv("VELOX_ASG_DUPLEX");
++        const auto* options = getConsoleAgents()->settings->android_cmdLineOptions();
++        if (!enabled || std::strcmp(enabled, "1") || !options || !options->no_snapstorage ||
++            mVirtioGpuInfo || mCurrentConsumer || mBufferAnnounced ||
++            size < kAsgPageSize || size > kAsgBlockSize / 2 || (size & (size - 1))) {
++            break;
++        }
++        const auto duplex = sGlobals->expandUnpublishedBuffer(mBufferAllocation, 2 * size);
++        if (!duplex.buffer) break;
++        mBufferAllocation = duplex;
++        mBufferAnnounced = true;
++        info->metadata = mBufferAllocation.offsetIntoPhys;
++        info->size = mBufferAllocation.size;
++        break;
++    }
+     case ASG_SET_VERSION: {
+         if (mCurrentConsumer) {
+             info->size = mVersion;
+@@ -685,7 +732,10 @@
+             break;
+         }
+ 
+-        if (info->size < mVersion) {
++        const auto capacity = sGlobals->perContextBufferSize();
++        if (info->size == kAsgDuplexVersion && !mVirtioGpuInfo && mBufferAllocation.size > capacity) {
++            mVersion = kAsgDuplexVersion;
++        } else if (info->size < mVersion) {
+             mVersion = static_cast<uint32_t>(info->size);
+         }
+         info->size = mVersion;
+@@ -694,7 +744,8 @@
+             .version = mVersion,
+             .ring_storage = mRingAllocation.buffer,
+             .buffer = mBufferAllocation.buffer,
+-            .buffer_size = sGlobals->perContextBufferSize(),
++            .buffer_size = static_cast<uint32_t>(mVersion == kAsgDuplexVersion
++                                                     ? mBufferAllocation.size : capacity),
+             .buffer_flush_interval = getConsoleAgents()->settings->hw()->hw_gltransport_asg_writeStepSize,
+             .callbacks = mConsumerCallbacks,
+             .virtioGpuContextId = mVirtioGpuInfo ?
+@@ -708,6 +759,11 @@
+                 std::nullopt,
+         };
+         mCurrentConsumer = mConsumerInterface.create(consumerCreateInfo, nullptr /* no load stream */);
++        if (!mCurrentConsumer) {
++            info->size = UINT64_MAX;
++            info->metadata = UINT64_MAX;
++            break;
++        }
+ 
+         if (mVirtioGpuInfo) {
+             info->metadata = mCombinedAllocation.hostmemId;
+@@ -719,7 +775,7 @@
+         info->metadata = 0;
+         break;
+     case ASG_GET_CONFIG:
+-        if (!mCurrentConsumer) {
++        if (!mCurrentConsumer || mVersion == kAsgDuplexVersion) {
+             info->metadata = UINT64_MAX;
+             break;
+         }
+@@ -818,7 +874,9 @@
+     }
+ 
+     mVersion = stream->getBe32();
++    if (mVersion == kAsgDuplexVersion) return false;
+     mExiting = stream->getBe32();
++    mBufferAnnounced = true;
+ 
+     loadAllocation(stream, mRingAllocation);
+     loadAllocation(stream, mBufferAllocation);
+@@ -855,6 +913,7 @@
+                 std::nullopt,
+         };
+         mCurrentConsumer = mConsumerInterface.create(consumerCreateInfo, &gfxstreamStream);
++        if (!mCurrentConsumer) return false;
+         mConsumerInterface.postLoad(mCurrentConsumer);
+     }
+ 

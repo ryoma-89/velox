@@ -1,0 +1,42 @@
+--- a/android/android-emu/android/emulation/address_space_graphics.cpp
++++ b/android/android-emu/android/emulation/address_space_graphics.cpp
+@@ -14,6 +14,7 @@
+
+ #include "host-common/address_space_graphics.h"
+
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <memory>
+@@ -709,14 +710,27 @@
+         info->size = 0;
+         const uint64_t size = sGlobals->perContextBufferSize();
+         const char* enabled = std::getenv("VELOX_ASG_DUPLEX");
++        if (!enabled || std::strcmp(enabled, "1")) break;
+         const auto* options = getConsoleAgents()->settings->android_cmdLineOptions();
+-        if (!enabled || std::strcmp(enabled, "1") || !options || !options->no_snapstorage ||
+-            mVirtioGpuInfo || mCurrentConsumer || mBufferAnnounced ||
+-            size < kAsgPageSize || size > kAsgBlockSize / 2 || (size & (size - 1))) {
++        if (!options || !options->no_snapstorage) {
++            fprintf(stderr, "VELOX_ASG_DUPLEX fallback: snapshot storage not disabled\n");
+             break;
+         }
++        if (mVirtioGpuInfo || mCurrentConsumer || mBufferAnnounced) {
++            fprintf(stderr, "VELOX_ASG_DUPLEX fallback: virtio=%d consumer=%d announced=%d\n",
++                    mVirtioGpuInfo.has_value(), mCurrentConsumer != nullptr, mBufferAnnounced);
++            break;
++        }
++        if (size < kAsgPageSize || size > kAsgBlockSize / 2 || (size & (size - 1))) {
++            fprintf(stderr, "VELOX_ASG_DUPLEX fallback: invalid context buffer size %llu\n",
++                    static_cast<unsigned long long>(size));
++            break;
++        }
+         const auto duplex = sGlobals->expandUnpublishedBuffer(mBufferAllocation, 2 * size);
+-        if (!duplex.buffer) break;
++        if (!duplex.buffer) {
++            fprintf(stderr, "VELOX_ASG_DUPLEX fallback: backing block has no replacement buffer\n");
++            break;
++        }
+         mBufferAllocation = duplex;
+         mBufferAnnounced = true;
+         info->metadata = mBufferAllocation.offsetIntoPhys;

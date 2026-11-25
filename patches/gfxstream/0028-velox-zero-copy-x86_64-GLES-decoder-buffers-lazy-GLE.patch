@@ -1,0 +1,311 @@
+From 712727098d8f015c3af6fa2b5402b59daf054bcf Mon Sep 17 00:00:00 2001
+From: Velox <velox@local>
+Date: Wed, 25 Nov 2026 03:09:22 +0900
+Subject: [PATCH] velox: zero-copy x86_64 GLES decoder buffers, lazy GLESbuffer
+ shadow, and shader translation cache (patch 0028)
+
+---
+ .../include/gfxstream/host/ProtocolUtils.h    | 13 ++++-
+ host/gl/glestranslator/common/gles_buffer.cpp | 47 ++++++++++++++++-
+ .../gl/glestranslator/common/gles_context.cpp | 18 ++++---
+ .../common/include/common/gles_buffer.h       |  5 +-
+ .../gles_v2/angle_shader_parser.cpp           | 50 +++++++++++++++++++
+ .../gl/glestranslator/gles_v2/gles_v2_imp.cpp |  2 -
+ 6 files changed, 122 insertions(+), 13 deletions(-)
+
+diff --git a/host/decoder_common/include/gfxstream/host/ProtocolUtils.h b/host/decoder_common/include/gfxstream/host/ProtocolUtils.h
+index f343d10..fc23eaa 100644
+--- a/host/decoder_common/include/gfxstream/host/ProtocolUtils.h
++++ b/host/decoder_common/include/gfxstream/host/ProtocolUtils.h
+@@ -111,7 +111,16 @@ inline T Unpack(const void* ptr) {
+ // if the |ptr|'s |size| is small enough. If it doesn't fit into the internal
+ // array, an aligned copy is allocated on the heap and freed in the dtor.
+ 
+-template <size_t StackSize = 1024, size_t Align = 8>
++// On x86_64, unaligned loads/stores are native hardware operations and host GL/EGL
++// entrypoints accept byte-aligned payload pointers (e.g. glTexSubImage2D at +44,
++// glBufferData at +20). Using Align = 1 eliminates a full malloc+memcpy+free per upload.
++#if defined(__x86_64__) || defined(_M_X64)
++static constexpr size_t kDefaultProtocolBufferAlign = 1;
++#else
++static constexpr size_t kDefaultProtocolBufferAlign = 8;
++#endif
++
++template <size_t StackSize = 1024, size_t Align = kDefaultProtocolBufferAlign>
+ class GenericInputBuffer {
+     static_assert(Align == 1 || Align == 2 || Align == 4 || Align == 8,
+                   "Bad alignment parameter");
+@@ -148,7 +157,7 @@ private:
+     char __attribute__((__aligned__(Align))) mArray[StackSize];
+ };
+ 
+-template <size_t StackSize = 1024, size_t Align = 8>
++template <size_t StackSize = 1024, size_t Align = kDefaultProtocolBufferAlign>
+ class GenericOutputBuffer {
+     static_assert(Align == 1 || Align == 2 || Align == 4 || Align == 8,
+                   "Bad alignment parameter");
+diff --git a/host/gl/glestranslator/common/gles_buffer.cpp b/host/gl/glestranslator/common/gles_buffer.cpp
+index 19b506f..ae90307 100644
+--- a/host/gl/glestranslator/common/gles_buffer.cpp
++++ b/host/gl/glestranslator/common/gles_buffer.cpp
+@@ -17,6 +17,31 @@
+ #include <common/gles_context.h>
+ #include <string.h>
+ #include <limits.h>
++#include <vector>
++
++GLvoid* GLESbuffer::getData() {
++    if (!m_data && m_lazyShadow && m_size > 0 && m_globalName != 0) {
++        GLDispatch& dispatcher = GLEScontext::dispatcher();
++        if (dispatcher.glMapBufferRange) {
++            m_data = new unsigned char[m_size];
++            int prevBuffer = 0;
++            dispatcher.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevBuffer);
++            dispatcher.glBindBuffer(GL_ARRAY_BUFFER, m_globalName);
++            void* gpuData = dispatcher.glMapBufferRange(GL_ARRAY_BUFFER, 0, m_size, GL_MAP_READ_BIT);
++            if (gpuData) {
++                memcpy(m_data, gpuData, m_size);
++                dispatcher.glUnmapBuffer(GL_ARRAY_BUFFER);
++            } else {
++                memset(m_data, 0, m_size);
++            }
++            dispatcher.glBindBuffer(GL_ARRAY_BUFFER, prevBuffer);
++            m_lazyShadow = false;
++            m_conversionManager.clear();
++            m_conversionManager.addRange(Range(0, m_size));
++        }
++    }
++    return m_data;
++}
+ 
+ bool  GLESbuffer::setBuffer(GLuint size,GLuint usage,const GLvoid* data) {
+     m_size = size;
+@@ -25,6 +50,16 @@ bool  GLESbuffer::setBuffer(GLuint size,GLuint usage,const GLvoid* data) {
+         delete [] m_data;
+         m_data = NULL;
+     }
++    // Skip eager host RAM shadow allocation and memcpy when GPU readback is available
++    // (glMapBufferRange). Shadow bytes are materialized lazily in getData() only if a
++    // legacy client-side conversion path actually inspects them; onSave() already reads
++    // directly from GPU memory via glMapBufferRange.
++    if (m_globalName != 0 && GLEScontext::dispatcher().glMapBufferRange) {
++        m_lazyShadow = true;
++        m_conversionManager.clear();
++        return true;
++    }
++    m_lazyShadow = false;
+     m_data = new unsigned char[size];
+     if(m_data) {
+         if(data) {
+@@ -40,6 +75,10 @@ bool  GLESbuffer::setBuffer(GLuint size,GLuint usage,const GLvoid* data) {
+ bool  GLESbuffer::setSubBuffer(GLuint offset, GLuint size, const GLvoid* data) {
+     if (UINT_MAX - offset < size) return false;
+     if(offset + size > m_size) return false;
++    if (m_lazyShadow && !m_data) {
++        return true;
++    }
++    if (!m_data) return false;
+     memcpy(m_data+offset,data,size);
+     m_conversionManager.addRange(Range(offset,size));
+     m_conversionManager.merge();
+@@ -103,7 +142,12 @@ void GLESbuffer::onSave(gfxstream::Stream* stream,
+         dispatcher.glBindBuffer(GL_ARRAY_BUFFER, prevBuffer);
+     }
+     if (!mapSuccess) {
+-        stream->write(m_data, m_size);
++        if (m_data) {
++            stream->write(m_data, m_size);
++        } else if (m_size != 0) {
++            std::vector<unsigned char> zeros(m_size, 0);
++            stream->write(zeros.data(), m_size);
++        }
+     }
+ 
+     // TODO: m_conversionManager
+@@ -119,6 +163,7 @@ void GLESbuffer::restore(ObjectLocalName localName,
+     ObjectData::restore(localName, getGlobalName);
+     GLDispatch& dispatcher = GLEScontext::dispatcher();
+     int globalName = getGlobalName(NamedObjectType::VERTEXBUFFER, localName);
++    m_globalName = static_cast<GLuint>(globalName);
+     // We bind to GL_ARRAY_BUFFER just for uploading buffer data
+     dispatcher.glBindBuffer(GL_ARRAY_BUFFER, globalName);
+     dispatcher.glBufferData(GL_ARRAY_BUFFER, m_size, m_data, m_usage);
+diff --git a/host/gl/glestranslator/common/gles_context.cpp b/host/gl/glestranslator/common/gles_context.cpp
+index 17fe1b2..4c127a4 100644
+--- a/host/gl/glestranslator/common/gles_context.cpp
++++ b/host/gl/glestranslator/common/gles_context.cpp
+@@ -362,15 +362,13 @@ GLuint GLEScontext::getVertexArrayObject() const {
+ 
+ bool GLEScontext::vertexAttributesBufferBacked() {
+     const auto& info = m_currVaoState.attribInfo_const();
+-    for (uint32_t i = 0; i  < kMaxVertexAttributes; ++i) {
++    const auto& vaoBindings = m_currVaoState.bufferBindings();
++    const size_t numBindings = vaoBindings.size();
++    for (uint32_t i = 0; i < kMaxVertexAttributes; ++i) {
+         const auto& pointerInfo = info[i];
+         if (pointerInfo.isEnable()) {
+             const auto bufferBindingIndex = pointerInfo.getBindingIndex();
+-            const auto& vaoBindings = m_currVaoState.bufferBindings();
+-            if (bufferBindingIndex >= vaoBindings.size()) {
+-                return false;
+-            }
+-            if (!vaoBindings[bufferBindingIndex].buffer) {
++            if (bufferBindingIndex >= numBindings || !vaoBindings[bufferBindingIndex].buffer) {
+                 return false;
+             }
+         }
+@@ -992,7 +990,9 @@ const GLvoid* GLEScontext::setPointer(GLenum arrType,GLint size,GLenum type,GLsi
+ 
+         glesPointer->setBuffer(size,type,stride,std::move(vboObj),bufferName,offset,normalize, isInt);
+ 
+-        return  static_cast<const unsigned char*>(vbo->getData()) +  offset;
++        // No caller inspects setPointer()'s return value; avoid forcing lazy shadow
++        // readback of GPU buffers on every glVertexAttribPointer call.
++        return nullptr;
+     }
+     glesPointer->setArray(size,type,stride,data,dataSize,normalize,isInt);
+     return glesPointer->getArrayData();
+@@ -1512,6 +1512,8 @@ bool GLEScontext::setBufferData(GLenum target,GLsizeiptr size,const GLvoid* data
+     GLESbuffer* vbo = static_cast<GLESbuffer*>(
+             m_shareGroup
+                     ->getObjectData(NamedObjectType::VERTEXBUFFER, bufferName));
++    if (!vbo) return false;
++    vbo->setGlobalName(m_shareGroup->getGlobalName(NamedObjectType::VERTEXBUFFER, bufferName));
+     return vbo->setBuffer(size,usage,data);
+ }
+ 
+@@ -1522,6 +1524,8 @@ bool GLEScontext::setBufferSubData(GLenum target,GLintptr offset,GLsizeiptr size
+     GLESbuffer* vbo = static_cast<GLESbuffer*>(
+             m_shareGroup
+                     ->getObjectData(NamedObjectType::VERTEXBUFFER, bufferName));
++    if (!vbo) return false;
++    vbo->setGlobalName(m_shareGroup->getGlobalName(NamedObjectType::VERTEXBUFFER, bufferName));
+     return vbo->setSubBuffer(offset,size,data);
+ }
+ 
+diff --git a/host/gl/glestranslator/common/include/common/gles_buffer.h b/host/gl/glestranslator/common/include/common/gles_buffer.h
+index 3259e12..ae9cd6f 100644
+--- a/host/gl/glestranslator/common/include/common/gles_buffer.h
++++ b/host/gl/glestranslator/common/include/common/gles_buffer.h
+@@ -32,7 +32,8 @@ public:
+                 const getGlobalName_t& getGlobalName) override;
+    GLuint getSize(){return m_size;};
+    GLuint getUsage(){return m_usage;};
+-   GLvoid* getData(){ return m_data;}
++   GLvoid* getData();
++   void  setGlobalName(GLuint globalName) { m_globalName = globalName; }
+    bool  setBuffer(GLuint size,GLuint usage,const GLvoid* data);
+    bool  setSubBuffer(GLuint offset, GLuint size, const GLvoid* data);
+    void  getConversions(const RangeList& rIn,RangeList& rOut);
+@@ -44,9 +45,11 @@ public:
+ private:
+     GLuint         m_size = 0;
+     GLuint         m_usage = GL_STATIC_DRAW;
++    GLuint         m_globalName = 0;
+     unsigned char* m_data = nullptr;
+     RangeList      m_conversionManager;
+     bool           m_wasBound = false;
++    bool           m_lazyShadow = false;
+ };
+ 
+ #endif
+diff --git a/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp b/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp
+index e7a9a4d..f007749 100644
+--- a/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp
++++ b/host/gl/glestranslator/gles_v2/angle_shader_parser.cpp
+@@ -18,8 +18,10 @@
+ 
+ #include <string.h>
+ 
++#include <deque>
+ #include <map>
+ #include <string>
++#include <unordered_map>
+ 
+ #include "ShaderTranslator.h"
+ #include "gfxstream/shared_library.h"
+@@ -132,6 +134,7 @@ ShaderLinkInfo& ShaderLinkInfo::operator=(ShaderLinkInfo&& other) {
+     varyings = std::move(other.varyings);
+     attributes = std::move(other.attributes);
+     outputVars = std::move(other.outputVars);
++    interfaceBlocks = std::move(other.interfaceBlocks);
+     nameMap = std::move(other.nameMap);
+     nameMapReverse = std::move(other.nameMapReverse);
+ 
+@@ -404,6 +407,37 @@ bool translate(bool hostUsesCoreProfile,
+     // at the same time.
+     gfxstream::base::AutoLock autolock(kCompilerLock);
+ 
++    struct CachedTranslation {
++        bool ok = false;
++        std::string infoLog;
++        std::string objCode;
++        ShaderLinkInfo linkInfo;
++    };
++    constexpr size_t kMaxCacheEntries = 256;
++    struct TranslationCache {
++        std::unordered_map<std::string, CachedTranslation> map;
++        std::deque<std::string> order;
++    };
++    static TranslationCache* sCache = new TranslationCache;
++
++    std::string cacheKey;
++    cacheKey.reserve(strlen(src) + 24);
++    cacheKey.push_back(hostUsesCoreProfile ? '1' : '0');
++    cacheKey.push_back(':');
++    cacheKey += std::to_string(shaderType);
++    cacheKey.push_back(':');
++    cacheKey += src;
++
++    auto cachedIt = sCache->map.find(cacheKey);
++    if (cachedIt != sCache->map.end()) {
++        *outInfolog = cachedIt->second.infoLog;
++        *outObjCode = cachedIt->second.objCode;
++        if (outShaderLinkInfo) {
++            *outShaderLinkInfo = cachedIt->second.linkInfo;
++        }
++        return cachedIt->second.ok;
++    }
++
+     ShaderSpecKey key;
+     key.shaderType = shaderType;
+     key.esslVersion = esslVersion;
+@@ -431,6 +465,22 @@ bool translate(bool hostUsesCoreProfile,
+ 
+     bool ret = res->compileStatus == 1;
+ 
++    if (ret) {
++        if (sCache->map.size() >= kMaxCacheEntries && !sCache->order.empty()) {
++            sCache->map.erase(sCache->order.front());
++            sCache->order.pop_front();
++        }
++        CachedTranslation entry;
++        entry.ok = ret;
++        entry.infoLog = *outInfolog;
++        entry.objCode = *outObjCode;
++        if (outShaderLinkInfo) {
++            entry.linkInfo = *outShaderLinkInfo;
++        }
++        sCache->map.emplace(cacheKey, std::move(entry));
++        sCache->order.push_back(std::move(cacheKey));
++    }
++
+     st->freeShaderResolveState(res);
+     return ret;
+ }
+diff --git a/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp b/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
+index 63efd84..1d3b27d 100644
+--- a/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
++++ b/host/gl/glestranslator/gles_v2/gles_v2_imp.cpp
+@@ -4329,8 +4329,6 @@ GL_APICALL void  GL_APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x
+                  yoffset + height > (GLint)texData->height,
+                  GL_INVALID_VALUE);
+     }
+-    SET_ERROR_IF(!(GLESv2Validate::pixelFrmt(ctx,format) &&
+-                   GLESv2Validate::pixelType(ctx,type)),GL_INVALID_ENUM);
+     SET_ERROR_IF(!GLESv2Validate::pixelOp(format,type),GL_INVALID_OPERATION);
+     SET_ERROR_IF(!pixels && !ctx->isBindedBuffer(GL_PIXEL_UNPACK_BUFFER),GL_INVALID_OPERATION);
+     if (type==GL_HALF_FLOAT_OES)
+-- 
+2.50.1.windows.1
+

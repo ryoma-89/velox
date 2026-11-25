@@ -1,0 +1,17 @@
+diff --git a/android-qemu2-glue/main.cpp b/android-qemu2-glue/main.cpp
+index 2d0ade77..5bd25cab 100644
+--- a/android-qemu2-glue/main.cpp
++++ b/android-qemu2-glue/main.cpp
+@@ -790,10 +790,8 @@ private:
+         }
+ 
+         if (qCow2Format) {
+-            // Disable extra qcow2 checks as we're on its stable version.
+-            // Disable cache flushes as well, as Android issues way too many
+-            // flush commands for nothing.
+-            driveParam += ",overlap-check=none,cache=unsafe";
++            // Keep host caching while honoring guest flushes and qcow2 overlap checks.
++            driveParam += ",cache=writeback";
+ 
+             // Default qcow2's L2 cache size is up to 8GB. Let's increase it for
+             // larger images.

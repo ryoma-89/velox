@@ -1,0 +1,2 @@
+option('gfxstream_dir', type : 'string', value : '', description : 'hardware/google/gfxstream のパス')
+option('mesa_dir', type : 'string', value : '', description : 'external/mesa3d のパス')

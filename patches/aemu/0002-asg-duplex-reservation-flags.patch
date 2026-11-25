@@ -1,0 +1,15 @@
+Velox: duplex reservation flags for the ASG context (pairs with emulator 0011).
+
+--- a/host-common/include/host-common/address_space_graphics.h
++++ b/host-common/include/host-common/address_space_graphics.h
+@@ -92,6 +92,10 @@
+     Allocation mBufferAllocation;
+     Allocation mCombinedAllocation;
+     bool mBufferAnnounced = false;
++    // Velox (VELOX_ASG_DUPLEX=1): the buffer was allocated at twice the context size when the
++    // context was created, and the guest was given the whole of it (kAsgGetDuplexBuffer).
++    bool mDuplexReserved = false;
++    bool mDuplexAnnounced = false;
+ 
+     // Consumer storage
+     gfxstream::ConsumerCallbacks mConsumerCallbacks;

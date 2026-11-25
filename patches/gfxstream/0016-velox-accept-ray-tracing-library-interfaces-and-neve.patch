@@ -1,0 +1,286 @@
+From eefe122360837c12c3ae5a16869bb4b226d24bdf Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:21:53 +0900
+Subject: [PATCH 16/16] velox: accept ray tracing library interfaces and never
+ pass null pipelines to the driver (KI-31, patch 0016)
+
+pLibraryInterface only carries payload and attribute sizes and is valid
+without pipeline libraries; rejecting it returned null pipelines that the
+guest later queried, and the NVIDIA driver dereferenced the null pipeline in
+vkGetRayTracingShaderGroupHandlesKHR. Shader group handle and stack size
+queries and pipeline binds now reject null pipelines. VELOX_VK_TRACE_FILE
+records decoded commands with a flush per line for crash diagnosis.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ieb17a43092bf587511744d3522bd993e269ac487
+---
+ host/vulkan/velox_trace.h               | 39 ++++++++++++++++++++++
+ host/vulkan/vk_decoder.cpp              | 37 ++++++++-------------
+ host/vulkan/vk_decoder_global_state.cpp | 44 ++++++++++++++++++++++++-
+ host/vulkan/vk_decoder_global_state.h   |  7 ++++
+ host/vulkan/vk_sub_decoder.cpp          |  8 +++++
+ 5 files changed, 110 insertions(+), 25 deletions(-)
+ create mode 100644 host/vulkan/velox_trace.h
+
+diff --git a/host/vulkan/velox_trace.h b/host/vulkan/velox_trace.h
+new file mode 100644
+index 0000000..a467417
+--- /dev/null
++++ b/host/vulkan/velox_trace.h
+@@ -0,0 +1,39 @@
++// Velox: durable diagnostic trace for host crashes (KI-31).
++//
++// Enabled only when VELOX_VK_TRACE_FILE names a file. Each line is flushed so the history before a
++// crash in the host process (or in the Vulkan driver it calls) survives the crash.
++#pragma once
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++namespace gfxstream {
++namespace host {
++namespace vk {
++
++inline FILE* veloxTraceFile() {
++    static FILE* file = []() -> FILE* {
++        const char* path = std::getenv("VELOX_VK_TRACE_FILE");
++        return path && *path ? std::fopen(path, "a") : nullptr;
++    }();
++    return file;
++}
++
++inline void veloxTrace(const char* format, ...) {
++    FILE* file = veloxTraceFile();
++    if (!file) return;
++    static std::mutex mutex;
++    std::lock_guard<std::mutex> lock(mutex);
++    va_list args;
++    va_start(args, format);
++    std::vfprintf(file, format, args);
++    va_end(args);
++    std::fputc('\n', file);
++    std::fflush(file);
++}
++
++}  // namespace vk
++}  // namespace host
++}  // namespace gfxstream
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index 79a1963..3484cd7 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -48,6 +48,7 @@
+ #include "goldfish_vk_private_defs.h"
+ #include "vk_decoder_global_state.h"
+ #include "vk_decoder_snapshot.h"
++#include "velox_trace.h"
+ #include "vulkan_boxed_handles.h"
+ #include "vulkan_dispatch.h"
+ #include "vulkan_stream.h"
+@@ -223,6 +224,11 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+ 
+         gfx_logger.recordCommandExecution();
+ 
++        if (veloxTraceFile()) {
++            veloxTrace("D tid=%x op=%s len=%u", gfxstream::base::getCurrentThreadId(),
++                       api_opcode_to_string(opcode), packetLen);
++        }
++
+         switch (opcode) {
+ #ifdef VK_BASE_VERSION_1_0
+             case OP_vkCreateInstance: {
+@@ -24636,14 +24642,12 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 uint32_t groupCount;
+                 size_t dataSize;
+                 void* pData;
+-                // Begin non wrapped dispatchable handle unboxing for device;
++                // Begin global wrapped dispatchable handle unboxing for device;
+                 uint64_t cgen_var_0;
+                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
+                 *readStreamPtrPtr += 1 * 8;
+                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
+-                auto unboxed_device = unbox_VkDevice(device);
+                 auto vk = dispatch_VkDevice(device);
+-                // End manual dispatchable handle unboxing for device;
+                 uint64_t cgen_var_1;
+                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
+                 *readStreamPtrPtr += 1 * 8;
+@@ -24673,23 +24677,10 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 VkResult vkGetRayTracingShaderGroupHandlesKHR_VkResult_return =
+                     VK_ERROR_OUT_OF_HOST_MEMORY;
+                 if (CC_LIKELY(vk)) {
+-                    static const bool logRayTracingPipelines =
+-                        gfxstream::base::getEnvironmentVariable("VELOX_VK_RT_PIPELINE_LOG") == "1";
+-                    if (logRayTracingPipelines) {
+-                        GFXSTREAM_INFO(
+-                            "Velox RT get handles begin device=%p pipeline=0x%llx first=%u count=%u size=%zu",
+-                            unboxed_device, (unsigned long long)cgen_var_1, firstGroup, groupCount,
+-                            dataSize);
+-                    }
+                     vkGetRayTracingShaderGroupHandlesKHR_VkResult_return =
+-                        vk->vkGetRayTracingShaderGroupHandlesKHR(
+-                            unboxed_device, pipeline, firstGroup, groupCount, dataSize, pData);
+-                    if (logRayTracingPipelines) {
+-                        GFXSTREAM_INFO(
+-                            "Velox RT get handles end device=%p pipeline=0x%llx result=%d",
+-                            unboxed_device, (unsigned long long)cgen_var_1,
+-                            static_cast<int>(vkGetRayTracingShaderGroupHandlesKHR_VkResult_return));
+-                    }
++                        m_state->on_vkGetRayTracingShaderGroupHandlesKHR(
++                            &m_pool, snapshotApiCallHandle, device, pipeline, firstGroup,
++                            groupCount, dataSize, pData);
+                 }
+                 if ((vkGetRayTracingShaderGroupHandlesKHR_VkResult_return) == VK_ERROR_DEVICE_LOST)
+                     m_state->on_DeviceLost();
+@@ -24872,14 +24863,12 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 VkPipeline pipeline;
+                 uint32_t group;
+                 VkShaderGroupShaderKHR groupShader;
+-                // Begin non wrapped dispatchable handle unboxing for device;
++                // Begin global wrapped dispatchable handle unboxing for device;
+                 uint64_t cgen_var_0;
+                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
+                 *readStreamPtrPtr += 1 * 8;
+                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
+-                auto unboxed_device = unbox_VkDevice(device);
+                 auto vk = dispatch_VkDevice(device);
+-                // End manual dispatchable handle unboxing for device;
+                 uint64_t cgen_var_1;
+                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
+                 *readStreamPtrPtr += 1 * 8;
+@@ -24900,8 +24889,8 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                     (VkDeviceSize)0;
+                 if (CC_LIKELY(vk)) {
+                     vkGetRayTracingShaderGroupStackSizeKHR_VkDeviceSize_return =
+-                        vk->vkGetRayTracingShaderGroupStackSizeKHR(unboxed_device, pipeline, group,
+-                                                                   groupShader);
++                        m_state->on_vkGetRayTracingShaderGroupStackSizeKHR(
++                            &m_pool, snapshotApiCallHandle, device, pipeline, group, groupShader);
+                 }
+                 vkStream->unsetHandleMapping();
+                 vkStream->write(&vkGetRayTracingShaderGroupStackSizeKHR_VkDeviceSize_return,
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 500a2bd..a450e64 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -12,6 +12,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ #include "vk_decoder_global_state.h"
++#include "velox_trace.h"
+ 
+ #ifndef _WIN32
+ #include <unistd.h>
+@@ -9312,7 +9313,10 @@ class VkDecoderGlobalState::Impl {
+             const auto& info = pCreateInfos[i];
+             // Pipeline libraries are not exposed, and capture/replay handles would be guest
+             // pointers here.
+-            if (info.pLibraryInfo || info.pLibraryInterface ||
++            // pLibraryInterface only carries the maximum payload and attribute sizes and is valid
++            // without pipeline libraries (KI-31: rejecting it returned null pipelines that dEQP
++            // later queried). Libraries themselves are not exposed.
++            if ((info.pLibraryInfo && info.pLibraryInfo->libraryCount) ||
+                 (info.flags & (VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+                                VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR))) {
+                 GFXSTREAM_ERROR("vkCreateRayTracingPipelinesKHR: libraries and capture/replay are "
+@@ -9402,6 +9406,14 @@ class VkDecoderGlobalState::Impl {
+                               VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline) {
+         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
+         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
++        if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
++            veloxTrace("S bind-rt-pipeline cb=%p pipeline=%p", commandBuffer, pipeline);
++        }
++        if (pipeline == VK_NULL_HANDLE) {
++            // Invalid usage from the guest; the host driver must not see it (KI-31).
++            GFXSTREAM_ERROR("vkCmdBindPipeline: null pipeline (bind point %d)", pipelineBindPoint);
++            return;
++        }
+         vk->vkCmdBindPipeline(commandBuffer, pipelineBindPoint, pipeline);
+         if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+             std::lock_guard<std::mutex> lock(mMutex);
+@@ -13654,6 +13666,36 @@ VkResult VkDecoderGlobalState::on_vkCreateRayTracingPipelinesKHR(
+                                                     pAllocator, pPipelines);
+ }
+ 
++// Velox: a guest can pass VK_NULL_HANDLE (or a pipeline whose creation failed); the NVIDIA driver
++// dereferences the pipeline here (KI-31). Reject it instead of calling the driver.
++VkResult VkDecoderGlobalState::on_vkGetRayTracingShaderGroupHandlesKHR(
++    gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, VkDevice boxed_device, VkPipeline pipeline,
++    uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void* pData) {
++    auto device = unbox_VkDevice(boxed_device);
++    auto vk = dispatch_VkDevice(boxed_device);
++    veloxTrace("D get-handles device=%p pipeline=%p first=%u count=%u size=%zu", device, pipeline,
++               firstGroup, groupCount, dataSize);
++    if (pipeline == VK_NULL_HANDLE) {
++        if (pData && dataSize) memset(pData, 0, dataSize);
++        GFXSTREAM_ERROR("vkGetRayTracingShaderGroupHandlesKHR: null pipeline");
++        return VK_ERROR_UNKNOWN;
++    }
++    return vk->vkGetRayTracingShaderGroupHandlesKHR(device, pipeline, firstGroup, groupCount,
++                                                    dataSize, pData);
++}
++
++VkDeviceSize VkDecoderGlobalState::on_vkGetRayTracingShaderGroupStackSizeKHR(
++    gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, VkDevice boxed_device, VkPipeline pipeline,
++    uint32_t group, VkShaderGroupShaderKHR groupShader) {
++    auto device = unbox_VkDevice(boxed_device);
++    auto vk = dispatch_VkDevice(boxed_device);
++    if (pipeline == VK_NULL_HANDLE) {
++        GFXSTREAM_ERROR("vkGetRayTracingShaderGroupStackSizeKHR: null pipeline");
++        return 0;
++    }
++    return vk->vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, group, groupShader);
++}
++
+ VkResult VkDecoderGlobalState::on_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
+     gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, VkDevice, VkPipeline, uint32_t, uint32_t,
+     size_t dataSize, void* pData) {
+diff --git a/host/vulkan/vk_decoder_global_state.h b/host/vulkan/vk_decoder_global_state.h
+index 596f120..e3e9dab 100644
+--- a/host/vulkan/vk_decoder_global_state.h
++++ b/host/vulkan/vk_decoder_global_state.h
+@@ -849,6 +849,13 @@ class VkDecoderGlobalState {
+         VkDeferredOperationKHR deferredOperation, VkPipelineCache pipelineCache,
+         uint32_t createInfoCount, const VkRayTracingPipelineCreateInfoKHR* pCreateInfos,
+         const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines);
++    VkResult on_vkGetRayTracingShaderGroupHandlesKHR(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
++        VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize,
++        void* pData);
++    VkDeviceSize on_vkGetRayTracingShaderGroupStackSizeKHR(
++        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
++        VkPipeline pipeline, uint32_t group, VkShaderGroupShaderKHR groupShader);
+     VkResult on_vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
+         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+         VkPipeline pipeline, uint32_t firstGroup, uint32_t groupCount, size_t dataSize,
+diff --git a/host/vulkan/vk_sub_decoder.cpp b/host/vulkan/vk_sub_decoder.cpp
+index 1d31310..48b8937 100644
+--- a/host/vulkan/vk_sub_decoder.cpp
++++ b/host/vulkan/vk_sub_decoder.cpp
+@@ -5080,6 +5080,11 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                         (VkStridedDeviceAddressRegionKHR*)(pCallableShaderBindingTable));
+                 }
+                 if (CC_LIKELY(vk)) {
++                    veloxTrace("S trace-rays cb=%p raygen=0x%llx miss=0x%llx hit=0x%llx %ux%ux%u",
++                               dispatchHandle, (unsigned long long)pRaygenShaderBindingTable->deviceAddress,
++                               (unsigned long long)pMissShaderBindingTable->deviceAddress,
++                               (unsigned long long)pHitShaderBindingTable->deviceAddress, width, height,
++                               depth);
+                     vk->vkCmdTraceRaysKHR((VkCommandBuffer)dispatchHandle,
+                                           pRaygenShaderBindingTable, pMissShaderBindingTable,
+                                           pHitShaderBindingTable, pCallableShaderBindingTable,
+@@ -5149,6 +5154,9 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                         (VkStridedDeviceAddressRegionKHR*)(pCallableShaderBindingTable));
+                 }
+                 if (CC_LIKELY(vk)) {
++                    veloxTrace("S trace-rays-indirect cb=%p raygen=0x%llx indirect=0x%llx", dispatchHandle,
++                               (unsigned long long)pRaygenShaderBindingTable->deviceAddress,
++                               (unsigned long long)indirectDeviceAddress);
+                     vk->vkCmdTraceRaysIndirectKHR(
+                         (VkCommandBuffer)dispatchHandle, pRaygenShaderBindingTable,
+                         pMissShaderBindingTable, pHitShaderBindingTable,
+-- 
+2.50.1.windows.1
+

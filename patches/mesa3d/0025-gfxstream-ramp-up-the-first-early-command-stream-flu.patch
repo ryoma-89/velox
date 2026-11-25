@@ -1,0 +1,114 @@
+From 9b2c0c86fd6fa72109a7c4956309a8265052f1e5 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:38:36 +0900
+Subject: [PATCH] gfxstream: ramp up the first early command stream flush of a
+ recording
+
+Velox-local change (biblioklept). With debug.velox.cmd_stream_first_kb the
+first early flush of a command buffer recording (debug.velox.cmd_stream_kb,
+Mesa 0018) happens at that size and the threshold doubles per flush up to
+cmd_stream_kb. After a fence wait the host's command stream is empty, and a
+full-size first flush left the host idle for the whole encode of it (66-200
+us per frame in vk-render draws). The counter is per command buffer and is
+reset when its staging info is reset (begin, reset, free). 0 keeps the
+previous behaviour.
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: Ie4ea4a7ad27d6e26aa66d0f01d4eeb563c981ba2
+---
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 21 ++++++++++++++++++-
+ .../guest/vulkan_enc/ResourceTracker.h        |  3 +++
+ .../guest/vulkan_enc/gfxstream_vk_private.h   |  2 ++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 9ecd79c..b9820c0 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1615,6 +1615,13 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+             const long kb = strtol(streamValue, nullptr, 10);
+             mCommandStreamBytes = kb >= 16 && kb <= 65536 ? static_cast<size_t>(kb) * 1024 : 0;
+         }
++        char firstValue[PROP_VALUE_MAX] = {};
++        if (mCommandStreamBytes &&
++            __system_property_get("debug.velox.cmd_stream_first_kb", firstValue) > 0) {
++            const long kb = strtol(firstValue, nullptr, 10);
++            const size_t bytes = kb > 0 ? static_cast<size_t>(kb) * 1024 : 0;
++            mCommandStreamFirstBytes = bytes >= 4096 && bytes < mCommandStreamBytes ? bytes : 0;
++        }
+     }
+ #endif
+     mFenceCompletionCache = mFeatureInfo.hasVulkanFenceStatusHint && fenceCompletionCacheAllowed();
+@@ -8012,6 +8019,7 @@ VkResult ResourceTracker::on_vkAllocateCommandBuffers(
+             gfxstream_vk_command_buffer_from_handle(pCommandBuffers[i]);
+         cb->isSecondary = pAllocateInfo->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+         cb->device = device;
++        cb->veloxStreamedFlushes = 0;
+     }
+ 
+     return res;
+@@ -8255,6 +8263,7 @@ void ResourceTracker::resetCommandBufferStagingInfo(VkCommandBuffer commandBuffe
+     if (!cb) {
+         return;
+     }
++    cb->veloxStreamedFlushes = 0;
+     if (cb->privateEncoder) {
+         sStaging.pushStaging((CommandBufferStagingStream*)cb->privateStream, cb->privateEncoder);
+         cb->privateEncoder = nullptr;
+@@ -8405,7 +8414,16 @@ ALWAYS_INLINE_GFXSTREAM VkEncoder* ResourceTracker::getCommandBufferEncoder(
+         size_t written;
+         auto* staging = (CommandBufferStagingStream*)cb->privateStream;
+         staging->getWritten(&writtenPtr, &written);
+-        if (written + staging->uncommittedBytes() >= tracker->mCommandStreamBytes) {
++        // Velox: with debug.velox.cmd_stream_first_kb the first early flush of a recording is
++        // small and the threshold doubles per flush, so the host starts decoding a new frame's
++        // commands while the guest still records them (after a fence wait the host's stream is
++        // empty, and a full-size first flush leaves it idle for the whole encode of that flush).
++        size_t threshold = tracker->mCommandStreamBytes;
++        if (tracker->mCommandStreamFirstBytes) {
++            const uint32_t step = std::min<uint32_t>(cb->veloxStreamedFlushes, 16);
++            threshold = std::min(threshold, tracker->mCommandStreamFirstBytes << step);
++        }
++        if (written + staging->uncommittedBytes() >= threshold) {
+             tracker->streamCommandBufferEarly(commandBuffer);
+         }
+     }
+@@ -8451,6 +8469,7 @@ void ResourceTracker::streamCommandBufferEarly(VkCommandBuffer commandBuffer) {
+     if (!written) return;
+     enc->vkQueueFlushCommandsGOOGLE(queue, commandBuffer, written, writtenPtr, true /* do lock */);
+     stream->reset();
++    ++cb->veloxStreamedFlushes;
+ }
+ 
+ // static
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index add51bb..d17448e 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -688,6 +688,9 @@ class ResourceTracker {
+     // Velox: send the commands recorded so far to the host while recording continues.
+     void streamCommandBufferEarly(VkCommandBuffer commandBuffer);
+     size_t mCommandStreamBytes = 0;  // debug.velox.cmd_stream_kb; 0 = only at submit
++    // debug.velox.cmd_stream_first_kb: the first early flush of a recording happens at this size
++    // and each later one doubles it up to mCommandStreamBytes (0 = always mCommandStreamBytes).
++    size_t mCommandStreamFirstBytes = 0;
+ 
+     void clearCommandPool(VkCommandPool commandPool);
+ 
+diff --git a/src/gfxstream/guest/vulkan_enc/gfxstream_vk_private.h b/src/gfxstream/guest/vulkan_enc/gfxstream_vk_private.h
+index a52fdeb..9c9fb28 100644
+--- a/src/gfxstream/guest/vulkan_enc/gfxstream_vk_private.h
++++ b/src/gfxstream/guest/vulkan_enc/gfxstream_vk_private.h
+@@ -182,6 +182,8 @@ struct gfxstream_vk_command_buffer {
+     void* userPtr;
+     bool isSecondary;
+     VkDevice device;
++    // Velox: early flushes of this recording (debug.velox.cmd_stream_first_kb ramp).
++    uint32_t veloxStreamedFlushes;
+ };
+ VK_DEFINE_HANDLE_CASTS(gfxstream_vk_command_buffer, base.base, VkCommandBuffer,
+                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+-- 
+2.50.1.windows.1
+

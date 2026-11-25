@@ -1,0 +1,37 @@
+name: Bug Report
+description: Report a bug or compatibility issue in Velox
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear description of the bug and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: CPU, GPU + driver version, RAM, Windows version, WHPX/VBS status, Android API level (e.g. API 31 / API 37), and profile used.
+      placeholder: |
+        - CPU:
+        - GPU & Driver:
+        - Windows 11 Build (VBS enabled?):
+        - Android System Image (API / ABI):
+        - Profile / Runtime:
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Diagnostics
+      description: Relevant sanitized logs (do NOT include private keys, tokens, or personal data).

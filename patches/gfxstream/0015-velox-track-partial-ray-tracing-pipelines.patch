@@ -1,0 +1,99 @@
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index b0aebd8..79a1963 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -24673,9 +24673,23 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 VkResult vkGetRayTracingShaderGroupHandlesKHR_VkResult_return =
+                     VK_ERROR_OUT_OF_HOST_MEMORY;
+                 if (CC_LIKELY(vk)) {
++                    static const bool logRayTracingPipelines =
++                        gfxstream::base::getEnvironmentVariable("VELOX_VK_RT_PIPELINE_LOG") == "1";
++                    if (logRayTracingPipelines) {
++                        GFXSTREAM_INFO(
++                            "Velox RT get handles begin device=%p pipeline=0x%llx first=%u count=%u size=%zu",
++                            unboxed_device, (unsigned long long)cgen_var_1, firstGroup, groupCount,
++                            dataSize);
++                    }
+                     vkGetRayTracingShaderGroupHandlesKHR_VkResult_return =
+                         vk->vkGetRayTracingShaderGroupHandlesKHR(
+                             unboxed_device, pipeline, firstGroup, groupCount, dataSize, pData);
++                    if (logRayTracingPipelines) {
++                        GFXSTREAM_INFO(
++                            "Velox RT get handles end device=%p pipeline=0x%llx result=%d",
++                            unboxed_device, (unsigned long long)cgen_var_1,
++                            static_cast<int>(vkGetRayTracingShaderGroupHandlesKHR_VkResult_return));
++                    }
+                 }
+                 if ((vkGetRayTracingShaderGroupHandlesKHR_VkResult_return) == VK_ERROR_DEVICE_LOST)
+                     m_state->on_DeviceLost();
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 48ad20b..500a2bd 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -385,6 +385,8 @@ class VkDecoderGlobalState::Impl {
+         mVkCleanupEnabled =
+             gfxstream::base::getEnvironmentVariable("ANDROID_EMU_VK_NO_CLEANUP") != "1";
+         mLogging = gfxstream::base::getEnvironmentVariable("ANDROID_EMU_VK_LOG_CALLS") == "1";
++        mLogRayTracingPipelines =
++            gfxstream::base::getEnvironmentVariable("VELOX_VK_RT_PIPELINE_LOG") == "1";
+         mVerbosePrints = gfxstream::base::getEnvironmentVariable("ANDROID_EMUGL_VERBOSE") == "1";
+ 
+         if (get_gfxstream_address_space_ops().control_get_hw_funcs &&
+@@ -6095,6 +6097,10 @@ class VkDecoderGlobalState::Impl {
+ 
+     void destroyPipelineWithExclusiveInfo(VkDevice device, VulkanDispatch* deviceDispatch,
+                                           VkPipeline pipeline, PipelineInfo& pipelineInfo) {
++        if (mLogRayTracingPipelines && pipelineInfo.rayTracing) {
++            GFXSTREAM_INFO("Velox RT destroy pipeline device=%p pipeline=0x%llx", device,
++                           (unsigned long long)pipelineInfo.boxed);
++        }
+         deviceDispatch->vkDestroyPipeline(device, pipeline, nullptr);
+     }
+ 
+@@ -9321,17 +9327,23 @@ class VkDecoderGlobalState::Impl {
+         // Deferred operations stay in the guest; create synchronously.
+         VkResult result = deviceDispatch->vkCreateRayTracingPipelinesKHR(
+             device, VK_NULL_HANDLE, pipelineCache, createInfoCount, pCreateInfos, nullptr, pPipelines);
+-        if (result != VK_SUCCESS && result != VK_PIPELINE_COMPILE_REQUIRED) {
+-            return result;
+-        }
++        // A multi-pipeline call can return an error and still create individual pipelines.
++        // Every successful output must remain usable and destroyable through its boxed handle.
+         std::lock_guard<std::mutex> lock(mMutex);
+         for (uint32_t i = 0; i < createInfoCount; i++) {
+             if (!pPipelines[i]) continue;
+             VALIDATE_NEW_HANDLE_INFO_ENTRY(mPipelineInfo, pPipelines[i]);
+             auto& pipelineInfo = mPipelineInfo[pPipelines[i]];
+             pipelineInfo.device = device;
++            pipelineInfo.rayTracing = true;
+             pPipelines[i] = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
+             pipelineInfo.boxed = pPipelines[i];
++            if (mLogRayTracingPipelines) {
++                GFXSTREAM_INFO(
++                    "Velox RT create pipeline device=%p pipeline=0x%llx groups=%u index=%u result=%d",
++                    device, (unsigned long long)pPipelines[i], pCreateInfos[i].groupCount, i,
++                    static_cast<int>(result));
++            }
+         }
+         return result;
+     }
+@@ -12126,6 +12138,7 @@ class VkDecoderGlobalState::Impl {
+     bool mVkCleanupEnabled = true;
+     bool mLogging = false;
+     bool mVerbosePrints = false;
++    bool mLogRayTracingPipelines = false;
+     bool mUseOldMemoryCleanupPath = false;
+ 
+     std::mutex mMutex;
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 852bc83..2d05ed1 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -601,6 +601,7 @@ struct PipelineLayoutInfo {
+ struct PipelineInfo {
+     VkDevice device;
+     VkPipeline boxed = VK_NULL_HANDLE;
++    bool rayTracing = false;
+ };
+ 
+ struct RenderPassInfo {

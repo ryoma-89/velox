@@ -1,0 +1,268 @@
+From 7c1d3a5ac3e52e252df3db2421db6c814df1028f Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:24:09 +0900
+Subject: [PATCH] gfxstream: add zero-alloc fast paths for semaphore-free
+ vkQueueSubmit and vkWaitForFences (patch 0029)
+
+---
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 194 +++++++++++++-----
+ 1 file changed, 139 insertions(+), 55 deletions(-)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index d7919b1..9d56858 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -5379,57 +5379,52 @@ VkResult ResourceTracker::on_vkWaitForFences(void* context, VkResult, VkDevice d
+                                              VkBool32 waitAll, uint64_t timeout) {
+ #if defined(VK_USE_PLATFORM_ANDROID_KHR) || DETECT_OS_LINUX
+     if (mFenceStats) mStatWaitForFencesCalls.fetch_add(1, std::memory_order_relaxed);
+-    if (mVeloxFenceShared && fenceCount > 0) {
+-        // Only completions the host observed natively for the fence's current epoch count;
+-        // anything else goes to the host as before.
+-        uint32_t completed = 0;
++    if (fenceCount == 0) return VK_SUCCESS;
++
++    VkFence stackNonExternal[4];
++    uint32_t stackNonExternalCount = 0;
++    std::vector<int> fencesExternalSyncFds;
++    std::vector<VkFence> fencesNonExternalVec;
++    const bool useStack = fenceCount <= 4;
++
++    {
+         std::lock_guard<std::recursive_mutex> lock(mLock);
++        uint32_t sharedCompleted = 0;
++        uint32_t cacheConfirmed = 0;
++        const bool checkShared = mVeloxFenceShared;
++        const bool checkCache = mFenceCompletionCache;
++
+         for (uint32_t i = 0; i < fenceCount; ++i) {
+             auto it = info_VkFence.find(pFences[i]);
+             if (it == info_VkFence.end()) continue;
+             const auto& info = it->second;
+-            if (!info.syncFd && info.veloxShared &&
+-                veloxFenceCompleted(pFences[i], info.veloxEpoch)) {
+-                ++completed;
+-            } else if (waitAll) {
+-                break;
++            if (info.syncFd) {
++                if (*info.syncFd >= 0) {
++                    fencesExternalSyncFds.push_back(*info.syncFd);
++                }
++            } else {
++                if (checkShared && info.veloxShared &&
++                    veloxFenceCompleted(pFences[i], info.veloxEpoch)) {
++                    ++sharedCompleted;
++                }
++                if (checkCache && info.signaledConfirmed) {
++                    ++cacheConfirmed;
++                }
++                if (useStack) {
++                    stackNonExternal[stackNonExternalCount++] = pFences[i];
++                } else {
++                    fencesNonExternalVec.push_back(pFences[i]);
++                }
+             }
+         }
+-        if (waitAll ? completed == fenceCount : completed != 0) return VK_SUCCESS;
+-    }
+-    if (mFenceCompletionCache && fenceCount > 0) {
+-        uint32_t confirmed = 0;
+-        std::lock_guard<std::recursive_mutex> lock(mLock);
+-        for (uint32_t i = 0; i < fenceCount; ++i) {
+-            auto it = info_VkFence.find(pFences[i]);
+-            if (it != info_VkFence.end() && !it->second.syncFd && it->second.signaledConfirmed) {
+-                ++confirmed;
+-            }
++        if (checkShared && (waitAll ? sharedCompleted == fenceCount : sharedCompleted != 0)) {
++            return VK_SUCCESS;
+         }
+-        if (waitAll ? confirmed == fenceCount : confirmed != 0) return VK_SUCCESS;
+-    }
+-
+-    (void)context;
+-    std::vector<int> fencesExternalSyncFds;
+-    std::vector<VkFence> fencesNonExternal;
+-
+-    std::unique_lock<std::recursive_mutex> lock(mLock);
+-
+-    for (uint32_t i = 0; i < fenceCount; ++i) {
+-        auto it = info_VkFence.find(pFences[i]);
+-        if (it == info_VkFence.end()) continue;
+-        const auto& info = it->second;
+-        if (info.syncFd) {
+-            if (*info.syncFd >= 0) {
+-                fencesExternalSyncFds.push_back(*info.syncFd);
+-            }
+-        } else {
+-            fencesNonExternal.push_back(pFences[i]);
++        if (checkCache && (waitAll ? cacheConfirmed == fenceCount : cacheConfirmed != 0)) {
++            return VK_SUCCESS;
+         }
+     }
+ 
+-    lock.unlock();
+-
+     for (auto fd : fencesExternalSyncFds) {
+         MESA_TRACE_SCOPE("Waiting on sync fd: %d", fd);
+ 
+@@ -5452,18 +5447,24 @@ VkResult ResourceTracker::on_vkWaitForFences(void* context, VkResult, VkDevice d
+ #endif
+     }
+ 
+-    if (!fencesNonExternal.empty()) {
+-        auto hostConn = ResourceTracker::threadingCallbacks.hostConnectionGetFunc();
+-        auto vkEncoder = ResourceTracker::threadingCallbacks.vkEncoderGetFunc(hostConn);
++    const uint32_t nonExtCount =
++        useStack ? stackNonExternalCount : static_cast<uint32_t>(fencesNonExternalVec.size());
++    const VkFence* nonExtData = useStack ? stackNonExternal : fencesNonExternalVec.data();
++
++    if (nonExtCount > 0) {
++        VkEncoder* vkEncoder = static_cast<VkEncoder*>(context);
++        if (!vkEncoder) {
++            auto hostConn = ResourceTracker::threadingCallbacks.hostConnectionGetFunc();
++            vkEncoder = ResourceTracker::threadingCallbacks.vkEncoderGetFunc(hostConn);
++        }
+         MESA_TRACE_SCOPE("vkWaitForFences to host");
+-        VkResult res = vkEncoder->vkWaitForFences(device, fencesNonExternal.size(),
+-                                                  fencesNonExternal.data(), waitAll, timeout,
+-                                                  true /* do lock */);
++        VkResult res = vkEncoder->vkWaitForFences(device, nonExtCount, nonExtData, waitAll,
++                                                  timeout, true /* do lock */);
+         if (mFenceStats) mStatWaitForFencesRpc.fetch_add(1, std::memory_order_relaxed);
+         if (res == VK_SUCCESS && waitAll && mFenceCompletionCache) {
+             std::lock_guard<std::recursive_mutex> lock(mLock);
+-            for (VkFence fence : fencesNonExternal) {
+-                auto it = info_VkFence.find(fence);
++            for (uint32_t i = 0; i < nonExtCount; ++i) {
++                auto it = info_VkFence.find(nonExtData[i]);
+                 if (it != info_VkFence.end() && it->second.canCacheCompletion) {
+                     it->second.signaledConfirmed = true;
+                 }
+@@ -6654,6 +6655,48 @@ uint32_t ResourceTracker::syncEncodersForQueue(VkQueue queue, VkEncoder* current
+ template <class VkSubmitInfoType>
+ void ResourceTracker::flushStagingStreams(void* context, VkQueue queue, uint32_t submitCount,
+                                           const VkSubmitInfoType* pSubmits) {
++    // Fast path for the common single-submit, single-primary-CB case without secondary CBs.
++    if (submitCount == 1 && getCommandBufferCount(pSubmits[0]) == 1) {
++        VkCommandBuffer cmdbuf = getCommandBuffer(pSubmits[0], 0);
++        struct goldfish_VkCommandBuffer* cb = gfxstream_vk_command_buffer_from_handle(cmdbuf);
++        if (cb && !cb->subObjects) {
++            if (mFeatureInfo.hasVulkanBatchedDescriptorSetUpdate && cb->userPtr) {
++                auto* pendingDescriptorSets =
++                    static_cast<CommandBufferPendingDescriptorSets*>(cb->userPtr);
++                if (!pendingDescriptorSets->sets.empty()) {
++                    std::lock_guard<std::mutex> lock(mDescriptorCommitLock);
++                    commitDescriptorSetUpdates(context, queue, pendingDescriptorSets->sets,
++                                               mGuestOnlyDescriptorPoolReset);
++                }
++            }
++            if (cb->privateStream) {
++                unsigned char* writtenPtr = nullptr;
++                size_t written = 0;
++                CommandBufferStagingStream* cmdBufStream =
++                    static_cast<CommandBufferStagingStream*>(cb->privateStream);
++                cmdBufStream->getWritten(&writtenPtr, &written);
++                if (written) {
++                    VkEncoder* enc = (VkEncoder*)context;
++                    if (mFeatureInfo.hasVulkanAuxCommandMemory) {
++                        VkDeviceMemory deviceMemory = cmdBufStream->getDeviceMemory();
++                        VkDeviceSize dataOffset = 0;
++                        deviceMemoryTransform_tohost(&deviceMemory, 1, &dataOffset, 1, nullptr, 0,
++                                                     nullptr, 0, nullptr, 0);
++                        cmdBufStream->markFlushing();
++                        enc->vkQueueFlushCommandsFromAuxMemoryGOOGLE(
++                            queue, cmdbuf, deviceMemory, dataOffset, written, true /*do lock*/);
++                    } else {
++                        enc->vkQueueFlushCommandsGOOGLE(queue, cmdbuf, written,
++                                                        (const void*)writtenPtr, true /*do lock*/);
++                    }
++                    cmdBufStream->reset();
++                }
++            }
++            resetCommandBufferPendingTopology(cmdbuf);
++            return;
++        }
++    }
++
+     std::vector<VkCommandBuffer> toFlush;
+     for (uint32_t i = 0; i < submitCount; ++i) {
+         for (uint32_t j = 0; j < getCommandBufferCount(pSubmits[i]); ++j) {
+@@ -6876,6 +6919,46 @@ VkResult ResourceTracker::on_vkQueueSubmitTemplate(void* context, VkResult input
+                                                    VkFence fence) {
+     flushStagingStreams(context, queue, submitCount, pSubmits);
+ 
++    VkEncoder* enc = (VkEncoder*)context;
++
++    // Fast path: no wait/signal semaphores and no pNext chains -> skip all 7 pruning vectors and
++    // semaphore map lookups, submit pSubmits directly.
++    bool needsSemaphorePruning = false;
++    for (uint32_t i = 0; i < submitCount; ++i) {
++        if (getWaitSemaphoreCount(pSubmits[i]) > 0 || getSignalSemaphoreCount(pSubmits[i]) > 0 ||
++            pSubmits[i].pNext != nullptr) {
++            needsSemaphorePruning = true;
++            break;
++        }
++    }
++
++    if (!needsSemaphorePruning) {
++        if (mFenceStats) mStatQueueSubmits.fetch_add(1, std::memory_order_relaxed);
++        input_result = vkQueueSubmitEnc(enc, queue, submitCount, pSubmits, fence);
++        if (input_result != VK_SUCCESS) return input_result;
++        if (fence == VK_NULL_HANDLE) return VK_SUCCESS;
++        int externalFenceFdToSignal = -1;
++#if defined(VK_USE_PLATFORM_ANDROID_KHR) || DETECT_OS_LINUX
++        {
++            std::lock_guard<std::recursive_mutex> lock(mLock);
++            auto it = info_VkFence.find(fence);
++            if (it != info_VkFence.end() && it->second.syncFd && *it->second.syncFd >= 0) {
++                externalFenceFdToSignal = *it->second.syncFd;
++            }
++        }
++        if (externalFenceFdToSignal >= 0) {
++            VkResult waitIdleRes = enc->vkQueueWaitIdle(queue, true /* do lock */);
++#if GFXSTREAM_ENABLE_GUEST_GOLDFISH
++            if (VK_SUCCESS == waitIdleRes) {
++                goldfish_sync_signal(externalFenceFdToSignal);
++            }
++#endif
++            return waitIdleRes;
++        }
++#endif
++        return VK_SUCCESS;
++    }
++
+ #ifdef VK_USE_PLATFORM_FUCHSIA
+     std::vector<VkSemaphore> pre_signal_semaphores;
+     std::vector<zx_handle_t> pre_signal_events;
+@@ -6887,8 +6970,6 @@ VkResult ResourceTracker::on_vkQueueSubmitTemplate(void* context, VkResult input
+     std::vector<std::pair<zx_handle_t, zx_koid_t>> post_wait_events;
+     std::vector<int> post_wait_sync_fds;
+ 
+-    VkEncoder* enc = (VkEncoder*)context;
+-
+     // The scope of all these "pruned" submitInfos, semLists, etc.. must be at the level that
+     // the encoder queue submission will be called, otherwise the vector storage will go out of
+     // scope
+@@ -8551,11 +8632,14 @@ void ResourceTracker::streamCommandBufferEarly(VkCommandBuffer commandBuffer) {
+     VkQueue queue = vk_queue_to_handle(first);
+ 
+     VkEncoder* enc = ResourceTracker::getThreadLocalEncoder();
+-    if (mFeatureInfo.hasVulkanBatchedDescriptorSetUpdate) {
+-        std::lock_guard<std::mutex> lock(mDescriptorCommitLock);
+-        std::unordered_set<VkDescriptorSet> pendingSets;
+-        collectAllPendingDescriptorSetsBottomUp({commandBuffer}, pendingSets);
+-        commitDescriptorSetUpdates(enc, queue, pendingSets, mGuestOnlyDescriptorPoolReset);
++    if (mFeatureInfo.hasVulkanBatchedDescriptorSetUpdate && cb->userPtr) {
++        auto* pendingDescriptorSets =
++            static_cast<CommandBufferPendingDescriptorSets*>(cb->userPtr);
++        if (!pendingDescriptorSets->sets.empty()) {
++            std::lock_guard<std::mutex> lock(mDescriptorCommitLock);
++            commitDescriptorSetUpdates(enc, queue, pendingDescriptorSets->sets,
++                                       mGuestOnlyDescriptorPoolReset);
++        }
+     }
+     unsigned char* writtenPtr = nullptr;
+     size_t written = 0;
+-- 
+2.50.1.windows.1
+

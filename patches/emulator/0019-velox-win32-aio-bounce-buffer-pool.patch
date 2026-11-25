@@ -1,0 +1,155 @@
+diff --git a/block/win32-aio.c b/block/win32-aio.c
+index 3be8f458..e6cb58d4 100644
+--- a/block/win32-aio.c
++++ b/block/win32-aio.c
+@@ -37,11 +37,23 @@
+ #define FTYPE_CD     1
+ #define FTYPE_HARDDISK 2
+ 
++#define WIN32_AIO_POOL_SLOTS 16
++#define WIN32_AIO_POOL_MAX_BYTES (1024 * 1024)
++
++typedef struct Win32AioPoolBuf {
++    void *ptr;
++    size_t cap;
++    size_t align;
++} Win32AioPoolBuf;
++
+ struct QEMUWin32AIOState {
+     HANDLE hIOCP;
+     EventNotifier e;
+     int count;
+     AioContext *aio_ctx;
++    bool use_pool;
++    int pool_count;
++    Win32AioPoolBuf pool[WIN32_AIO_POOL_SLOTS];
+ };
+ 
+ typedef struct QEMUWin32AIOCB {
+@@ -51,10 +63,69 @@ typedef struct QEMUWin32AIOCB {
+     OVERLAPPED ov;
+     QEMUIOVector *qiov;
+     void *buf;
++    size_t buf_cap;
++    size_t buf_align;
+     bool is_read;
+     bool is_linear;
+ } QEMUWin32AIOCB;
+ 
++static void *win32_aio_alloc_bounce(QEMUWin32AIOState *s, BlockDriverState *bs,
++                                    size_t size, size_t *out_cap, size_t *out_align)
++{
++    size_t align = bs ? MAX(bs->bl.request_alignment, 4096) : 4096;
++    if (s->use_pool && size <= WIN32_AIO_POOL_MAX_BYTES) {
++        int best = -1;
++        for (int i = 0; i < s->pool_count; ++i) {
++            if (s->pool[i].cap >= size && s->pool[i].align >= align) {
++                if (best < 0 || s->pool[i].cap < s->pool[best].cap) {
++                    best = i;
++                }
++            }
++        }
++        if (best >= 0) {
++            Win32AioPoolBuf entry = s->pool[best];
++            s->pool[best] = s->pool[--s->pool_count];
++            *out_cap = entry.cap;
++            *out_align = entry.align;
++            return entry.ptr;
++        }
++    }
++    /* Round up pooled allocations to power-of-2 / 4 KiB to maximize reuse. */
++    size_t alloc_size = size;
++    if (s->use_pool && alloc_size <= WIN32_AIO_POOL_MAX_BYTES) {
++        size_t rounded = 4096;
++        while (rounded < alloc_size) {
++            rounded <<= 1;
++        }
++        alloc_size = rounded;
++    }
++    void *p = qemu_try_blockalign(bs, alloc_size);
++    if (!p) {
++        return NULL;
++    }
++    *out_cap = alloc_size;
++    *out_align = align;
++    return p;
++}
++
++static void win32_aio_free_bounce(QEMUWin32AIOState *s, void *ptr,
++                                  size_t cap, size_t align)
++{
++    if (!ptr) {
++        return;
++    }
++    if (s->use_pool && cap <= WIN32_AIO_POOL_MAX_BYTES &&
++        s->pool_count < WIN32_AIO_POOL_SLOTS) {
++        s->pool[s->pool_count++] = (Win32AioPoolBuf){
++            .ptr = ptr,
++            .cap = cap,
++            .align = align,
++        };
++        return;
++    }
++    qemu_vfree(ptr);
++}
++
+ /*
+  * Completes an AIO request (calls the callback and frees the ACB).
+  */
+@@ -84,7 +155,7 @@ static void win32_aio_process_completion(QEMUWin32AIOState *s,
+             QEMUIOVector *qiov = waiocb->qiov;
+             iov_from_buf(qiov->iov, qiov->niov, 0, waiocb->buf, qiov->size);
+         }
+-        qemu_vfree(waiocb->buf);
++        win32_aio_free_bounce(s, waiocb->buf, waiocb->buf_cap, waiocb->buf_align);
+     }
+ 
+     waiocb->common.cb(waiocb->common.opaque, ret);
+@@ -125,7 +196,8 @@ BlockAIOCB *win32_aio_submit(BlockDriverState *bs,
+     waiocb->is_read = (type == QEMU_AIO_READ);
+ 
+     if (qiov->niov > 1) {
+-        waiocb->buf = qemu_try_blockalign(bs, qiov->size);
++        waiocb->buf = win32_aio_alloc_bounce(aio, bs, qiov->size,
++                                             &waiocb->buf_cap, &waiocb->buf_align);
+         if (waiocb->buf == NULL) {
+             goto out;
+         }
+@@ -135,6 +207,8 @@ BlockAIOCB *win32_aio_submit(BlockDriverState *bs,
+         waiocb->is_linear = false;
+     } else {
+         waiocb->buf = qiov->iov[0].iov_base;
++        waiocb->buf_cap = 0;
++        waiocb->buf_align = 0;
+         waiocb->is_linear = true;
+     }
+ 
+@@ -157,6 +231,9 @@ BlockAIOCB *win32_aio_submit(BlockDriverState *bs,
+ 
+ out_dec_count:
+     aio->count--;
++    if (!waiocb->is_linear) {
++        win32_aio_free_bounce(aio, waiocb->buf, waiocb->buf_cap, waiocb->buf_align);
++    }
+ out:
+     qemu_aio_unref(waiocb);
+     return NULL;
+@@ -200,6 +277,7 @@ QEMUWin32AIOState *win32_aio_init(void)
+         goto out_close_efd;
+     }
+ 
++    s->use_pool = g_strcmp0(g_getenv("VELOX_WIN32_AIO_POOL"), "0") != 0;
+     return s;
+ 
+ out_close_efd:
+@@ -212,6 +290,10 @@ out_free_state:
+ void win32_aio_cleanup(QEMUWin32AIOState *aio)
+ {
+     assert(!aio->aio_ctx);
++    for (int i = 0; i < aio->pool_count; ++i) {
++        qemu_vfree(aio->pool[i].ptr);
++    }
++    aio->pool_count = 0;
+     CloseHandle(aio->hIOCP);
+     event_notifier_cleanup(&aio->e);
+     g_free(aio);

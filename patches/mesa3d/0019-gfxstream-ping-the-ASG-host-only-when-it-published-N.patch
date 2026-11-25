@@ -1,0 +1,53 @@
+From 005ec98a277dc958f54625db0be4fe25957b7e6c Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:52:12 +0900
+Subject: [PATCH] gfxstream: ping the ASG host only when it published
+ NEED_NOTIFY
+
+notifyAfterWrite() pinged the host after every ring write unless it was
+RENDERING, so a host that was polling the ring (CAN_CONSUME) still got an
+address space ping, i.e. a VM exit per write. The host publishes
+NEED_NOTIFY with a full barrier and re-checks the rings before sleeping,
+and this side fences between the ring write and the state load, so a ping
+is only needed for NEED_NOTIFY; the duplex protocol already used that rule.
+
+WHPX + ASG, 50 us host poll budget: vk-render sync (wait every frame)
+9780 -> 12400 frames/s, draws +3-4%, game unchanged, identical checksums.
+vk-syncbench transport/mt stress, dEQP synchronization.basic,
+synchronization.op.single_queue.fence, api.command_buffers and
+memory.mapping.suballocation.full pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+
+Change-Id: I298e0c316b09e2c04a38f759cd17dbbf27cf1180
+---
+ .../guest/GoldfishAddressSpace/AddressSpaceStream.cpp     | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+index 610a385..568c44c 100644
+--- a/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
++++ b/src/gfxstream/guest/GoldfishAddressSpace/AddressSpaceStream.cpp
+@@ -354,10 +354,14 @@ void AddressSpaceStream::notifyAvailable() {
+ }
+ 
+ void AddressSpaceStream::notifyAfterWrite() {
++    // The host publishes NEED_NOTIFY with a full barrier and then looks at the rings again before
++    // it sleeps; this side publishes the ring write, fences, then loads the state. One of the two
++    // sees the other, so a ping is only needed for NEED_NOTIFY. A consumer that is polling
++    // (CAN_CONSUME) or decoding (RENDERING) reads the new bytes without one, and pinging it anyway
++    // costs a VM exit per write.
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+     const auto state = __atomic_load_n(m_context.host_state, __ATOMIC_ACQUIRE);
+-    if (m_version == kAsgDuplexVersion ? state == ASG_HOST_STATE_NEED_NOTIFY
+-                                      : state != ASG_HOST_STATE_RENDERING) {
++    if (state == ASG_HOST_STATE_NEED_NOTIFY) {
+         notifyAvailable();
+     }
+ }
+-- 
+2.50.1.windows.1
+

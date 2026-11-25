@@ -1,0 +1,38 @@
+diff --git a/android/android-emu/android/emulation/address_space_device.cpp b/android/android-emu/android/emulation/address_space_device.cpp
+index cb939d8f..ea0d048c 100644
+--- a/android/android-emu/android/emulation/address_space_device.cpp
++++ b/android/android-emu/android/emulation/address_space_device.cpp
+@@ -95,11 +95,19 @@ public:
+ 
+     void tellPingInfo(uint32_t handle, uint64_t gpa) {
+         AutoLock lock(mContextsLock);
++        if (!handle || handle >= mHandleIndex) return;
++
+         auto& contextDesc = mContexts[handle];
+-        contextDesc.pingInfo =
+-            (AddressSpaceDevicePingInfo*)
+-            sVmOps->physicalMemoryGetAddr(gpa);
++        contextDesc.pingInfo = nullptr;
+         contextDesc.pingInfoGpa = gpa;
++        constexpr uint64_t span = sizeof(AddressSpaceDevicePingInfo) - 1;
++        if (gpa > UINT64_MAX - span || gpa % alignof(AddressSpaceDevicePingInfo)) return;
++
++        auto* address = sVmOps->physicalMemoryGetAddr(gpa);
++        const auto first = reinterpret_cast<uintptr_t>(address);
++        const auto last = reinterpret_cast<uintptr_t>(sVmOps->physicalMemoryGetAddr(gpa + span));
++        if (!first || first > UINTPTR_MAX - span || last != first + span) return;
++        contextDesc.pingInfo = static_cast<AddressSpaceDevicePingInfo*>(address);
+         AS_DEVICE_DPRINT("Ping info: gpa 0x%llx @ %p\n", (unsigned long long)gpa,
+                          contextDesc.pingInfo);
+     }
+@@ -112,7 +120,9 @@ public:
+ 
+     void ping(uint32_t handle) {
+         AutoLock lock(mContextsLock);
+-        auto& contextDesc = mContexts[handle];
++        auto it = mContexts.find(handle);
++        if (it == mContexts.end() || !it->second.pingInfo) return;
++        auto& contextDesc = it->second;
+         AddressSpaceDevicePingInfo* pingInfo = contextDesc.pingInfo;
+ 
+         const uint64_t phys_addr = pingInfo->phys_addr;

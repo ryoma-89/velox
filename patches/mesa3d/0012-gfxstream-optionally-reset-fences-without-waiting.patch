@@ -1,0 +1,152 @@
+From cf0fa41278c5ec7cefa66068da5f66e36dcc4f4a Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:51:16 +0900
+Subject: [PATCH 12/12] gfxstream: optionally reset fences without waiting
+
+debug.velox.async_fence_reset=1 (not with the confirmed fence cache): the
+fence reset is applied by the host in sequence-number order before any later
+submit, status query or wait, and its status is read with the next reply.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I6e7a81954d9515f8ea361d7dccb1f25cb235bebb
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+---
+ .../guest/vulkan_enc/ResourceTracker.cpp      | 24 ++++++++++--
+ .../guest/vulkan_enc/ResourceTracker.h        |  1 +
+ .../guest/vulkan_enc/VkEncoder.cpp.inl        | 39 +++++++++++++++++++
+ .../guest/vulkan_enc/VkEncoder.h.inl          |  4 ++
+ 4 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+index 35e4385..6219ca8 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.cpp
+@@ -1620,6 +1620,15 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+     mAsyncDescriptorPoolReset = mGuestOnlyDescriptorPoolReset && asyncDescriptorPoolResetAllowed();
+ 
+     mFenceCompletionCache = mFeatureInfo.hasVulkanFenceStatusHint && fenceCompletionCacheAllowed();
++#if DETECT_OS_ANDROID
++    {
++        char fenceValue[PROP_VALUE_MAX] = {};
++        // The fence cache relies on a confirmed reset: keep the synchronous reset with it.
++        mAsyncFenceReset = mFeatureInfo.hasVulkanQueueSubmitWithCommands && !mFenceCompletionCache &&
++                           __system_property_get("debug.velox.async_fence_reset", fenceValue) > 0 &&
++                           strcmp(fenceValue, "1") == 0;
++    }
++#endif
+ #if DETECT_OS_ANDROID
+     char value[PROP_VALUE_MAX] = {};
+     mFenceStats = __system_property_get("debug.velox.fence_stats", value) > 0 &&
+@@ -1627,9 +1636,9 @@ void ResourceTracker::setupFeatures(const struct GfxStreamVkFeatureInfo* feature
+     if (mFenceStats) {
+         mesa_logi(
+             "velox-sync-config: guestOnlyPoolReset=%d asyncPoolReset=%d fenceCache=%d "
+-            "bufferViewCache=%d",
++            "bufferViewCache=%d asyncFenceReset=%d",
+             mGuestOnlyDescriptorPoolReset, mAsyncDescriptorPoolReset, mFenceCompletionCache,
+-            mBufferViewCache);
++            mBufferViewCache, mAsyncFenceReset);
+     }
+ #endif
+ 
+@@ -5026,7 +5035,16 @@ VkResult ResourceTracker::on_vkResetFences(void* context, VkResult, VkDevice dev
+                                            uint32_t fenceCount, const VkFence* pFences) {
+     VkEncoder* enc = (VkEncoder*)context;
+     if (mFenceStats) mStatResetFencesRpc.fetch_add(1, std::memory_order_relaxed);
+-    VkResult res = enc->vkResetFences(device, fenceCount, pFences, true /* do lock */);
++    VkResult res;
++    if (mAsyncFenceReset && fenceCount) {
++        // Applied by the host in sequence-number order before any later submit, status query
++        // or wait from any thread; the status arrives with the next reply on this stream.
++        const int32_t earlier = enc->vkResetFencesDeferredStatusVELOX(device, fenceCount, pFences);
++        if (earlier != 0) mesa_loge("velox: an earlier deferred reset reported %d", earlier);
++        res = static_cast<VkResult>(earlier);
++    } else {
++        res = enc->vkResetFences(device, fenceCount, pFences, true /* do lock */);
++    }
+ 
+     if (res != VK_SUCCESS) return res;
+ 
+diff --git a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+index 3d561ec..c86f64a 100644
+--- a/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
++++ b/src/gfxstream/guest/vulkan_enc/ResourceTracker.h
+@@ -935,6 +935,7 @@ class ResourceTracker {
+     struct GfxStreamVkFeatureInfo mFeatureInfo = {};
+     bool mGuestOnlyDescriptorPoolReset = false;
+     bool mAsyncDescriptorPoolReset = false;
++    bool mAsyncFenceReset = false;
+     // Several queues can submit command buffers referencing the same descriptor set.
+     std::mutex mDescriptorCommitLock;
+     bool mFenceCompletionCache = false;
+diff --git a/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl b/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
+index e8f20b8..bc292d6 100644
+--- a/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
++++ b/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
+@@ -125,6 +125,14 @@ int32_t VkEncoder::vkResetDescriptorPoolDeferredStatusVELOX(VkDevice device,
+     memcpy(streamPtr, &hostPool, 8);
+     streamPtr += 8;
+     memcpy(streamPtr, &flags, sizeof(VkDescriptorPoolResetFlags));
++    (void)pool;
++    return finishDeferredStatusCommandVELOX();
++}
++
++// Flushes the command just encoded and leaves its 4-byte status for the next readback().
++int32_t VkEncoder::finishDeferredStatusCommandVELOX() {
++    auto stream = mImpl->stream();
++    auto pool = mImpl->pool();
+     stream->flush();
+     stream->deferStatusReply();
+     // Bound the replies left in the host-to-guest channel.
+@@ -139,3 +147,34 @@ int32_t VkEncoder::vkResetDescriptorPoolDeferredStatusVELOX(VkDevice device,
+     }
+     return stream->takeDeferredReplyError();
+ }
++
++// Velox: the generated vkResetFences packet without waiting for the status (see above).
++int32_t VkEncoder::vkResetFencesDeferredStatusVELOX(VkDevice device, uint32_t fenceCount,
++                                                    const VkFence* pFences) {
++    const bool queueSubmitWithCommandsEnabled =
++        sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
++    if (!queueSubmitWithCommandsEnabled) {
++        GFXSTREAM_FATAL("vkResetFencesDeferredStatusVELOX needs sequence numbers");
++    }
++    auto stream = mImpl->stream();
++    const uint32_t packetSize = 4 + 4 + 4 + 8 + 4 + 8 * fenceCount;
++    uint8_t* streamPtr = stream->reserve(packetSize);
++    const uint32_t opcode = OP_vkResetFences;
++    const uint32_t seqno = ResourceTracker::nextSeqno();
++    const uint64_t hostDevice = gfxstream_vk_device_to_host_u64(device);
++    memcpy(streamPtr, &opcode, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    memcpy(streamPtr, &packetSize, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    memcpy(streamPtr, &seqno, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    memcpy(streamPtr, &hostDevice, 8);
++    streamPtr += 8;
++    memcpy(streamPtr, &fenceCount, sizeof(uint32_t));
++    streamPtr += sizeof(uint32_t);
++    for (uint32_t k = 0; k < fenceCount; ++k) {
++        const uint64_t hostFence = gfxstream_vk_fence_to_host_u64(pFences[k]);
++        memcpy(streamPtr + k * 8, &hostFence, sizeof(uint64_t));
++    }
++    return finishDeferredStatusCommandVELOX();
++}
+diff --git a/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl b/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl
+index fb3d940..dc3629b 100644
+--- a/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl
++++ b/src/gfxstream/guest/vulkan_enc/VkEncoder.h.inl
+@@ -18,3 +18,7 @@
+     // status that an earlier deferred reply on this stream reported, or 0.
+     int32_t vkResetDescriptorPoolDeferredStatusVELOX(VkDevice device, VkDescriptorPool descriptorPool,
+                                                       VkDescriptorPoolResetFlags flags);
++    // Same for vkResetFences (the fences must not be in use, as for vkResetFences).
++    int32_t vkResetFencesDeferredStatusVELOX(VkDevice device, uint32_t fenceCount,
++                                             const VkFence* pFences);
++    int32_t finishDeferredStatusCommandVELOX();
+-- 
+2.50.1.windows.1
+

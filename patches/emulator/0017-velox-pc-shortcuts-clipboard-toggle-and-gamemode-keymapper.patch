@@ -1,0 +1,676 @@
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp
+index 96f8f2bd..02dafeb4 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.cpp
+@@ -768,6 +768,14 @@ EmulatorQtWindow::EmulatorQtWindow(QWidget* parent)
+     setAttribute(Qt::WA_NoSystemBackground);
+     setAttribute(Qt::WA_AcceptTouchEvents);
+ 
++    if (android::featurecontrol::isEnabled(
++                android::featurecontrol::VirtioTablet)) {
++        // Enable hover tracking so native PC mouse pointer (VirtioTablet)
++        // delivers ACTION_HOVER_MOVE continuously without requiring a button hold.
++        setMouseTracking(true);
++    }
++    initVeloxDesktopFeatures();
++
+     bool shortcutBool = false;
+     if (!android::featurecontrol::isEnabled(
+                 android::featurecontrol::QtRawKeyboardInput)) {
+@@ -959,6 +967,8 @@ EmulatorQtWindow::~EmulatorQtWindow() {
+ }
+ 
+ void EmulatorQtWindow::focusOutEvent(QFocusEvent* event) {
++    mNativeTouchOrPenActive = false;
++    releaseVeloxGameInputs();
+     for (auto& key : mHeldModifiers) {
+         SkinEvent skin_event = createSkinEvent(kEventKeyUp);
+         skin_event.u.key.keycode = key;
+@@ -1230,6 +1240,14 @@ void EmulatorQtWindow::dropEvent(QDropEvent* event) {
+ }
+ 
+ void EmulatorQtWindow::keyPressEvent(QKeyEvent* event) {
++    if (handleVeloxDesktopShortcut(event, true)) {
++        event->accept();
++        return;
++    }
++    if (handleVeloxKeymapKey(event, true)) {
++        event->accept();
++        return;
++    }
+     if (android::featurecontrol::isEnabled(
+                 android::featurecontrol::QtRawKeyboardInput) &&
+         event->isAutoRepeat()) {
+@@ -1241,6 +1259,14 @@ void EmulatorQtWindow::keyPressEvent(QKeyEvent* event) {
+ }
+ 
+ void EmulatorQtWindow::keyReleaseEvent(QKeyEvent* event) {
++    if (handleVeloxDesktopShortcut(event, false)) {
++        event->accept();
++        return;
++    }
++    if (handleVeloxKeymapKey(event, false)) {
++        event->accept();
++        return;
++    }
+     if (android::featurecontrol::isEnabled(
+                 android::featurecontrol::QtRawKeyboardInput) &&
+         event->isAutoRepeat()) {
+@@ -1255,10 +1281,13 @@ void EmulatorQtWindow::keyReleaseEvent(QKeyEvent* event) {
+ 
+     handleKeyEvent(kEventKeyUp, *event);
+ 
+-    // If we enabled trackball mode, tell Qt to always forward mouse movement
+-    // events. Otherwise, Qt will forward them only when a button is pressed.
++    // If we enabled trackball mode, VirtioTablet hover, or mouse-look capture,
++    // keep Qt forwarding mouse movement events without a button pressed.
+     EmulatorWindow* ew = emulator_window_get();
+-    bool trackballActive = skin_ui_is_trackball_active(ew->ui);
++    bool trackballActive = skin_ui_is_trackball_active(ew->ui) ||
++                           mVeloxMouseLookCaptured ||
++                           android::featurecontrol::isEnabled(
++                                   android::featurecontrol::VirtioTablet);
+     if (trackballActive != hasMouseTracking()) {
+         setMouseTracking(trackballActive);
+     }
+@@ -1332,11 +1361,393 @@ void EmulatorQtWindow::releaseMouse() {
+ 
+ #endif  // __APPLE__
+ 
++int EmulatorQtWindow::parseVeloxQtKey(const QString& raw) {
++    const QString k = raw.trimmed().toUpper();
++    if (k.size() == 1) {
++        const QChar c = k[0];
++        if (c >= 'A' && c <= 'Z') return Qt::Key_A + (c.unicode() - 'A');
++        if (c >= '0' && c <= '9') return Qt::Key_0 + (c.unicode() - '0');
++    }
++    if (k == "SPACE") return Qt::Key_Space;
++    if (k == "TAB") return Qt::Key_Tab;
++    if (k == "SHIFT") return Qt::Key_Shift;
++    if (k == "CTRL" || k == "CONTROL") return Qt::Key_Control;
++    if (k == "ALT") return Qt::Key_Alt;
++    if (k == "ESC" || k == "ESCAPE") return Qt::Key_Escape;
++    if (k == "ENTER" || k == "RETURN") return Qt::Key_Return;
++    if (k == "PAUSE") return Qt::Key_Pause;
++    if (k == "SCROLLLOCK") return Qt::Key_ScrollLock;
++    if (k == "HOME") return Qt::Key_Home;
++    if (k == "END") return Qt::Key_End;
++    if (k == "PAGEUP") return Qt::Key_PageUp;
++    if (k == "PAGEDOWN") return Qt::Key_PageDown;
++    if (k.startsWith('F') && k.size() <= 3) {
++        bool ok = false;
++        int n = k.mid(1).toInt(&ok);
++        if (ok && n >= 1 && n <= 12) return Qt::Key_F1 + (n - 1);
++    }
++    return 0;
++}
++
++void EmulatorQtWindow::initVeloxDesktopFeatures() {
++    if (const char* hk = std::getenv("VELOX_HOME_KEY")) {
++        QString spec = QString::fromUtf8(hk).trimmed();
++        if (!spec.isEmpty()) {
++            Qt::KeyboardModifiers mods = Qt::NoModifier;
++            QStringList parts = spec.split('+', Qt::SkipEmptyParts);
++            for (int i = 0; i + 1 < parts.size(); ++i) {
++                QString m = parts[i].trimmed().toUpper();
++                if (m == "ALT") mods |= Qt::AltModifier;
++                else if (m == "CTRL" || m == "CONTROL") mods |= Qt::ControlModifier;
++                else if (m == "SHIFT") mods |= Qt::ShiftModifier;
++            }
++            if (!parts.isEmpty()) {
++                mVeloxHomeQtKey = parseVeloxQtKey(parts.last());
++                mVeloxHomeQtMods = mods;
++            }
++        }
++    }
++    if (const char* km = std::getenv("VELOX_KEYMAP_FILE")) {
++        mVeloxKeymapPath = QString::fromUtf8(km).trimmed();
++        maybeReloadVeloxKeymap(true);
++    }
++}
++
++void EmulatorQtWindow::maybeReloadVeloxKeymap(bool force) {
++    if (mVeloxKeymapPath.isEmpty()) {
++        return;
++    }
++    if (!force && mVeloxKeymapPollTimer.isValid() &&
++        mVeloxKeymapPollTimer.elapsed() < 500) {
++        return;
++    }
++    mVeloxKeymapPollTimer.restart();
++    QFileInfo fi(mVeloxKeymapPath);
++    if (!fi.exists()) {
++        if (mVeloxKeymapEnabled) {
++            releaseVeloxGameInputs();
++            mVeloxKeymapEnabled = false;
++        }
++        return;
++    }
++    qint64 mtime = fi.lastModified().toMSecsSinceEpoch();
++    if (!force && mtime == mVeloxKeymapMtimeMs) {
++        return;
++    }
++    mVeloxKeymapMtimeMs = mtime;
++
++    QFile f(mVeloxKeymapPath);
++    if (!f.open(QIODevice::ReadOnly)) {
++        return;
++    }
++    QJsonParseError err;
++    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
++    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
++        return;
++    }
++    releaseVeloxGameInputs();
++    QJsonObject obj = doc.object();
++    mVeloxKeymapEnabled = obj.value("enabled").toBool(false);
++    int capKey = parseVeloxQtKey(obj.value("toggle_capture_key").toString("F8"));
++    mVeloxCaptureToggleKey = capKey ? capKey : Qt::Key_F8;
++
++    QJsonObject joy = obj.value("joystick").toObject();
++    mVeloxJoyEnabled = joy.value("enabled").toBool(false);
++    mVeloxJoyUp = parseVeloxQtKey(joy.value("up").toString("W"));
++    mVeloxJoyDown = parseVeloxQtKey(joy.value("down").toString("S"));
++    mVeloxJoyLeft = parseVeloxQtKey(joy.value("left").toString("A"));
++    mVeloxJoyRight = parseVeloxQtKey(joy.value("right").toString("D"));
++    mVeloxJoyCx = std::clamp(joy.value("cx").toDouble(0.18), 0.02, 0.98);
++    mVeloxJoyCy = std::clamp(joy.value("cy").toDouble(0.76), 0.02, 0.98);
++    mVeloxJoyRadius = std::clamp(joy.value("radius").toDouble(0.10), 0.02, 0.35);
++
++    mVeloxTapBinds.clear();
++    QJsonArray keys = obj.value("keys").toArray();
++    int nextId = 91;
++    for (const QJsonValue& val : keys) {
++        if (!val.isObject() || nextId >= 98) continue;
++        QJsonObject ko = val.toObject();
++        int qk = parseVeloxQtKey(ko.value("key").toString());
++        if (!qk) continue;
++        VeloxTapBind b;
++        b.qtKey = qk;
++        b.rx = std::clamp(ko.value("x").toDouble(0.5), 0.01, 0.99);
++        b.ry = std::clamp(ko.value("y").toDouble(0.5), 0.01, 0.99);
++        b.touchId = nextId++;
++        mVeloxTapBinds.push_back(b);
++    }
++
++    QJsonObject ml = obj.value("mouse_look").toObject();
++    mVeloxMouseLookEnabled = ml.value("enabled").toBool(false);
++    mVeloxMouseLookCx = std::clamp(ml.value("cx").toDouble(0.72), 0.10, 0.90);
++    mVeloxMouseLookCy = std::clamp(ml.value("cy").toDouble(0.50), 0.10, 0.90);
++    mVeloxMouseLookSens = std::clamp(ml.value("sensitivity").toDouble(1.0), 0.1, 4.0);
++}
++
++void EmulatorQtWindow::sendVeloxVirtualTouch(SkinEventType type,
++                                             int touchId,
++                                             int x,
++                                             int y) {
++    SkinEvent ev = createSkinEvent(type);
++    ev.u.multi_touch_point.x = x;
++    ev.u.multi_touch_point.y = y;
++    QPoint g = mapToGlobal(QPoint(x, y));
++    ev.u.multi_touch_point.x_global = g.x();
++    ev.u.multi_touch_point.y_global = g.y();
++    ev.u.multi_touch_point.id = touchId;
++    ev.u.multi_touch_point.pressure = (type == kEventTouchEnd) ? 0 : (MTS_PRESSURE_RANGE_MAX / 2);
++    ev.u.multi_touch_point.touch_major = 8;
++    ev.u.multi_touch_point.touch_minor = 8;
++    ev.u.multi_touch_point.orientation = 0;
++    ev.u.multi_touch_point.skip_sync = false;
++    ev.u.multi_touch_point.display_id = 0;
++    queueSkinEvent(std::move(ev));
++}
++
++void EmulatorQtWindow::updateVeloxJoystickTouch() {
++    double dx = (mVeloxJoyHeld[3] ? 1.0 : 0.0) - (mVeloxJoyHeld[2] ? 1.0 : 0.0);
++    double dy = (mVeloxJoyHeld[1] ? 1.0 : 0.0) - (mVeloxJoyHeld[0] ? 1.0 : 0.0);
++    const int w = std::max(1, width());
++    const int h = std::max(1, height());
++    const double cx = mVeloxJoyCx * w;
++    const double cy = mVeloxJoyCy * h;
++    if (dx == 0.0 && dy == 0.0) {
++        if (mVeloxJoyTouchActive) {
++            sendVeloxVirtualTouch(kEventTouchEnd, 90, (int)cx, (int)cy);
++            mVeloxJoyTouchActive = false;
++        }
++        return;
++    }
++    const double len = std::hypot(dx, dy);
++    const double r = mVeloxJoyRadius * std::min(w, h);
++    const int tx = std::clamp((int)(cx + (dx / len) * r), 0, w - 1);
++    const int ty = std::clamp((int)(cy + (dy / len) * r), 0, h - 1);
++    if (!mVeloxJoyTouchActive) {
++        sendVeloxVirtualTouch(kEventTouchBegin, 90, (int)cx, (int)cy);
++        mVeloxJoyTouchActive = true;
++    }
++    sendVeloxVirtualTouch(kEventTouchUpdate, 90, tx, ty);
++}
++
++void EmulatorQtWindow::setVeloxMouseLookCaptured(bool capture) {
++    if (capture == mVeloxMouseLookCaptured) {
++        return;
++    }
++    mVeloxMouseLookCaptured = capture;
++    if (capture) {
++        setMouseTracking(true);
++        setCursor(Qt::BlankCursor);
++        QPoint center(width() / 2, height() / 2);
++        mVeloxMouseLookRecentering = true;
++        QCursor::setPos(mapToGlobal(center));
++        mVeloxMouseLookLastLocal = center;
++        mVeloxMouseLookCurX = mVeloxMouseLookCx * std::max(1, width());
++        mVeloxMouseLookCurY = mVeloxMouseLookCy * std::max(1, height());
++        sendVeloxVirtualTouch(kEventTouchBegin, 99, (int)mVeloxMouseLookCurX,
++                              (int)mVeloxMouseLookCurY);
++        mVeloxMouseLookTouchActive = true;
++    } else {
++        if (mVeloxMouseLookTouchActive) {
++            sendVeloxVirtualTouch(kEventTouchEnd, 99, (int)mVeloxMouseLookCurX,
++                                  (int)mVeloxMouseLookCurY);
++            mVeloxMouseLookTouchActive = false;
++        }
++        unsetCursor();
++        mVeloxMouseLookRecentering = false;
++    }
++}
++
++void EmulatorQtWindow::releaseVeloxGameInputs() {
++    if (mVeloxMouseLookCaptured) {
++        setVeloxMouseLookCaptured(false);
++    }
++    bool anyJoy = false;
++    for (bool& h : mVeloxJoyHeld) {
++        if (h) anyJoy = true;
++        h = false;
++    }
++    if (anyJoy || mVeloxJoyTouchActive) {
++        updateVeloxJoystickTouch();
++    }
++    const int w = std::max(1, width());
++    const int h = std::max(1, height());
++    for (auto& b : mVeloxTapBinds) {
++        if (b.active) {
++            sendVeloxVirtualTouch(kEventTouchEnd, b.touchId, (int)(b.rx * w),
++                                  (int)(b.ry * h));
++            b.active = false;
++        }
++    }
++}
++
++bool EmulatorQtWindow::handleVeloxDesktopShortcut(const QKeyEvent* event,
++                                                  bool pressed) {
++    if (!event) return false;
++    // F11 toggles fullscreen cleanly ONLY when this emulator window has focus.
++    if (event->key() == Qt::Key_F11 && event->modifiers() == Qt::NoModifier) {
++        if (pressed && !event->isAutoRepeat()) {
++            if (mContainer.isFullScreen()) {
++                mContainer.showNormal();
++            } else {
++                mContainer.showFullScreen();
++            }
++        }
++        return true;
++    }
++    // User-configurable Home key (VELOX_HOME_KEY, e.g. F12 or Alt+H)
++    if (mVeloxHomeQtKey != 0 && event->key() == mVeloxHomeQtKey &&
++        (event->modifiers() & (Qt::AltModifier | Qt::ControlModifier |
++                               Qt::ShiftModifier)) == mVeloxHomeQtMods) {
++        if (!event->isAutoRepeat()) {
++            SkinEvent sk = createSkinEvent(pressed ? kEventKeyDown : kEventKeyUp);
++            sk.u.key.keycode = LINUX_KEY_HOME;
++            sk.u.key.mod = 0;
++            queueSkinEvent(std::move(sk));
++        }
++        return true;
++    }
++    return false;
++}
++
++bool EmulatorQtWindow::handleVeloxKeymapKey(const QKeyEvent* event,
++                                            bool pressed) {
++    if (!event) return false;
++    maybeReloadVeloxKeymap(false);
++    if (!mVeloxKeymapEnabled) return false;
++    if (event->isAutoRepeat()) return true;
++
++    const int k = event->key();
++    // Toggle mouse-look capture cleanly (Esc always releases capture)
++    if (mVeloxMouseLookEnabled && k == mVeloxCaptureToggleKey) {
++        if (pressed) {
++            setVeloxMouseLookCaptured(!mVeloxMouseLookCaptured);
++        }
++        return true;
++    }
++    if (mVeloxMouseLookCaptured && k == Qt::Key_Escape) {
++        if (pressed) {
++            setVeloxMouseLookCaptured(false);
++        }
++        return true;
++    }
++
++    // 1:1 WASD virtual joystick mapping
++    if (mVeloxJoyEnabled) {
++        int dir = -1;
++        if (k == mVeloxJoyUp) dir = 0;
++        else if (k == mVeloxJoyDown) dir = 1;
++        else if (k == mVeloxJoyLeft) dir = 2;
++        else if (k == mVeloxJoyRight) dir = 3;
++        if (dir >= 0) {
++            mVeloxJoyHeld[dir] = pressed;
++            updateVeloxJoystickTouch();
++            return true;
++        }
++    }
++
++    // 1:1 custom key-to-touch bindings
++    const int w = std::max(1, width());
++    const int h = std::max(1, height());
++    for (auto& b : mVeloxTapBinds) {
++        if (b.qtKey == k) {
++            if (pressed && !b.active) {
++                b.active = true;
++                sendVeloxVirtualTouch(kEventTouchBegin, b.touchId,
++                                      (int)(b.rx * w), (int)(b.ry * h));
++            } else if (!pressed && b.active) {
++                b.active = false;
++                sendVeloxVirtualTouch(kEventTouchEnd, b.touchId,
++                                      (int)(b.rx * w), (int)(b.ry * h));
++            }
++            return true;
++        }
++    }
++    return false;
++}
++
++bool EmulatorQtWindow::handleVeloxMouseLookMove(QMouseEvent* event) {
++    if (!mVeloxMouseLookCaptured || !event) return false;
++    const QPoint pos = event->pos();
++    const QPoint center(width() / 2, height() / 2);
++    if (mVeloxMouseLookRecentering) {
++        if ((pos - center).manhattanLength() <= 6) {
++            mVeloxMouseLookRecentering = false;
++            mVeloxMouseLookLastLocal = pos;
++        }
++        return true;
++    }
++    const double dx = (pos.x() - mVeloxMouseLookLastLocal.x()) * mVeloxMouseLookSens;
++    const double dy = (pos.y() - mVeloxMouseLookLastLocal.y()) * mVeloxMouseLookSens;
++    mVeloxMouseLookLastLocal = pos;
++    if (dx == 0.0 && dy == 0.0) return true;
++
++    const int w = std::max(1, width());
++    const int h = std::max(1, height());
++    mVeloxMouseLookCurX += dx;
++    mVeloxMouseLookCurY += dy;
++    // Re-anchor smoothly if approaching viewport edge
++    if (mVeloxMouseLookCurX < w * 0.15 || mVeloxMouseLookCurX > w * 0.95 ||
++        mVeloxMouseLookCurY < h * 0.10 || mVeloxMouseLookCurY > h * 0.90) {
++        sendVeloxVirtualTouch(kEventTouchEnd, 99,
++                              std::clamp((int)mVeloxMouseLookCurX, 0, w - 1),
++                              std::clamp((int)mVeloxMouseLookCurY, 0, h - 1));
++        mVeloxMouseLookCurX = mVeloxMouseLookCx * w;
++        mVeloxMouseLookCurY = mVeloxMouseLookCy * h;
++        sendVeloxVirtualTouch(kEventTouchBegin, 99, (int)mVeloxMouseLookCurX,
++                              (int)mVeloxMouseLookCurY);
++    } else {
++        sendVeloxVirtualTouch(kEventTouchUpdate, 99,
++                              std::clamp((int)mVeloxMouseLookCurX, 0, w - 1),
++                              std::clamp((int)mVeloxMouseLookCurY, 0, h - 1));
++    }
++
++    // Keep host cursor centered inside the emulator window while captured
++    if (std::abs(pos.x() - center.x()) > w / 4 ||
++        std::abs(pos.y() - center.y()) > h / 4) {
++        mVeloxMouseLookRecentering = true;
++        QCursor::setPos(mapToGlobal(center));
++        mVeloxMouseLookLastLocal = center;
++    }
++    return true;
++}
++
++bool EmulatorQtWindow::shouldProcessMouseEvent(const QMouseEvent* event) {
++    if (!event) {
++        return false;
++    }
++    if (event->source() == Qt::MouseEventNotSynthesized) {
++        return true;
++    }
++    // Filter out system/Qt-synthesized mouse events only while a native
++    // TouchScreen or Tablet/Pen gesture is active or just ended (Windows Ink
++    // long-press / release synthesis window). Remote Desktop, mobile remote
++    // clients, and touch-to-mouse drivers deliver only synthesized mouse events
++    // (MI_WP_SIGNATURE) without native QTouchEvent/QTabletEvent and must pass.
++    constexpr qint64 kNativeTouchPenCooldownMs = 250;
++    constexpr qint64 kNativeActiveStaleMs = 5000;
++    if (mNativeTouchOrPenActive) {
++        if (!mNativeTouchOrPenTimer.isValid() ||
++            mNativeTouchOrPenTimer.elapsed() > kNativeActiveStaleMs) {
++            mNativeTouchOrPenActive = false;
++        } else {
++            return false;
++        }
++    }
++    if (mNativeTouchOrPenTimer.isValid() &&
++        mNativeTouchOrPenTimer.elapsed() <= kNativeTouchPenCooldownMs) {
++        return false;
++    }
++    return true;
++}
++
+ void EmulatorQtWindow::mouseMoveEvent(QMouseEvent* event) {
+     // The motion event will interfere with the swipe gesture being synthesized.
+     if (mWheelScrollTimer.isActive())
+         return;
+ 
++    if (handleVeloxMouseLookMove(event))
++        return;
++
+     if (android::featurecontrol::isEnabled(
+                 android::featurecontrol::VirtioMouse) &&
+         !getConsoleAgents()
+@@ -1344,10 +1755,9 @@ void EmulatorQtWindow::mouseMoveEvent(QMouseEvent* event) {
+                  ->no_mouse_reposition) {
+         // Block all the incoming mouse events if mouse is being moved to
+         // center of the screen.
+-        if (!mMouseRepositioning &&
+-            (event->source() == Qt::MouseEventNotSynthesized)) {
++        if (!mMouseRepositioning && shouldProcessMouseEvent(event)) {
+             // Pen long press generates synthesized mouse events,
+-            // which need to be filtered out
++            // which need to be filtered out when native touch/pen is active
+             SkinEventType eventType = translateMouseEventType(
+                     kEventMouseMotion, event->button(), event->buttons());
+             handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1379,8 +1789,8 @@ void EmulatorQtWindow::mouseMoveEvent(QMouseEvent* event) {
+         }
+     } else {
+         // Pen long press generates synthesized mouse events,
+-        // which need to be filtered out
+-        if (event->source() == Qt::MouseEventNotSynthesized) {
++        // which need to be filtered out when native touch/pen is active
++        if (shouldProcessMouseEvent(event)) {
+             SkinEventType eventType = translateMouseEventType(
+                     kEventMouseMotion, event->button(), event->buttons());
+             handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1496,8 +1906,8 @@ void EmulatorQtWindow::mousePressEvent(QMouseEvent* event) {
+     }
+ 
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    // which need to be filtered out when native touch/pen is active
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = translateMouseEventType(
+                 kEventMouseButtonDown, event->button(), event->buttons());
+         handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1507,7 +1917,7 @@ void EmulatorQtWindow::mousePressEvent(QMouseEvent* event) {
+ 
+ void EmulatorQtWindow::mouseReleaseEvent(QMouseEvent* event) {
+     // Pen long press generates synthesized mouse events,
+-    // which need to be filtered out
++    // which need to be filtered out when native touch/pen is active
+     if (android::featurecontrol::isEnabled(
+                 android::featurecontrol::VirtioDualModeMouse) &&
+         mRelativeMouseCoordMode && mMouseGrabbed) {
+@@ -1517,7 +1927,7 @@ void EmulatorQtWindow::mouseReleaseEvent(QMouseEvent* event) {
+         updateWindowTitle();
+         mContainer.setCursor(getCursorShape(/*mouseGrabbed*/ false));
+     }
+-    if (event->source() == Qt::MouseEventNotSynthesized) {
++    if (shouldProcessMouseEvent(event)) {
+         SkinEventType eventType = translateMouseEventType(
+                 kEventMouseButtonUp, event->button(), event->buttons());
+         handleMouseEvent(eventType, getSkinMouseButton(event), event->pos(),
+@@ -1544,6 +1954,8 @@ void EmulatorQtWindow::tabletEvent(QTabletEvent* event) {
+ 
+     switch (event->type()) {
+         case QEvent::TabletPress: {
++            mNativeTouchOrPenActive = true;
++            mNativeTouchOrPenTimer.restart();
+             button_pressed =
+                     ((event->buttons() & Qt::RightButton) == Qt::RightButton);
+             eventType = translatePenEventType(kEventPenPress, event->button(),
+@@ -1555,6 +1967,8 @@ void EmulatorQtWindow::tabletEvent(QTabletEvent* event) {
+             break;
+         }
+         case QEvent::TabletRelease: {
++            mNativeTouchOrPenActive = false;
++            mNativeTouchOrPenTimer.restart();
+             button_pressed =
+                     ((event->buttons() & Qt::RightButton) == Qt::RightButton);
+             eventType = translatePenEventType(kEventPenRelease, event->button(),
+@@ -1566,6 +1980,10 @@ void EmulatorQtWindow::tabletEvent(QTabletEvent* event) {
+             break;
+         }
+         case QEvent::TabletMove: {
++            mNativeTouchOrPenActive =
++                    (event->buttons() != Qt::NoButton) ||
++                    (event->pressure() > 0.0);
++            mNativeTouchOrPenTimer.restart();
+             button_pressed =
+                     ((event->buttons() & Qt::RightButton) == Qt::RightButton);
+             if ((event->pos().x() != mPenPosX) ||
+@@ -2025,12 +2443,19 @@ void EmulatorQtWindow::handleTouchPoints(const QTouchEvent& touch,
+ 
+ bool EmulatorQtWindow::event(QEvent* ev) {
+     if (ev->type() == QEvent::TouchBegin || ev->type() == QEvent::TouchUpdate ||
+-        ev->type() == QEvent::TouchEnd) {
++        ev->type() == QEvent::TouchEnd || ev->type() == QEvent::TouchCancel) {
+         QTouchEvent* touchEvent = static_cast<QTouchEvent*>(ev);
+         // b/216383452 Only process multitouch events generated from touch
+         // screen.
+         if (touchEvent->device()->type() ==
+             QInputDevice::DeviceType::TouchScreen) {
++            if (ev->type() == QEvent::TouchCancel) {
++                mNativeTouchOrPenActive = false;
++                mNativeTouchOrPenTimer.restart();
++                return true;
++            }
++            mNativeTouchOrPenActive = (ev->type() != QEvent::TouchEnd);
++            mNativeTouchOrPenTimer.restart();
+             handleTouchPoints(*touchEvent);
+             return true;
+         }
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h
+index 97b737c6..42c8c8b2 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/emulator-qt-window.h
+@@ -36,6 +36,7 @@
+ 
+ #include <QDragEnterEvent>
+ #include <QDropEvent>
++#include <QElapsedTimer>
+ #include <QFrame>
+ #include <QGuiApplication>
+ #include <QImage>
+@@ -678,6 +679,61 @@ private:
+     /* State of mouse event type translation state machine. */
+     TouchState mMouseTouchState = TouchState::NOT_TOUCHING;
+ 
++    /* Tracks active/recent native TouchScreen or Tablet/Pen input so we only
++     * filter system-synthesized mouse events that duplicate native touch/pen
++     * events, without dropping Remote Desktop / touch-to-mouse input. */
++    bool mNativeTouchOrPenActive = false;
++    QElapsedTimer mNativeTouchOrPenTimer;
++    bool shouldProcessMouseEvent(const QMouseEvent* event);
++
++    /* Velox PC desktop shortcuts & Game Mode 1:1 keymapper (opt-in via env) */
++    struct VeloxTapBind {
++        int qtKey = 0;
++        double rx = 0.5;
++        double ry = 0.5;
++        int touchId = 91;
++        bool active = false;
++    };
++    bool mVeloxKeymapEnabled = false;
++    QString mVeloxKeymapPath;
++    qint64 mVeloxKeymapMtimeMs = 0;
++    QElapsedTimer mVeloxKeymapPollTimer;
++    int mVeloxHomeQtKey = 0;
++    Qt::KeyboardModifiers mVeloxHomeQtMods = Qt::NoModifier;
++    int mVeloxCaptureToggleKey = Qt::Key_F8;
++    bool mVeloxJoyEnabled = false;
++    int mVeloxJoyUp = Qt::Key_W;
++    int mVeloxJoyDown = Qt::Key_S;
++    int mVeloxJoyLeft = Qt::Key_A;
++    int mVeloxJoyRight = Qt::Key_D;
++    double mVeloxJoyCx = 0.18;
++    double mVeloxJoyCy = 0.76;
++    double mVeloxJoyRadius = 0.10;
++    bool mVeloxJoyHeld[4] = {false, false, false, false};
++    bool mVeloxJoyTouchActive = false;
++    std::vector<VeloxTapBind> mVeloxTapBinds;
++    bool mVeloxMouseLookEnabled = false;
++    double mVeloxMouseLookCx = 0.72;
++    double mVeloxMouseLookCy = 0.50;
++    double mVeloxMouseLookSens = 1.0;
++    bool mVeloxMouseLookCaptured = false;
++    bool mVeloxMouseLookTouchActive = false;
++    double mVeloxMouseLookCurX = 0.0;
++    double mVeloxMouseLookCurY = 0.0;
++    QPoint mVeloxMouseLookLastLocal;
++    bool mVeloxMouseLookRecentering = false;
++
++    void initVeloxDesktopFeatures();
++    void maybeReloadVeloxKeymap(bool force = false);
++    void sendVeloxVirtualTouch(SkinEventType type, int touchId, int x, int y);
++    void updateVeloxJoystickTouch();
++    void releaseVeloxGameInputs();
++    void setVeloxMouseLookCaptured(bool capture);
++    bool handleVeloxDesktopShortcut(const QKeyEvent* event, bool pressed);
++    bool handleVeloxKeymapKey(const QKeyEvent* event, bool pressed);
++    bool handleVeloxMouseLookMove(QMouseEvent* event);
++    static int parseVeloxQtKey(const QString& name);
++
+     SkinEventType translatePenEventType(SkinEventType type,
+                                         Qt::MouseButton button,
+                                         Qt::MouseButtons buttons);
+diff --git a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/tool-window.cpp b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/tool-window.cpp
+index 39728a72..151f95e3 100644
+--- a/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/tool-window.cpp
++++ b/android/android-ui/modules/aemu-ui-qt/src/android/skin/qt/tool-window.cpp
+@@ -762,7 +762,15 @@ void ToolWindow::allowExtWindowCreation() {
+     mAllowExtWindow = true;
+ }
+ 
++static bool isVeloxClipboardDisabledByEnv() {
++    const char* v = std::getenv("VELOX_CLIPBOARD_SHARING");
++    return v && (v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
++}
++
+ void ToolWindow::switchClipboardSharing(bool enabled) {
++    if (isVeloxClipboardDisabledByEnv()) {
++        enabled = false;
++    }
+     if (sUiEmuAgent && sUiEmuAgent->clipboard) {
+         sUiEmuAgent->clipboard->setEnabled(enabled);
+     }
+@@ -1634,6 +1642,9 @@ void ToolWindow::onMainLoopStart() {
+ 
+ void ToolWindow::setClipboardCallbacks(const UiEmuAgent* agPtr) {
+     if (agPtr->clipboard) {
++        if (isVeloxClipboardDisabledByEnv()) {
++            agPtr->clipboard->setEnabled(false);
++        }
+         connect(this, SIGNAL(guestClipboardChanged(QString)), this,
+                 SLOT(onGuestClipboardChanged(QString)), Qt::QueuedConnection);
+         agPtr->clipboard->registerGuestClipboardCallback(

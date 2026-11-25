@@ -1,0 +1,276 @@
+From 03fd747dee5e9ffbc08ed4caca6fb64ed362ba42 Mon Sep 17 00:00:00 2001
+From: Velox <velox@localhost>
+Date: Sat, 21 Nov 2026 22:38:25 +0900
+Subject: [PATCH] gfxstream: retire unsafe Vulkan fence notification workers
+
+Change-Id: I71ffea2eeeea0dad29de3f18ad39ee45e2972964
+---
+ guest/renderControl_enc/EmulatorFeatureInfo.h |  8 +--
+ host/render_control.cpp                       | 14 ++--
+ host/sync_thread.cpp                          | 16 ++---
+ host/sync_thread.h                            |  4 +-
+ host/vulkan/vk_decoder_global_state.cpp       | 69 +++----------------
+ host/vulkan/vk_decoder_global_state.h         |  1 -
+ host/vulkan/vk_decoder_internal_structs.h     |  7 --
+ 7 files changed, 26 insertions(+), 93 deletions(-)
+
+diff --git a/guest/renderControl_enc/EmulatorFeatureInfo.h b/guest/renderControl_enc/EmulatorFeatureInfo.h
+index 84d1119..9422194 100644
+--- a/guest/renderControl_enc/EmulatorFeatureInfo.h
++++ b/guest/renderControl_enc/EmulatorFeatureInfo.h
+@@ -132,12 +132,12 @@ static const char kSyncBufferData[] = "ANDROID_EMU_sync_buffer_data";
+ // Batched descriptor set update
+ static const char kVulkanBatchedDescriptorSetUpdate[] = "ANDROID_EMU_vulkan_batched_descriptor_set_update";
+ 
+-// Deferred vkResetDescriptorPool (vkQueueCommitDescriptorSetUpdates2GOOGLE)
++// vkResetDescriptorPool for pools with no native descriptor sets.
+ static const char kVulkanDeferredDescriptorPoolReset[] =
+-    "ANDROID_EMU_vulkan_deferred_descriptor_pool_reset";
++    "ANDROID_EMU_vulkan_guest_only_descriptor_pool_reset";
+ 
+-// Fence status hints through the goldfish sync device
+-static const char kVulkanFenceStatusHint[] = "ANDROID_EMU_vulkan_fence_status_hint";
++// Guest cache of confirmed fence completion.
++static const char kVulkanFenceStatusHint[] = "ANDROID_EMU_vulkan_confirmed_fence_status";
+ 
+ // Async QSRI
+ static const char kVulkanAsyncQsri[] = "ANDROID_EMU_vulkan_async_qsri";
+diff --git a/host/render_control.cpp b/host/render_control.cpp
+index b20951b..21a0435 100644
+--- a/host/render_control.cpp
++++ b/host/render_control.cpp
+@@ -253,14 +253,13 @@ static const char* kVulkanQueueSubmitWithCommands = "ANDROID_EMU_vulkan_queue_su
+ // Batched descriptor set update
+ static const char* kVulkanBatchedDescriptorSetUpdate = "ANDROID_EMU_vulkan_batched_descriptor_set_update";
+ 
+-// Deferred vkResetDescriptorPool for batched descriptor set updates
+-// (vkQueueCommitDescriptorSetUpdates2GOOGLE). Not advertised with Vulkan snapshots, which do not
+-// record the reset epochs.
++// Allows a guest-only reset of a batched pool that has no native allocations. Keep the
++// synchronous path with Vulkan snapshots.
+ static const char* kVulkanDeferredDescriptorPoolReset =
+-    "ANDROID_EMU_vulkan_deferred_descriptor_pool_reset";
++    "ANDROID_EMU_vulkan_guest_only_descriptor_pool_reset";
+ 
+-// Fence status hints through the goldfish sync device (GOLDFISH_SYNC_VULKAN_FENCE_HINT).
+-static const char* kVulkanFenceStatusHint = "ANDROID_EMU_vulkan_fence_status_hint";
++// Allows the guest to cache confirmed completion for ordinary fences.
++static const char* kVulkanFenceStatusHint = "ANDROID_EMU_vulkan_confirmed_fence_status";
+ 
+ // Synchronized glBufferData call
+ static const char* kSyncBufferData = "ANDROID_EMU_sync_buffer_data";
+@@ -613,7 +612,8 @@ static EGLint rcGetGLString(EGLenum name, void* buffer, EGLint bufferSize) {
+         glStr += " ";
+     }
+ 
+-    if (shouldEnableVulkan(features) && name == GL_EXTENSIONS) {
++    if (shouldEnableVulkan(features) && !features.VulkanSnapshots.enabled() &&
++        name == GL_EXTENSIONS) {
+         glStr += kVulkanFenceStatusHint;
+         glStr += " ";
+     }
+diff --git a/host/sync_thread.cpp b/host/sync_thread.cpp
+index 747dd86..1a4c896 100644
+--- a/host/sync_thread.cpp
++++ b/host/sync_thread.cpp
+@@ -292,18 +292,12 @@ void SyncThread::triggerWaitVk(VkFence vkFence, uint64_t timeline) {
+         ss.str());
+ }
+ 
+-void SyncThread::triggerWaitVkFenceHint(VkFence vkFence, uint64_t generation,
++void SyncThread::triggerWaitVkFenceHint(VkFence, uint64_t,
+                                         uint64_t timeline) {
+-    std::stringstream ss;
+-    ss << "triggerWaitVkFenceHint vkFence=0x" << std::hex << reinterpret_cast<uintptr_t>(vkFence)
+-       << " generation=" << std::dec << generation;
+-    sendAsync(
+-        [vkFence, generation, timeline](WorkerId) {
+-            auto decoder = vk::VkDecoderGlobalState::get();
+-            decoder->waitForFenceSubmission(vkFence, generation, kDefaultTimeoutNsecs);
+-            gfxstream_sync_timeline_inc(timeline, kTimelineInterval);
+-        },
+-        ss.str());
++    // A legacy guest treats this notification as advisory and queries native status.
++    // Acknowledge in the sync worker without retaining a reference to the fence or device.
++    sendAsync([timeline](WorkerId) { gfxstream_sync_timeline_inc(timeline, kTimelineInterval); },
++              "retired Vulkan fence status hint");
+ }
+ 
+ void SyncThread::triggerWaitVkWithCompletionCallback(VkFence vkFence, FenceCompletionCallback cb) {
+diff --git a/host/sync_thread.h b/host/sync_thread.h
+index 61283d3..9351cd0 100644
+--- a/host/sync_thread.h
++++ b/host/sync_thread.h
+@@ -64,9 +64,7 @@ class SyncThread : public gfxstream::base::Thread {
+     // knows when to increment timelines / signal native fence FD's.
+     void triggerWaitVk(VkFence vkFence, uint64_t timeline);
+ 
+-    // |triggerWaitVkFenceHint|: like |triggerWaitVk|, but waits for submission number
+-    // |generation| of the fence (see VkDecoderGlobalState::waitForFenceSubmission), so a request
+-    // that arrives after the fence was reset or resubmitted completes immediately.
++    // Acknowledge advisory notifications from legacy guests.
+     void triggerWaitVkFenceHint(VkFence vkFence, uint64_t generation, uint64_t timeline);
+ 
+ #if GFXSTREAM_ENABLE_HOST_GLES
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index f78741f..25990f9 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -4578,9 +4578,6 @@ class VkDecoderGlobalState::Impl {
+             } else {
+                 fenceInfo.state = FenceInfo::State::kNotWaitable;
+             }
+-            fenceInfo.submitCount = 0;
+-            fenceInfo.resetCount = 0;
+-            fenceInfo.resetCountAtLastSubmit = 0;
+         }
+ 
+         return VK_SUCCESS;
+@@ -4594,8 +4591,8 @@ class VkDecoderGlobalState::Impl {
+             std::lock_guard<std::mutex> lock(mMutex);
+             auto* fenceInfo = gfxstream::base::find(mFenceInfo, fence);
+             if (!fenceInfo) {
+-                GFXSTREAM_ERROR("%s: Invalid fence %p", fence);
+-                return VK_SUCCESS;
++                GFXSTREAM_ERROR("%s: Invalid fence %p", __func__, fence);
++                return VK_ERROR_UNKNOWN;
+             }
+         }
+ 
+@@ -4650,7 +4647,6 @@ class VkDecoderGlobalState::Impl {
+                     cleanedFences.push_back(fence);
+                     std::lock_guard<std::mutex> fenceLock(fenceInfo.mutex);
+                     fenceInfo.state = FenceInfo::State::kNotWaitable;
+-                    fenceInfo.resetCount.fetch_add(1);
+                 }
+             }
+         }
+@@ -4687,8 +4683,9 @@ class VkDecoderGlobalState::Impl {
+         }
+ 
+         if (!cleanedFences.empty()) {
+-            VK_CHECK(vk->vkResetFences(device, (uint32_t)cleanedFences.size(),
+-                                       cleanedFences.data()));
++            const VkResult res =
++                vk->vkResetFences(device, (uint32_t)cleanedFences.size(), cleanedFences.data());
++            if (res != VK_SUCCESS) return res;
+         }
+ 
+         // For external fences, we unilaterally put them in the pool to ensure they finish
+@@ -8569,8 +8566,6 @@ class VkDecoderGlobalState::Impl {
+                 {
+                     std::unique_lock<std::mutex> fenceLock(fenceInfo->mutex);
+                     fenceInfo->state = FenceInfo::State::kWaitable;
+-                    fenceInfo->resetCountAtLastSubmit = fenceInfo->resetCount.load();
+-                    fenceInfo->submitCount.fetch_add(1);
+                 }
+                 fenceInfo->cv.notify_all();
+                 // Also update the latestUse waitable for this fence, to ensure
+@@ -10185,8 +10180,10 @@ class VkDecoderGlobalState::Impl {
+         if (didAlloc || needToUnboxDescriptorSet) {
+             std::vector<VkWriteDescriptorSet> writeDescriptorSetsForHostDriver(
+                 pendingDescriptorWriteCount);
+-            memcpy(writeDescriptorSetsForHostDriver.data(), pPendingDescriptorWrites,
+-                   pendingDescriptorWriteCount * sizeof(VkWriteDescriptorSet));
++            if (pendingDescriptorWriteCount) {
++                memcpy(writeDescriptorSetsForHostDriver.data(), pPendingDescriptorWrites,
++                       pendingDescriptorWriteCount * sizeof(VkWriteDescriptorSet));
++            }
+ 
+             for (uint32_t i = 0; i < descriptorSetCount; ++i) {
+                 uint32_t writeStartIndex = pDescriptorWriteStartingIndices[i];
+@@ -10580,47 +10577,6 @@ class VkDecoderGlobalState::Impl {
+         });
+     }
+ 
+-    // Fence status hint: return once submission number |generation| of |fence| (1 = first
+-    // submission after creation) is known to have completed: the fence signaled, was reset after
+-    // that submission (a reset requires completion), was submitted again, or was destroyed.
+-    // Errors and the overall timeout also return, so the waiting sync worker is never held for
+-    // long; the guest confirms with vkGetFenceStatus before it reports the fence as signaled.
+-    VkResult waitForFenceSubmission(VkFence fence, uint64_t generation, uint64_t timeoutNs) {
+-        const auto deadline =
+-            std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeoutNs);
+-        constexpr uint64_t kStepNs = 2000000;  // 2 ms
+-        for (;;) {
+-            VkDevice device = VK_NULL_HANDLE;
+-            VulkanDispatch* vk = nullptr;
+-            FenceInfo* info = nullptr;
+-            {
+-                std::lock_guard<std::mutex> lock(mMutex);
+-                info = gfxstream::base::find(mFenceInfo, fence);
+-                if (!info) return VK_SUCCESS;  // destroyed: nothing is pending on it
+-                device = info->device;
+-                vk = info->vk;
+-            }
+-            const uint64_t submits = info->submitCount.load();
+-            if (submits > generation) return VK_SUCCESS;  // resubmitted: earlier one completed
+-            if (submits == generation) {
+-                if (info->resetCount.load() != info->resetCountAtLastSubmit.load()) {
+-                    return VK_SUCCESS;  // reset after this submission
+-                }
+-                VkResult res = vk->vkWaitForFences(device, 1, &fence, VK_TRUE, kStepNs);
+-                if (res != VK_TIMEOUT) return res;
+-            } else {
+-                // The submission has not been decoded yet (the hint travels through the sync
+-                // device, the submission through the command stream).
+-                std::unique_lock<std::mutex> lock(info->mutex);
+-                info->cv.wait_for(lock, std::chrono::nanoseconds(kStepNs),
+-                                  [info, generation] {
+-                                      return info->submitCount.load() >= generation;
+-                                  });
+-            }
+-            if (std::chrono::steady_clock::now() >= deadline) return VK_TIMEOUT;
+-        }
+-    }
+-
+     VkResult waitForFence(VkFence fence, uint64_t timeout) {
+         VkDevice device;
+         VulkanDispatch* vk;
+@@ -13760,13 +13716,6 @@ VkResult VkDecoderGlobalState::on_vkSetDebugUtilsObjectTagEXT(
+ 
+ void VkDecoderGlobalState::on_DeviceLost() { mImpl->on_DeviceLost(); }
+ 
+-VkResult VkDecoderGlobalState::waitForFenceSubmission(VkFence boxed_fence, uint64_t generation,
+-                                                      uint64_t timeoutNs) {
+-    VkFence fence = unbox_VkFence(boxed_fence);
+-    if (fence == VK_NULL_HANDLE) return VK_SUCCESS;
+-    return mImpl->waitForFenceSubmission(fence, generation, timeoutNs);
+-}
+-
+ VkResult VkDecoderGlobalState::waitForFence(VkFence boxed_fence, uint64_t timeout) {
+     VkFence fence = unbox_VkFence(boxed_fence);
+     return mImpl->waitForFence(fence, timeout);
+diff --git a/host/vulkan/vk_decoder_global_state.h b/host/vulkan/vk_decoder_global_state.h
+index 967abe3..6625f09 100644
+--- a/host/vulkan/vk_decoder_global_state.h
++++ b/host/vulkan/vk_decoder_global_state.h
+@@ -1047,7 +1047,6 @@ class VkDecoderGlobalState {
+ 
+     // Fence waits
+     VkResult waitForFence(VkFence boxed_fence, uint64_t timeout);
+-    VkResult waitForFenceSubmission(VkFence boxed_fence, uint64_t generation, uint64_t timeoutNs);
+ 
+     // Wait for present (vkQueueSignalReleaseImageANDROID). This explicitly
+     // requires the image to be presented again versus how many times it's been
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index e9106f9..1e5a920 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -419,13 +419,6 @@ struct FenceInfo {
+     };
+     State state = State::kNotWaitable;
+ 
+-    // Fence status hints (GOLDFISH_SYNC_VULKAN_FENCE_HINT): number of queue submissions and
+-    // resets of this fence since its creation, and the reset count at the latest submission.
+-    // Written with |mutex| held; read without it by hint waits.
+-    std::atomic<uint64_t> submitCount{0};
+-    std::atomic<uint64_t> resetCount{0};
+-    std::atomic<uint64_t> resetCountAtLastSubmit{0};
+-
+     bool external = false;
+ 
+     // If this fence was used in an additional host operation that must be waited
+-- 
+2.50.1.windows.1
+

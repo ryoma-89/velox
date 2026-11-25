@@ -1,0 +1,107 @@
+From 48b96846fec93576e958ce38166468f4319fba87 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 05:24:20 +0900
+Subject: [PATCH] gfxstream: defer status replies only on the goldfish pipe
+
+Address space graphics uses one large transfer ring for both directions and
+expects every reply to be read before the next large write. An unread
+deferred reply was overwritten by the next command buffer flush: vkResetFences
+then returned command buffer contents as its status (seen with
+vk-syncbench --transport-stress and AnTuTu, which exited). Streams opt in with
+supportsDeferredReplies(); only QemuPipeStream does, others keep the
+synchronous call.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+
+Change-Id: Icea646a0a85e806ef4b5e192d5dea3de6251abdf
+---
+ src/gfxstream/guest/connection-manager/QemuPipeStream.h     | 2 ++
+ .../guest/iostream/include/gfxstream/guest/IOStream.h       | 4 ++++
+ src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl            | 6 ++++++
+ src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp        | 2 ++
+ src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h          | 1 +
+ 5 files changed, 15 insertions(+)
+
+diff --git a/src/gfxstream/guest/connection-manager/QemuPipeStream.h b/src/gfxstream/guest/connection-manager/QemuPipeStream.h
+index 2a81fd5..7f62197 100644
+--- a/src/gfxstream/guest/connection-manager/QemuPipeStream.h
++++ b/src/gfxstream/guest/connection-manager/QemuPipeStream.h
+@@ -28,6 +28,8 @@ class QemuPipeStream : public gfxstream::guest::IOStream {
+     virtual void* allocBuffer(size_t minSize);
+     virtual int commitBuffer(size_t size);
+     virtual const unsigned char* readFully(void* buf, size_t len);
++    // Replies are queued messages in the host RenderChannel (see IOStream::kMaxDeferredReplies).
++    bool supportsDeferredReplies() const override { return true; }
+     virtual const unsigned char* commitBufferAndReadFully(size_t size, void* buf, size_t len);
+     virtual const unsigned char* read(void* buf, size_t* inout_len);
+ 
+diff --git a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+index c96c3e1..b2e1d29 100644
+--- a/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
++++ b/src/gfxstream/guest/iostream/include/gfxstream/guest/IOStream.h
+@@ -98,6 +98,10 @@ class IOStream {
+     // write, and with process-wide sequence numbers every other thread's commands wait behind it:
+     // a deadlock if this thread then waits for another thread. Keep the bound far below 16.
+     static constexpr uint32_t kMaxDeferredReplies = 4;
++    // Only transports whose host-to-guest replies cannot be overwritten by later guest writes
++    // may leave replies unread. Address space graphics shares its large transfer ring between
++    // both directions (a later large write overwrites an unread reply), so it does not opt in.
++    virtual bool supportsDeferredReplies() const { return false; }
+     void deferStatusReply() { ++m_deferredReplies; }
+     uint32_t deferredReplies() const { return m_deferredReplies; }
+     int32_t takeDeferredReplyError() {
+diff --git a/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl b/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
+index bc292d6..bb86e66 100644
+--- a/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
++++ b/src/gfxstream/guest/vulkan_enc/VkEncoder.cpp.inl
+@@ -107,6 +107,9 @@ int32_t VkEncoder::vkResetDescriptorPoolDeferredStatusVELOX(VkDevice device,
+         GFXSTREAM_FATAL("vkResetDescriptorPoolDeferredStatusVELOX needs sequence numbers");
+     }
+     auto stream = mImpl->stream();
++    if (!stream->supportsDeferredReplies()) {
++        return vkResetDescriptorPool(device, descriptorPool, flags, true /* do lock */);
++    }
+     auto pool = mImpl->pool();
+     const uint32_t packetSize = 4 + 4 + 4 + 8 + 8 + sizeof(VkDescriptorPoolResetFlags);
+     uint8_t* streamPtr = stream->reserve(packetSize);
+@@ -157,6 +160,9 @@ int32_t VkEncoder::vkResetFencesDeferredStatusVELOX(VkDevice device, uint32_t fe
+         GFXSTREAM_FATAL("vkResetFencesDeferredStatusVELOX needs sequence numbers");
+     }
+     auto stream = mImpl->stream();
++    if (!stream->supportsDeferredReplies()) {
++        return vkResetFences(device, fenceCount, pFences, true /* do lock */);
++    }
+     const uint32_t packetSize = 4 + 4 + 4 + 8 + 4 + 8 * fenceCount;
+     uint8_t* streamPtr = stream->reserve(packetSize);
+     const uint32_t opcode = OP_vkResetFences;
+diff --git a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
+index fce630e..acd8538 100644
+--- a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
++++ b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.cpp
+@@ -123,6 +123,8 @@ bool VulkanStreamGuest::decStreamRef() { return mStream->decRef(); }
+ 
+ uint8_t* VulkanStreamGuest::reserve(size_t size) { return (uint8_t*)mStream->alloc(size); }
+ 
++bool VulkanStreamGuest::supportsDeferredReplies() const { return mStream->supportsDeferredReplies(); }
++
+ void VulkanStreamGuest::deferStatusReply() { mStream->deferStatusReply(); }
+ 
+ uint32_t VulkanStreamGuest::deferredReplies() const { return mStream->deferredReplies(); }
+diff --git a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
+index a00e5c7..97341be 100644
+--- a/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
++++ b/src/gfxstream/guest/vulkan_enc/VulkanStreamGuest.h
+@@ -56,6 +56,7 @@ class VulkanStreamGuest : public gfxstream::aemu::Stream {
+     uint8_t* reserve(size_t size);
+ 
+     // Velox: status replies that are read later (see IOStream::deferStatusReply).
++    bool supportsDeferredReplies() const;
+     void deferStatusReply();
+     uint32_t deferredReplies() const;
+     bool drainDeferredReplies();
+-- 
+2.50.1.windows.1
+

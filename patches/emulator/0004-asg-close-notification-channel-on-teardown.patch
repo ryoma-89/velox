@@ -1,0 +1,59 @@
+diff --git a/android/android-emu/android/emulation/address_space_graphics.cpp b/android/android-emu/android/emulation/address_space_graphics.cpp
+index eb46b40e..3360d9e5 100644
+--- a/android/android-emu/android/emulation/address_space_graphics.cpp
++++ b/android/android-emu/android/emulation/address_space_graphics.cpp
+@@ -655,7 +655,9 @@ AddressSpaceGraphicsContext::AddressSpaceGraphicsContext(
+ AddressSpaceGraphicsContext::~AddressSpaceGraphicsContext() {
+     if (mCurrentConsumer) {
+         mExiting = 1;
+-        mConsumerMessages.send(ConsumerCommand::Exit);
++        // Closing the channel also wakes a reader. Enqueueing an exit can
++        // block before destroy() has interrupted a renderer writing a reply.
++        mConsumerMessages.stop();
+         mConsumerInterface.destroy(mCurrentConsumer);
+     }
+ 
+@@ -675,9 +677,18 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
+         info->size = mBufferAllocation.size;
+         break;
+     case ASG_SET_VERSION: {
+-        auto guestVersion = (uint32_t)info->size;
+-        info->size = (uint64_t)(mVersion > guestVersion ? guestVersion : mVersion);
+-        mVersion = (uint32_t)info->size;
++        if (mCurrentConsumer) {
++            info->size = mVersion;
++            if (mVirtioGpuInfo) {
++                info->metadata = mCombinedAllocation.hostmemId;
++            }
++            break;
++        }
++
++        if (info->size < mVersion) {
++            mVersion = static_cast<uint32_t>(info->size);
++        }
++        info->size = mVersion;
+ 
+         const AsgConsumerCreateInfo& consumerCreateInfo = {
+             .version = mVersion,
+@@ -708,6 +719,10 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
+         info->metadata = 0;
+         break;
+     case ASG_GET_CONFIG:
++        if (!mCurrentConsumer) {
++            info->metadata = UINT64_MAX;
++            break;
++        }
+         mConsumerInterface.reloadRingConfig(mCurrentConsumer);
+         info->metadata = 0;
+         break;
+@@ -716,7 +731,9 @@ void AddressSpaceGraphicsContext::perform(AddressSpaceDevicePingInfo* info) {
+ 
+ AsgOnUnavailableReadStatus AddressSpaceGraphicsContext::onUnavailableRead() {
+     ConsumerCommand cmd;
+-    mConsumerMessages.receive(&cmd);
++    if (!mConsumerMessages.receive(&cmd)) {
++        return AsgOnUnavailableReadStatus::kExit;
++    }
+     switch (cmd) {
+         case ConsumerCommand::Wakeup:
+             return AsgOnUnavailableReadStatus::kContinue;

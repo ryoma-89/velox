@@ -1,0 +1,123 @@
+From d2ad6f8b81240e9455565cf687da80aad8597156 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 04:18:08 +0900
+Subject: [PATCH 08/12] gfxstream: leave the pool untouched when a batched
+ descriptor allocation fails
+
+Validate the whole batch against a scratch copy of the per-type counts and
+the free reserved IDs, then commit the counts and the set count at once.
+A failed batch returns VK_ERROR_OUT_OF_POOL_MEMORY with every output handle
+set to VK_NULL_HANDLE and leaves the live counts and reserved IDs as they
+were (previously the counts of the sets before the failing one leaked).
+
+Written by Codex, reviewed and committed by Claude Code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Change-Id: I35b7b3a28d1a9424086b1a5586ff186c221d75ea
+
+Generated-by: LLM
+Marker required by the Mesa AGENTS.md for generated prose: biblioklept
+---
+ .../DescriptorSetVirtualization.cpp           | 34 +++++++++----------
+ .../vulkan_enc/DescriptorSetVirtualization.h  |  2 ++
+ 2 files changed, 18 insertions(+), 18 deletions(-)
+
+diff --git a/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.cpp b/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.cpp
+index 910b7e2..27edda7 100644
+--- a/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.cpp
++++ b/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.cpp
+@@ -4,6 +4,8 @@
+  */
+ #include "DescriptorSetVirtualization.h"
+ 
++#include <algorithm>
++
+ #include "Resources.h"
+ #include "util/log.h"
+ 
+@@ -369,27 +371,24 @@ static void freeBindingFeasible(const VkDescriptorSetLayoutBinding& binding,
+     poolState.used -= binding.descriptorCount;
+ }
+ 
+-static VkResult validateDescriptorSetAllocation(const VkDescriptorSetAllocateInfo* pAllocateInfo) {
+-    VkDescriptorPool pool = pAllocateInfo->descriptorPool;
+-    DescriptorPoolAllocationInfo* poolInfo =
+-        gfxstream_vk_descriptor_pool_from_handle(pool)->allocInfo;
+-
++static VkResult stageVirtualDescriptorSetAllocation(const VkDescriptorSetAllocateInfo* pAllocateInfo,
++                                                    DescriptorPoolAllocationInfo& poolInfo) {
+     // Check the number of sets available.
+-    auto setsAvailable = poolInfo->maxSets - poolInfo->usedSets;
++    const uint32_t unusedSets = poolInfo.usedSets <= poolInfo.maxSets ? poolInfo.maxSets - poolInfo.usedSets : 0;
++    const size_t setsAvailable = std::min<size_t>(unusedSets, poolInfo.freePoolIds.size());
+ 
+     if (setsAvailable < pAllocateInfo->descriptorSetCount) {
+         mesa_logd(
+             "%s: Error: VkDescriptorSetAllocateInfo wants %u sets "
+-            "but we only have %u available. "
++            "but we only have %zu available. "
+             "Bailing with VK_ERROR_OUT_OF_POOL_MEMORY.\n",
+             __func__, pAllocateInfo->descriptorSetCount, setsAvailable);
+         return VK_ERROR_OUT_OF_POOL_MEMORY;
+     }
+ 
+-    // Perform simulated allocation and error out with
+-    // VK_ERROR_OUT_OF_POOL_MEMORY if it fails.
+-    std::vector<DescriptorPoolAllocationInfo::DescriptorCountInfo> descriptorCountCopy =
+-        poolInfo->descriptorCountInfo;
++    // Failed batches leave the live counts and reserved IDs untouched.
++    auto& descriptorCountCopy = poolInfo.allocationCountsScratch;
++    descriptorCountCopy = poolInfo.descriptorCountInfo;
+ 
+     for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; ++i) {
+         if (!pAllocateInfo->pSetLayouts[i]) {
+@@ -476,20 +475,17 @@ void fillDescriptorSetInfoForPool(VkDescriptorPool pool, VkDescriptorSetLayout s
+ 
+ VkResult validateAndApplyVirtualDescriptorSetAllocation(
+     const VkDescriptorSetAllocateInfo* pAllocateInfo, VkDescriptorSet* pSets) {
+-    VkResult validateRes = validateDescriptorSetAllocation(pAllocateInfo);
+-
+-    if (validateRes != VK_SUCCESS) return validateRes;
+-
+     VkDescriptorPool pool = pAllocateInfo->descriptorPool;
+     DescriptorPoolAllocationInfo* allocInfo =
+         gfxstream_vk_descriptor_pool_from_handle(pool)->allocInfo;
+ 
+-    if (allocInfo->freePoolIds.size() < pAllocateInfo->descriptorSetCount) {
+-        return VK_ERROR_OUT_OF_POOL_MEMORY;
++    const VkResult validateRes = stageVirtualDescriptorSetAllocation(pAllocateInfo, *allocInfo);
++    if (validateRes != VK_SUCCESS) {
++        std::fill_n(pSets, pAllocateInfo->descriptorSetCount, VK_NULL_HANDLE);
++        return validateRes;
+     }
+ 
+     for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; ++i) {
+-        applyDescriptorSetAllocation(pool, pAllocateInfo->pSetLayouts[i]);
+         uint64_t id = allocInfo->freePoolIds.back();
+         allocInfo->freePoolIds.pop_back();
+ 
+@@ -498,6 +494,8 @@ VkResult validateAndApplyVirtualDescriptorSetAllocation(
+ 
+         fillDescriptorSetInfoForPool(pool, pAllocateInfo->pSetLayouts[i], newSet);
+     }
++    allocInfo->descriptorCountInfo.swap(allocInfo->allocationCountsScratch);
++    allocInfo->usedSets += pAllocateInfo->descriptorSetCount;
+ 
+     return VK_SUCCESS;
+ }
+diff --git a/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h b/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h
+index 6d101c2..f489a3a 100644
+--- a/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h
++++ b/src/gfxstream/guest/vulkan_enc/DescriptorSetVirtualization.h
+@@ -87,6 +87,8 @@ struct DescriptorPoolAllocationInfo {
+         uint32_t used;
+     };
+     std::vector<DescriptorCountInfo> descriptorCountInfo;
++    // Reuse validation storage across externally synchronized allocations from this pool.
++    std::vector<DescriptorCountInfo> allocationCountsScratch;
+ };
+ 
+ struct DescriptorSetLayoutInfo {
+-- 
+2.50.1.windows.1
+

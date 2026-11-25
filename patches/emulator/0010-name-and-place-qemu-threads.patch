@@ -1,0 +1,67 @@
+Velox: name QEMU threads and optionally place vCPU and other QEMU threads (Windows).
+VELOX_VCPU_AFFINITY / VELOX_QEMU_THREAD_AFFINITY are hex masks from the launcher (EfficiencyClass).
+
+diff --git a/util/qemu-thread-win32.c b/util/qemu-thread-win32.c
+index d84c3d71..2a763017 100644
+--- a/util/qemu-thread-win32.c
++++ b/util/qemu-thread-win32.c
+@@ -382,6 +382,51 @@ void *qemu_thread_join(QemuThread *thread)
+     return ret;
+ }
+ 
++/*
++ * Velox: name every QEMU thread (visible to debuggers, ETW and Velox telemetry) and, when the
++ * launcher asks for it, restrict vCPU threads ("CPU n/WHPX") to VELOX_VCPU_AFFINITY and other
++ * QEMU threads (I/O and thread-pool workers) to VELOX_QEMU_THREAD_AFFINITY. Both are hex masks
++ * derived by the launcher from the processors' EfficiencyClass; the bits outside the process
++ * affinity are dropped. Unset means the scheduler places the thread, as before.
++ */
++static void velox_place_thread(HANDLE thread, const char *name)
++{
++    typedef HRESULT (WINAPI *SetDescriptionFn)(HANDLE, PCWSTR);
++    static SetDescriptionFn set_description;
++    static int looked_up;
++    const char *value;
++    char *end = NULL;
++    unsigned long long mask;
++    DWORD_PTR process_mask = 0, system_mask = 0;
++
++    if (!looked_up) {
++        set_description = (SetDescriptionFn)(void *)GetProcAddress(
++            GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
++        looked_up = 1;
++    }
++    if (set_description && name) {
++        wchar_t wide[64];
++        if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64) > 0) {
++            wide[63] = 0;
++            set_description(thread, wide);
++        }
++    }
++    value = getenv(name && strstr(name, "/WHPX") ? "VELOX_VCPU_AFFINITY"
++                                                 : "VELOX_QEMU_THREAD_AFFINITY");
++    if (!value || !*value) {
++        return;
++    }
++    mask = strtoull(value, &end, 16);
++    if (end == value || *end ||
++        !GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
++        return;
++    }
++    mask &= process_mask;
++    if (mask) {
++        SetThreadAffinityMask(thread, (DWORD_PTR)mask);
++    }
++}
++
+ void qemu_thread_create(QemuThread *thread, const char *name,
+                        void *(*start_routine)(void *),
+                        void *arg, int mode)
+@@ -405,6 +450,7 @@ void qemu_thread_create(QemuThread *thread, const char *name,
+     if (!hThread) {
+         error_exit(GetLastError(), __func__);
+     }
++    velox_place_thread(hThread, name);
+     CloseHandle(hThread);
+     thread->data = data;
+ }

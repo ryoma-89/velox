@@ -1,0 +1,1092 @@
+From ac1ba569703a5f5ea8fb2237f453a0d6f309a1dc Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:59:38 +0900
+Subject: [PATCH] velox: vulkan hotpath lock, alloc, and subdecode layout-cache
+ optimization (patch 0031)
+
+---
+ host/vulkan/velox_fence_shared.h          |  19 +-
+ host/vulkan/vk_decoder_global_state.cpp   | 570 +++++++++++++---------
+ host/vulkan/vk_decoder_internal_structs.h |   1 +
+ host/vulkan/vk_sub_decoder.cpp            | 116 ++++-
+ host/vulkan/vulkan_boxed_handles.h        |   5 +-
+ 5 files changed, 469 insertions(+), 242 deletions(-)
+
+diff --git a/host/vulkan/velox_fence_shared.h b/host/vulkan/velox_fence_shared.h
+index 6c1ad5a..2d7cbeb 100644
+--- a/host/vulkan/velox_fence_shared.h
++++ b/host/vulkan/velox_fence_shared.h
+@@ -93,6 +93,7 @@ class VeloxFenceTable {
+     void invalidate() {
+         std::lock_guard<std::mutex> lock(mMutex);
+         if (!mValid) return;
++        mValidAtomic.store(false, std::memory_order_release);
+         auto* header = reinterpret_cast<VeloxFenceTableHeader*>(mBase);
+         __atomic_store_n(&header->magic, 0u, __ATOMIC_RELEASE);
+         mValid = false;
+@@ -109,6 +110,12 @@ class VeloxFenceTable {
+     // Forget |handle| (reset or destroy) so that its old completion is never reused.
+     void clear(uint64_t handle) {
+         if (!handle) return;
++        // Fast check without mMutex: if this slot does not hold |handle|, nothing to clear.
++        // Only the host writes slots, and reset/destroy is externally synchronized with submit.
++        if (mValidAtomic.load(std::memory_order_acquire)) {
++            VeloxFenceSlot* s = slot(handle);
++            if (__atomic_load_n(&s->handle, __ATOMIC_RELAXED) != handle) return;
++        }
+         std::lock_guard<std::mutex> lock(mMutex);
+         if (!mValid) return;
+         VeloxFenceSlot* s = slot(handle);
+@@ -136,6 +143,7 @@ class VeloxFenceTable {
+     std::mutex mMutex;
+     uint8_t* mBase;
+     bool mValid = true;
++    std::atomic<bool> mValidAtomic{true};
+     unsigned long long mPublished = 0;
+ };
+ 
+@@ -243,15 +251,20 @@ class VeloxFenceWatcher {
+     }
+ 
+     // Non-blocking: remove |fence| from mPending so the watcher neither starts waiting on it
+-    // nor publishes a stale completion from an in-flight batch. Safe under global mMutex.
+-    void removePending(VkFence fence) {
++    // nor publishes a stale completion from an in-flight batch. Returns true only if |fence|
++    // is currently in mInWait and requires waitNotInUse(). Safe under global mMutex.
++    bool removePending(VkFence fence) {
+         std::lock_guard<std::mutex> lock(mMutex);
+         for (size_t i = 0; i < mPending.size(); ++i) {
+             if (mPending[i].fence == fence) {
+                 mPending.erase(mPending.begin() + i);
+-                return;
++                break;
+             }
+         }
++        for (VkFence f : mInWait) {
++            if (f == fence) return true;
++        }
++        return false;
+     }
+ 
+     // Waits until no native call on |fence| is in progress. Call outside global mMutex.
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 55db363..041a03e 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -4677,12 +4677,18 @@ class VkDecoderGlobalState::Impl {
+         auto device = unbox_VkDevice(boxed_device);
+         auto vk = dispatch_VkDevice(boxed_device);
+ 
+-        std::vector<VkFence> cleanedFences;
++        constexpr uint32_t kStackFences = 8;
++        VkFence stackCleaned[kStackFences];
++        uint32_t stackCleanedCount = 0;
++        std::vector<VkFence> cleanedFencesVec;
+         std::vector<VkFence> externalFences;
+ 
+         std::vector<DeviceOpWaitable> pendingUses;
+         std::shared_ptr<VeloxFenceWatcher> watcherToWait;
+-        std::vector<VkFence> fencesToCancel;
++        VkFence stackCancel[kStackFences];
++        uint32_t stackCancelCount = 0;
++        std::vector<VkFence> fencesToCancelVec;
++        const bool useStack = fenceCount <= kStackFences;
+ 
+         {
+             std::lock_guard<std::mutex> lock(mMutex);
+@@ -4700,9 +4706,12 @@ class VkDecoderGlobalState::Impl {
+                     continue;
+                 }
+                 FenceInfo& fenceInfo = fenceInfoIt->second;
+-                if (watcherToWait) {
+-                    watcherToWait->removePending(fence);
+-                    fencesToCancel.push_back(fence);
++                if (watcherToWait && watcherToWait->removePending(fence)) {
++                    if (useStack) {
++                        stackCancel[stackCancelCount++] = fence;
++                    } else {
++                        fencesToCancelVec.push_back(fence);
++                    }
+                 }
+                 if (fenceInfo.veloxTable) {
+                     fenceInfo.veloxTable->clear(reinterpret_cast<uint64_t>(fenceInfo.boxed));
+@@ -4720,7 +4729,11 @@ class VkDecoderGlobalState::Impl {
+                     externalFences.push_back(fence);
+                 } else {
+                     // Reset all fences' states to kNotWaitable.
+-                    cleanedFences.push_back(fence);
++                    if (useStack) {
++                        stackCleaned[stackCleanedCount++] = fence;
++                    } else {
++                        cleanedFencesVec.push_back(fence);
++                    }
+                     std::lock_guard<std::mutex> fenceLock(fenceInfo.mutex);
+                     fenceInfo.state = FenceInfo::State::kNotWaitable;
+                 }
+@@ -4729,8 +4742,11 @@ class VkDecoderGlobalState::Impl {
+ 
+         // Wait outside mMutex until the watcher has no native call in flight on these fences.
+         if (watcherToWait) {
+-            for (VkFence f : fencesToCancel) {
+-                watcherToWait->waitNotInUse(f);
++            const uint32_t cancelCount =
++                useStack ? stackCancelCount : static_cast<uint32_t>(fencesToCancelVec.size());
++            const VkFence* cancelPtr = useStack ? stackCancel : fencesToCancelVec.data();
++            for (uint32_t i = 0; i < cancelCount; ++i) {
++                watcherToWait->waitNotInUse(cancelPtr[i]);
+             }
+         }
+ 
+@@ -4767,12 +4783,18 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
+-        if (!cleanedFences.empty()) {
+-            const VkResult res =
+-                vk->vkResetFences(device, (uint32_t)cleanedFences.size(), cleanedFences.data());
++        const uint32_t cleanedCount =
++            useStack ? stackCleanedCount : static_cast<uint32_t>(cleanedFencesVec.size());
++        const VkFence* cleanedPtr = useStack ? stackCleaned : cleanedFencesVec.data();
++        if (cleanedCount > 0) {
++            const VkResult res = vk->vkResetFences(device, cleanedCount, cleanedPtr);
+             if (res != VK_SUCCESS) return res;
+         }
+ 
++        if (externalFences.empty()) {
++            return VK_SUCCESS;
++        }
++
+         // For external fences, we unilaterally put them in the pool to ensure they finish
+         // TODO: should store creation info / pNext chain per fence and re-apply?
+         VkFenceCreateInfo createInfo{
+@@ -5680,41 +5702,70 @@ class VkDecoderGlobalState::Impl {
+                                        const VkWriteDescriptorSet* pDescriptorWrites,
+                                        uint32_t descriptorCopyCount,
+                                        const VkCopyDescriptorSet* pDescriptorCopies) REQUIRES(mMutex) {
++        const bool trackSnapshots = snapshotsEnabled();
++        auto setBoundCb = [](DescriptorSetInfo& dsInfo, DescriptorSetInfo::DescriptorWrite& entry,
++                             std::optional<HandleType> cb) {
++            if (entry.boundColorBuffer.has_value()) {
++                --dsInfo.boundColorBufferCount;
++            }
++            entry.boundColorBuffer = cb;
++            if (entry.boundColorBuffer.has_value()) {
++                ++dsInfo.boundColorBufferCount;
++            }
++        };
+         for (uint32_t writeIdx = 0; writeIdx < descriptorWriteCount; writeIdx++) {
+             const VkWriteDescriptorSet& descriptorWrite = pDescriptorWrites[writeIdx];
++            VkDescriptorType descType = descriptorWrite.descriptorType;
++            // When snapshots are disabled, non-image descriptor types cannot carry a
++            // boundColorBuffer; skip table lookups entirely unless the set currently holds one.
+             auto ite = mDescriptorSetInfo.find(descriptorWrite.dstSet);
+             if (ite == mDescriptorSetInfo.end()) {
+                 continue;
+             }
+             DescriptorSetInfo& descriptorSetInfo = ite->second;
++            if (!trackSnapshots && !isDescriptorTypeImageInfo(descType) &&
++                descriptorSetInfo.boundColorBufferCount == 0) {
++                continue;
++            }
+             auto& table = descriptorSetInfo.allWrites;
+-            VkDescriptorType descType = descriptorWrite.descriptorType;
+             uint32_t dstBinding = descriptorWrite.dstBinding;
+             uint32_t dstArrayElement = descriptorWrite.dstArrayElement;
+             uint32_t descriptorCount = descriptorWrite.descriptorCount;
+ 
+             if (isDescriptorTypeImageInfo(descType)) {
++                const bool hasImage = descriptorTypeContainsImage(descType);
++                const bool hasSampler = descriptorTypeContainsSampler(descType);
++                if (!trackSnapshots && !hasImage && descriptorSetInfo.boundColorBufferCount == 0) {
++                    continue;
++                }
+                 for (uint32_t writeElemIdx = 0; writeElemIdx < descriptorCount;
+                      ++writeElemIdx, ++dstArrayElement) {
+                     auto* entry =
+                         GetDescriptorSetElementEntryWrapping(table, dstBinding, dstArrayElement);
+                     if (entry == nullptr) break;
+-                    entry->imageInfo = descriptorWrite.pImageInfo[writeElemIdx];
+-                    entry->writeType = DescriptorSetInfo::DescriptorWriteType::ImageInfo;
+-                    entry->descriptorType = descType;
++                    if (trackSnapshots) {
++                        entry->imageInfo = descriptorWrite.pImageInfo[writeElemIdx];
++                        entry->writeType = DescriptorSetInfo::DescriptorWriteType::ImageInfo;
++                        entry->descriptorType = descType;
++                    }
+                     entry->alives.clear();
+-                    entry->boundColorBuffer.reset();
+-                    if (descriptorTypeContainsImage(descType)) {
+-                        auto* imageViewInfo =
+-                            gfxstream::base::find(mImageViewInfo, entry->imageInfo.imageView);
++                    setBoundCb(descriptorSetInfo, *entry, std::nullopt);
++                    if (hasImage) {
++                        auto* imageViewInfo = gfxstream::base::find(
++                            mImageViewInfo, descriptorWrite.pImageInfo[writeElemIdx].imageView);
+                         if (imageViewInfo) {
+-                            entry->alives.push_back(imageViewInfo->alive);
+-                            entry->boundColorBuffer = imageViewInfo->boundColorBuffer;
++                            if (trackSnapshots || imageViewInfo->boundColorBuffer.has_value()) {
++                                entry->alives.push_back(imageViewInfo->alive);
++                            }
++                            if (imageViewInfo->boundColorBuffer.has_value()) {
++                                setBoundCb(descriptorSetInfo, *entry,
++                                           imageViewInfo->boundColorBuffer);
++                            }
+                         }
+                     }
+-                    if (descriptorTypeContainsSampler(descType)) {
+-                        auto* samplerInfo =
+-                            gfxstream::base::find(mSamplerInfo, entry->imageInfo.sampler);
++                    if (trackSnapshots && hasSampler) {
++                        auto* samplerInfo = gfxstream::base::find(
++                            mSamplerInfo, descriptorWrite.pImageInfo[writeElemIdx].sampler);
+                         if (samplerInfo) {
+                             entry->alives.push_back(samplerInfo->alive);
+                         }
+@@ -5726,13 +5777,17 @@ class VkDecoderGlobalState::Impl {
+                     auto* entry =
+                         GetDescriptorSetElementEntryWrapping(table, dstBinding, dstArrayElement);
+                     if (entry == nullptr) break;
+-                    entry->bufferInfo = descriptorWrite.pBufferInfo[writeElemIdx];
+-                    entry->writeType = DescriptorSetInfo::DescriptorWriteType::BufferInfo;
+-                    entry->descriptorType = descType;
+-                    entry->alives.clear();
+-                    auto* bufferInfo = gfxstream::base::find(mBufferInfo, entry->bufferInfo.buffer);
+-                    if (bufferInfo) {
+-                        entry->alives.push_back(bufferInfo->alive);
++                    setBoundCb(descriptorSetInfo, *entry, std::nullopt);
++                    if (trackSnapshots) {
++                        entry->bufferInfo = descriptorWrite.pBufferInfo[writeElemIdx];
++                        entry->writeType = DescriptorSetInfo::DescriptorWriteType::BufferInfo;
++                        entry->descriptorType = descType;
++                        entry->alives.clear();
++                        auto* bufferInfo =
++                            gfxstream::base::find(mBufferInfo, entry->bufferInfo.buffer);
++                        if (bufferInfo) {
++                            entry->alives.push_back(bufferInfo->alive);
++                        }
+                     }
+                 }
+             } else if (isDescriptorTypeBufferView(descType)) {
+@@ -5741,11 +5796,12 @@ class VkDecoderGlobalState::Impl {
+                     auto* entry =
+                         GetDescriptorSetElementEntryWrapping(table, dstBinding, dstArrayElement);
+                     if (entry == nullptr) break;
+-                    entry->bufferView = descriptorWrite.pTexelBufferView[writeElemIdx];
+-                    entry->writeType = DescriptorSetInfo::DescriptorWriteType::BufferView;
+-                    entry->descriptorType = descType;
+-                    entry->alives.clear();
+-                    if (snapshotsEnabled()) {
++                    setBoundCb(descriptorSetInfo, *entry, std::nullopt);
++                    if (trackSnapshots) {
++                        entry->bufferView = descriptorWrite.pTexelBufferView[writeElemIdx];
++                        entry->writeType = DescriptorSetInfo::DescriptorWriteType::BufferView;
++                        entry->descriptorType = descType;
++                        entry->alives.clear();
+                         auto* bufferViewInfo =
+                             gfxstream::base::find(mBufferViewInfo, entry->bufferView);
+                         if (bufferViewInfo) {
+@@ -5773,23 +5829,25 @@ class VkDecoderGlobalState::Impl {
+                 uint32_t zero = 0;
+                 auto* entry = GetDescriptorSetElementEntryWrapping(table, dstBinding, zero);
+                 if (entry == nullptr) break;
+-
+-                entry->inlineUniformBlock = *descInlineUniformBlock;
+-                if (entry->inlineUniformBlockBuffer.size() <
+-                    dstArrayElement + descInlineUniformBlock->dataSize) {
+-                    entry->inlineUniformBlockBuffer.resize(dstArrayElement +
+-                                                           descInlineUniformBlock->dataSize);
+-                }
+-                memcpy(entry->inlineUniformBlockBuffer.data() + dstArrayElement,
+-                       descInlineUniformBlock->pData, descInlineUniformBlock->dataSize);
+-                entry->writeType = DescriptorSetInfo::DescriptorWriteType::InlineUniformBlock;
+-                entry->descriptorType = descType;
+-                entry->dstArrayElement = dstArrayElement;
++                setBoundCb(descriptorSetInfo, *entry, std::nullopt);
++                if (trackSnapshots) {
++                    entry->inlineUniformBlock = *descInlineUniformBlock;
++                    if (entry->inlineUniformBlockBuffer.size() <
++                        dstArrayElement + descInlineUniformBlock->dataSize) {
++                        entry->inlineUniformBlockBuffer.resize(dstArrayElement +
++                                                               descInlineUniformBlock->dataSize);
++                    }
++                    memcpy(entry->inlineUniformBlockBuffer.data() + dstArrayElement,
++                           descInlineUniformBlock->pData, descInlineUniformBlock->dataSize);
++                    entry->writeType = DescriptorSetInfo::DescriptorWriteType::InlineUniformBlock;
++                    entry->descriptorType = descType;
++                    entry->dstArrayElement = dstArrayElement;
++                }
+             } else if (isDescriptorTypeAccelerationStructure(descType)) {
+                 // TODO
+                 // Look for pNext inline uniform block or acceleration structure.
+                 // Append new DescriptorWrite entry that holds the buffer
+-                if (snapshotsEnabled()) {
++                if (trackSnapshots) {
+                     GFXSTREAM_ERROR(
+                         "%s: Ignoring Snapshot for emulated write for descriptor type 0x%x\n",
+                         __func__, descType);
+@@ -5809,6 +5867,10 @@ class VkDecoderGlobalState::Impl {
+ 
+             DescriptorSetInfo& srcDescriptorSetInfo = srcIte->second;
+             DescriptorSetInfo& dstDescriptorSetInfo = dstIte->second;
++            if (!trackSnapshots && srcDescriptorSetInfo.boundColorBufferCount == 0 &&
++                dstDescriptorSetInfo.boundColorBufferCount == 0) {
++                continue;
++            }
+ 
+             auto& srcTable = srcDescriptorSetInfo.allWrites;
+             auto& dstTable = dstDescriptorSetInfo.allWrites;
+@@ -5839,6 +5901,7 @@ class VkDecoderGlobalState::Impl {
+                     GetDescriptorSetElementEntryWrapping(dstTable, dstBindingCheck, zero2);
+ 
+                 if (srcEntry && dstEntry) {
++                    setBoundCb(dstDescriptorSetInfo, *dstEntry, std::nullopt);
+                     if (dstEntry->inlineUniformBlockBuffer.size() <
+                         dstArrayElementCheck + descriptorCount) {
+                         dstEntry->inlineUniformBlockBuffer.resize(dstArrayElementCheck +
+@@ -5868,30 +5931,36 @@ class VkDecoderGlobalState::Impl {
+ 
+                 if (srcEntry == nullptr || dstEntry == nullptr) break;
+ 
++                const bool hadCb = dstEntry->boundColorBuffer.has_value();
+                 *dstEntry = *srcEntry;
++                const bool hasCb = dstEntry->boundColorBuffer.has_value();
++                if (hadCb && !hasCb) --dstDescriptorSetInfo.boundColorBufferCount;
++                else if (!hadCb && hasCb) ++dstDescriptorSetInfo.boundColorBufferCount;
+             }
+         }
+         bool needEmulateWriteDescriptor = false;
+-        // c++ seems to allow for 0-size array allocation
+-        std::unique_ptr<bool[]> descriptorWritesNeedDeepCopy(new bool[descriptorWriteCount]);
++        constexpr uint32_t kStackDeepCopy = 32;
++        bool stackDeepCopy[kStackDeepCopy];
++        std::unique_ptr<bool[]> heapDeepCopy;
++        bool* descriptorWritesNeedDeepCopy = stackDeepCopy;
++        if (descriptorWriteCount > kStackDeepCopy) {
++            heapDeepCopy.reset(new bool[descriptorWriteCount]);
++            descriptorWritesNeedDeepCopy = heapDeepCopy.get();
++        }
+         for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+             const VkWriteDescriptorSet& descriptorWrite = pDescriptorWrites[i];
+             descriptorWritesNeedDeepCopy[i] = false;
+-            if (!vk_util::vk_descriptor_type_has_image_view(descriptorWrite.descriptorType)) {
++            if (descriptorWrite.descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                 continue;
+             }
+             for (uint32_t j = 0; j < descriptorWrite.descriptorCount; j++) {
+                 const VkDescriptorImageInfo& imageInfo = descriptorWrite.pImageInfo[j];
+                 const auto* imgViewInfo = gfxstream::base::find(mImageViewInfo, imageInfo.imageView);
+-                if (!imgViewInfo) {
+-                    continue;
+-                }
+-                if (descriptorWrite.descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
++                if (!imgViewInfo || !imgViewInfo->needEmulatedAlpha) {
+                     continue;
+                 }
+                 const auto* samplerInfo = gfxstream::base::find(mSamplerInfo, imageInfo.sampler);
+-                if (samplerInfo && imgViewInfo->needEmulatedAlpha &&
+-                    samplerInfo->needEmulatedAlpha) {
++                if (samplerInfo && samplerInfo->needEmulatedAlpha) {
+                     needEmulateWriteDescriptor = true;
+                     descriptorWritesNeedDeepCopy[i] = true;
+                     break;
+@@ -6951,72 +7020,80 @@ class VkDecoderGlobalState::Impl {
+                                      pImageMemoryBarriers);
+             return;
+         }
+-        std::lock_guard<std::mutex> lock(mMutex);
+-        CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+-        if (!cmdBufferInfo) return;
+-
+-        DeviceInfo* deviceInfo = gfxstream::base::find(mDeviceInfo, cmdBufferInfo->device);
+-        if (!deviceInfo) return;
+-
+-        processImageMemoryBarrierLocked(commandBuffer, imageMemoryBarrierCount,
+-                                        pImageMemoryBarriers);
++        bool needDecompPath = false;
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
++            if (!cmdBufferInfo) return;
++
++            DeviceInfo* deviceInfo = gfxstream::base::find(mDeviceInfo, cmdBufferInfo->device);
++            if (!deviceInfo) return;
++
++            processImageMemoryBarrierLocked(commandBuffer, imageMemoryBarrierCount,
++                                            pImageMemoryBarriers);
++
++            if (deviceInfo->emulateTextureEtc2 || deviceInfo->emulateTextureAstc) {
++                for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
++                    auto* imageInfo = gfxstream::base::find(mImageInfo, pImageMemoryBarriers[i].image);
++                    if (imageInfo && imageInfo->compressInfo &&
++                        (!imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression)) {
++                        needDecompPath = true;
++                        break;
++                    }
++                }
++            }
+ 
+-        if (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc) {
+-            vk->vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
+-                                     memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
+-                                     pBufferMemoryBarriers, imageMemoryBarrierCount,
+-                                     pImageMemoryBarriers);
+-            return;
+-        }
++            if (needDecompPath) {
++                // This is a compressed image. Handle decompression before calling vkCmdPipelineBarrier
++                std::vector<VkImageMemoryBarrier> imageBarriers;
++                imageBarriers.reserve(imageMemoryBarrierCount);
++                bool needRebind = false;
+ 
+-        // This is a compressed image. Handle decompression before calling vkCmdPipelineBarrier
++                for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
++                    const VkImageMemoryBarrier& srcBarrier = pImageMemoryBarriers[i];
++                    auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
+ 
+-        std::vector<VkImageMemoryBarrier> imageBarriers;
+-        bool needRebind = false;
++                    bool needGpuDecompression = false;
++                    if (imageInfo && imageInfo->compressInfo) {
++                        needGpuDecompression =
++                            !imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression;
++                    }
++                    if (!needGpuDecompression) {
++                        imageBarriers.push_back(srcBarrier);
++                        continue;
++                    }
+ 
+-        for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
+-            const VkImageMemoryBarrier& srcBarrier = pImageMemoryBarriers[i];
+-            auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
+-
+-            // If the image doesn't need GPU decompression, nothing to do.
+-            bool needGpuDecompression = false;
+-            if (imageInfo && imageInfo->compressInfo) {
+-                needGpuDecompression =
+-                    !imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression;
+-            }
+-            // If the image doesn't need GPU decompression, nothing to do.
+-            if (!needGpuDecompression) {
+-                imageBarriers.push_back(srcBarrier);
+-                continue;
+-            }
++                    needRebind |= imageInfo->compressInfo->decompressIfNeeded(
++                        vk, commandBuffer, srcStageMask, dstStageMask, srcBarrier, imageBarriers);
++                }
+ 
+-            // Otherwise, decompress the image, if we're going to read from it.
+-            needRebind |= imageInfo->compressInfo->decompressIfNeeded(
+-                vk, commandBuffer, srcStageMask, dstStageMask, srcBarrier, imageBarriers);
+-        }
++                if (needRebind && cmdBufferInfo->computePipeline) {
++                    vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                                          cmdBufferInfo->computePipeline);
++                    if (!cmdBufferInfo->currentDescriptorSets.empty()) {
++                        vk->vkCmdBindDescriptorSets(
++                            commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
++                            cmdBufferInfo->firstSet, cmdBufferInfo->currentDescriptorSets.size(),
++                            cmdBufferInfo->currentDescriptorSets.data(),
++                            cmdBufferInfo->dynamicOffsets.size(), cmdBufferInfo->dynamicOffsets.data());
++                    }
++                }
+ 
+-        if (needRebind && cmdBufferInfo->computePipeline) {
+-            // Recover pipeline bindings
+-            // TODO(gregschlom): instead of doing this here again and again after each image we
+-            // decompress, could we do it once before calling vkCmdDispatch?
+-            vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+-                                  cmdBufferInfo->computePipeline);
+-            if (!cmdBufferInfo->currentDescriptorSets.empty()) {
+-                vk->vkCmdBindDescriptorSets(
+-                    commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
+-                    cmdBufferInfo->firstSet, cmdBufferInfo->currentDescriptorSets.size(),
+-                    cmdBufferInfo->currentDescriptorSets.data(),
+-                    cmdBufferInfo->dynamicOffsets.size(), cmdBufferInfo->dynamicOffsets.data());
++                if (memoryBarrierCount || bufferMemoryBarrierCount || !imageBarriers.empty()) {
++                    vk->vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
++                                             memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
++                                             pBufferMemoryBarriers, imageBarriers.size(),
++                                             imageBarriers.data());
++                }
++                return;
+             }
+         }
+ 
+-        // Apply the remaining barriers
+-        if (memoryBarrierCount || bufferMemoryBarrierCount || !imageBarriers.empty()) {
+-            vk->vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
+-                                     memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
+-                                     pBufferMemoryBarriers, imageBarriers.size(),
+-                                     imageBarriers.data());
+-        }
++        // Fast path: no compressed image needs GPU decompression; dispatch outside mMutex.
++        vk->vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
++                                 memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
++                                 pBufferMemoryBarriers, imageMemoryBarrierCount,
++                                 pImageMemoryBarriers);
+     }
+ 
+     // Conservatively converts synchronization2 stage masks for the legacy decompression path.
+@@ -7113,64 +7190,85 @@ class VkDecoderGlobalState::Impl {
+             pDependencyInfo = &mappedDependencyInfo;
+         }
+ 
+-        std::lock_guard<std::mutex> lock(mMutex);
+-        CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+-        if (!cmdBufferInfo) return;
+-
+-        DeviceInfo* deviceInfo = gfxstream::base::find(mDeviceInfo, cmdBufferInfo->device);
+-        if (!deviceInfo) return;
+-
+-        processImageMemoryBarrierLocked(commandBuffer, pDependencyInfo->imageMemoryBarrierCount,
+-                                        pDependencyInfo->pImageMemoryBarriers);
+-
+-        if (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc) {
++        if (pDependencyInfo->imageMemoryBarrierCount == 0) {
+             dispatchCmdPipelineBarrier2(pDependencyInfo);
+             return;
+         }
+ 
+-        std::vector<VkImageMemoryBarrier2> imageBarriers;
+-        bool needRebind = false;
+-        for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i) {
+-            const VkImageMemoryBarrier2& srcBarrier = pDependencyInfo->pImageMemoryBarriers[i];
+-            auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
+-            bool needGpuDecompression = false;
+-            if (imageInfo && imageInfo->compressInfo) {
+-                needGpuDecompression =
+-                    !imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression;
+-            }
+-            if (!needGpuDecompression) {
+-                imageBarriers.push_back(srcBarrier);
+-                continue;
++        bool needDecompPath = false;
++        {
++            std::lock_guard<std::mutex> lock(mMutex);
++            CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
++            if (!cmdBufferInfo) return;
++
++            DeviceInfo* deviceInfo = gfxstream::base::find(mDeviceInfo, cmdBufferInfo->device);
++            if (!deviceInfo) return;
++
++            processImageMemoryBarrierLocked(commandBuffer, pDependencyInfo->imageMemoryBarrierCount,
++                                            pDependencyInfo->pImageMemoryBarriers);
++
++            if (deviceInfo->emulateTextureEtc2 || deviceInfo->emulateTextureAstc) {
++                for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i) {
++                    auto* imageInfo =
++                        gfxstream::base::find(mImageInfo, pDependencyInfo->pImageMemoryBarriers[i].image);
++                    if (imageInfo && imageInfo->compressInfo &&
++                        (!imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression)) {
++                        needDecompPath = true;
++                        break;
++                    }
++                }
+             }
+ 
+-            const VkImageMemoryBarrier legacyBarrier = toLegacyImageMemoryBarrier(srcBarrier);
+-            std::vector<VkImageMemoryBarrier> legacyOutputBarriers;
+-            needRebind |= imageInfo->compressInfo->decompressIfNeeded(
+-                vk, commandBuffer, toLegacyPipelineStageFlags(srcBarrier.srcStageMask),
+-                toLegacyPipelineStageFlags(srcBarrier.dstStageMask), legacyBarrier,
+-                legacyOutputBarriers);
+-            for (const auto& barrier : legacyOutputBarriers) {
+-                imageBarriers.push_back(toImageMemoryBarrier2(barrier, srcBarrier.srcStageMask,
+-                                                              srcBarrier.dstStageMask));
+-            }
+-        }
++            if (needDecompPath) {
++                std::vector<VkImageMemoryBarrier2> imageBarriers;
++                imageBarriers.reserve(pDependencyInfo->imageMemoryBarrierCount);
++                bool needRebind = false;
++                for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; ++i) {
++                    const VkImageMemoryBarrier2& srcBarrier = pDependencyInfo->pImageMemoryBarriers[i];
++                    auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
++                    bool needGpuDecompression = false;
++                    if (imageInfo && imageInfo->compressInfo) {
++                        needGpuDecompression =
++                            !imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression;
++                    }
++                    if (!needGpuDecompression) {
++                        imageBarriers.push_back(srcBarrier);
++                        continue;
++                    }
++
++                    const VkImageMemoryBarrier legacyBarrier = toLegacyImageMemoryBarrier(srcBarrier);
++                    std::vector<VkImageMemoryBarrier> legacyOutputBarriers;
++                    needRebind |= imageInfo->compressInfo->decompressIfNeeded(
++                        vk, commandBuffer, toLegacyPipelineStageFlags(srcBarrier.srcStageMask),
++                        toLegacyPipelineStageFlags(srcBarrier.dstStageMask), legacyBarrier,
++                        legacyOutputBarriers);
++                    for (const auto& barrier : legacyOutputBarriers) {
++                        imageBarriers.push_back(toImageMemoryBarrier2(barrier, srcBarrier.srcStageMask,
++                                                                      srcBarrier.dstStageMask));
++                    }
++                }
+ 
+-        if (needRebind && cmdBufferInfo->computePipeline) {
+-            vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+-                                  cmdBufferInfo->computePipeline);
+-            if (!cmdBufferInfo->currentDescriptorSets.empty()) {
+-                vk->vkCmdBindDescriptorSets(
+-                    commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
+-                    cmdBufferInfo->firstSet, cmdBufferInfo->currentDescriptorSets.size(),
+-                    cmdBufferInfo->currentDescriptorSets.data(),
+-                    cmdBufferInfo->dynamicOffsets.size(), cmdBufferInfo->dynamicOffsets.data());
++                if (needRebind && cmdBufferInfo->computePipeline) {
++                    vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
++                                          cmdBufferInfo->computePipeline);
++                    if (!cmdBufferInfo->currentDescriptorSets.empty()) {
++                        vk->vkCmdBindDescriptorSets(
++                            commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
++                            cmdBufferInfo->firstSet, cmdBufferInfo->currentDescriptorSets.size(),
++                            cmdBufferInfo->currentDescriptorSets.data(),
++                            cmdBufferInfo->dynamicOffsets.size(), cmdBufferInfo->dynamicOffsets.data());
++                    }
++                }
++
++                VkDependencyInfo dependencyInfo = *pDependencyInfo;
++                dependencyInfo.imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size());
++                dependencyInfo.pImageMemoryBarriers = imageBarriers.data();
++                dispatchCmdPipelineBarrier2(&dependencyInfo);
++                return;
+             }
+         }
+ 
+-        VkDependencyInfo dependencyInfo = *pDependencyInfo;
+-        dependencyInfo.imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size());
+-        dependencyInfo.pImageMemoryBarriers = imageBarriers.data();
+-        dispatchCmdPipelineBarrier2(&dependencyInfo);
++        dispatchCmdPipelineBarrier2(pDependencyInfo);
+     }
+ 
+     void on_vkCmdWaitEvents(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
+@@ -8480,50 +8578,66 @@ class VkDecoderGlobalState::Impl {
+         auto queue = unbox_VkQueue(boxed_queue);
+         auto vk = dispatch_VkQueue(boxed_queue);
+ 
+-        std::unordered_set<HandleType> acquiredColorBuffers;
+-        std::unordered_set<HandleType> releasedColorBuffers;
++        std::optional<std::unordered_set<HandleType>> acquiredColorBuffers;
++        std::optional<std::unordered_set<HandleType>> releasedColorBuffers;
+         VkDevice device = VK_NULL_HANDLE;
+         std::shared_ptr<std::mutex> queueMutex;
+         std::shared_ptr<PhysicalQueuePendingOps> pendingOps;
+         bool sharedQueue = false;
++        bool anyImageLayouts = false;
+         DeviceOpTrackerPtr deviceOpTracker;
+ 
+         {
+             std::lock_guard<std::mutex> lock(mMutex);
+ 
+-            if (!m_vkEmulation->getFeatures().GuestVulkanOnly.enabled()) {
+-                for (uint32_t i = 0; i < submitCount; i++) {
+-                    for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
+-                        VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
+-                        CommandBufferInfo* cmdBufferInfo =
+-                            gfxstream::base::find(mCommandBufferInfo, cmdBuffer);
+-                        if (!cmdBufferInfo) {
++            const bool checkColorBuffers = !m_vkEmulation->getFeatures().GuestVulkanOnly.enabled();
++            for (uint32_t i = 0; i < submitCount; i++) {
++                for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
++                    VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
++                    CommandBufferInfo* cmdBufferInfo =
++                        gfxstream::base::find(mCommandBufferInfo, cmdBuffer);
++                    if (!cmdBufferInfo) {
++                        continue;
++                    }
++                    if (!cmdBufferInfo->imageLayouts.empty()) {
++                        anyImageLayouts = true;
++                    }
++                    if (!checkColorBuffers) {
++                        continue;
++                    }
++                    for (auto descriptorSet : cmdBufferInfo->allDescriptorSets) {
++                        auto descriptorSetInfo =
++                            gfxstream::base::find(mDescriptorSetInfo, descriptorSet);
++                        if (!descriptorSetInfo || descriptorSetInfo->boundColorBufferCount == 0) {
+                             continue;
+                         }
+-                        for (auto descriptorSet : cmdBufferInfo->allDescriptorSets) {
+-                            auto descriptorSetInfo =
+-                                gfxstream::base::find(mDescriptorSetInfo, descriptorSet);
+-                            if (!descriptorSetInfo) {
+-                                continue;
+-                            }
+-                            for (auto& writes : descriptorSetInfo->allWrites) {
+-                                for (const auto& write : writes) {
+-                                    bool isValid = true;
+-                                    for (const auto& alive : write.alives) {
+-                                        isValid &= !alive.expired();
+-                                    }
+-                                    if (isValid && write.boundColorBuffer.has_value()) {
+-                                        acquiredColorBuffers.insert(write.boundColorBuffer.value());
+-                                    }
++                        for (auto& writes : descriptorSetInfo->allWrites) {
++                            for (const auto& write : writes) {
++                                if (!write.boundColorBuffer.has_value()) {
++                                    continue;
++                                }
++                                bool isValid = true;
++                                for (const auto& alive : write.alives) {
++                                    isValid &= !alive.expired();
++                                }
++                                if (isValid) {
++                                    if (!acquiredColorBuffers) acquiredColorBuffers.emplace();
++                                    acquiredColorBuffers->insert(write.boundColorBuffer.value());
+                                 }
+                             }
+                         }
++                    }
+ 
+-                        acquiredColorBuffers.merge(cmdBufferInfo->acquiredColorBuffers);
+-                        releasedColorBuffers.merge(cmdBufferInfo->releasedColorBuffers);
+-                        for (const auto& ite : cmdBufferInfo->cbLayouts) {
+-                            m_vkEmulation->setColorBufferCurrentLayout(ite.first, ite.second);
+-                        }
++                    if (!cmdBufferInfo->acquiredColorBuffers.empty()) {
++                        if (!acquiredColorBuffers) acquiredColorBuffers.emplace();
++                        acquiredColorBuffers->merge(cmdBufferInfo->acquiredColorBuffers);
++                    }
++                    if (!cmdBufferInfo->releasedColorBuffers.empty()) {
++                        if (!releasedColorBuffers) releasedColorBuffers.emplace();
++                        releasedColorBuffers->merge(cmdBufferInfo->releasedColorBuffers);
++                    }
++                    for (const auto& ite : cmdBufferInfo->cbLayouts) {
++                        m_vkEmulation->setColorBufferCurrentLayout(ite.first, ite.second);
+                     }
+                 }
+             }
+@@ -8565,8 +8679,10 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
+-        for (HandleType cb : acquiredColorBuffers) {
+-            m_vkEmulation->getGlobalState()->invalidateColorBuffer(cb);
++        if (acquiredColorBuffers) {
++            for (HandleType cb : *acquiredColorBuffers) {
++                m_vkEmulation->getGlobalState()->invalidateColorBuffer(cb);
++            }
+         }
+ 
+         if (m_vkEmulation->getFeatures().VulkanDisableCoherentMemoryAndEmulate.enabled()) {
+@@ -8685,7 +8801,8 @@ class VkDecoderGlobalState::Impl {
+             queueCompletedWaitable = builder->OnQueueSubmittedWithFence(usedFence);
+         }
+ 
+-        {
++        if (fence != VK_NULL_HANDLE || anyImageLayouts ||
++            (hasAnySemaphore && queueCompletedWaitable)) {
+             std::lock_guard<std::mutex> lock(mMutex);
+             auto* fenceInfo =
+                 (fence != VK_NULL_HANDLE) ? gfxstream::base::find(mFenceInfo, fence) : nullptr;
+@@ -8704,20 +8821,22 @@ class VkDecoderGlobalState::Impl {
+                               fenceInfo->veloxEpoch, fenceInfo->veloxTable});
+             }
+             // Update image layouts
+-            for (uint32_t i = 0; i < submitCount; i++) {
+-                for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
+-                    VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
+-                    CommandBufferInfo* cmdBufferInfo =
+-                        gfxstream::base::find(mCommandBufferInfo, cmdBuffer);
+-                    if (!cmdBufferInfo || cmdBufferInfo->imageLayouts.empty()) {
+-                        continue;
+-                    }
+-                    for (const auto& ite : cmdBufferInfo->imageLayouts) {
+-                        auto imageIte = mImageInfo.find(ite.first);
+-                        if (imageIte == mImageInfo.end()) {
++            if (anyImageLayouts) {
++                for (uint32_t i = 0; i < submitCount; i++) {
++                    for (int j = 0; j < getCommandBufferCount(pSubmits[i]); j++) {
++                        VkCommandBuffer cmdBuffer = getCommandBuffer(pSubmits[i], j);
++                        CommandBufferInfo* cmdBufferInfo =
++                            gfxstream::base::find(mCommandBufferInfo, cmdBuffer);
++                        if (!cmdBufferInfo || cmdBufferInfo->imageLayouts.empty()) {
+                             continue;
+                         }
+-                        imageIte->second.layout = ite.second;
++                        for (const auto& ite : cmdBufferInfo->imageLayouts) {
++                            auto imageIte = mImageInfo.find(ite.first);
++                            if (imageIte == mImageInfo.end()) {
++                                continue;
++                            }
++                            imageIte->second.layout = ite.second;
++                        }
+                     }
+                 }
+             }
+@@ -8763,7 +8882,7 @@ class VkDecoderGlobalState::Impl {
+             }
+         }
+ 
+-        if (!releasedColorBuffers.empty()) {
++        if (releasedColorBuffers && !releasedColorBuffers->empty()) {
+             // Presentation images are not expected to use timeline semaphores. In case of this
+             // warning when the virtual queue is active, special handling will be required to
+             // finish the after-dispatch operations. vkWaitForFences is skipped, as it can deadlock.
+@@ -8775,7 +8894,7 @@ class VkDecoderGlobalState::Impl {
+                     GFXSTREAM_ERROR("Cannot sync colorbuffers, vkWaitForFences failed: %s [%d]",
+                                     string_VkResult(result), result);
+                 } else {
+-                    for (HandleType cb : releasedColorBuffers) {
++                    for (HandleType cb : *releasedColorBuffers) {
+                         m_vkEmulation->getGlobalState()->flushColorBuffer(cb);
+                     }
+                 }
+@@ -9587,18 +9706,27 @@ class VkDecoderGlobalState::Impl {
+                                     descriptorSetCount, pDescriptorSets, dynamicOffsetCount,
+                                     pDynamicOffsets);
+         if (descriptorSetCount) {
+-            std::lock_guard<std::mutex> lock(mMutex);
+-            auto* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+-            if (cmdBufferInfo) {
+-                cmdBufferInfo->descriptorLayout = layout;
+-
+-                cmdBufferInfo->allDescriptorSets.insert(pDescriptorSets,
+-                                                        pDescriptorSets + descriptorSetCount);
+-                cmdBufferInfo->firstSet = firstSet;
+-                cmdBufferInfo->currentDescriptorSets.assign(pDescriptorSets,
+-                                                            pDescriptorSets + descriptorSetCount);
+-                cmdBufferInfo->dynamicOffsets.assign(pDynamicOffsets,
+-                                                     pDynamicOffsets + dynamicOffsetCount);
++            const bool trackComputeRebind =
++                (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE);
++            const bool trackColorBuffers =
++                !m_vkEmulation->getFeatures().GuestVulkanOnly.enabled();
++            if (trackComputeRebind || trackColorBuffers) {
++                std::lock_guard<std::mutex> lock(mMutex);
++                auto* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
++                if (cmdBufferInfo) {
++                    if (trackColorBuffers) {
++                        cmdBufferInfo->allDescriptorSets.insert(
++                            pDescriptorSets, pDescriptorSets + descriptorSetCount);
++                    }
++                    if (trackComputeRebind) {
++                        cmdBufferInfo->descriptorLayout = layout;
++                        cmdBufferInfo->firstSet = firstSet;
++                        cmdBufferInfo->currentDescriptorSets.assign(
++                            pDescriptorSets, pDescriptorSets + descriptorSetCount);
++                        cmdBufferInfo->dynamicOffsets.assign(
++                            pDynamicOffsets, pDynamicOffsets + dynamicOffsetCount);
++                    }
++                }
+             }
+         }
+     }
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 324ad87..fffb93a 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -580,6 +580,7 @@ struct DescriptorSetInfo {
+     VkDevice device;
+     VkDescriptorPool pool;
+     VkDescriptorSetLayout unboxedLayout = 0;
++    uint32_t boundColorBufferCount = 0;
+     std::vector<std::vector<DescriptorWrite>> allWrites;
+     std::vector<VkDescriptorSetLayoutBinding> bindings;
+ };
+diff --git a/host/vulkan/vk_sub_decoder.cpp b/host/vulkan/vk_sub_decoder.cpp
+index b586def..ca82a18 100644
+--- a/host/vulkan/vk_sub_decoder.cpp
++++ b/host/vulkan/vk_sub_decoder.cpp
+@@ -41,6 +41,63 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+     unsigned char* ptr = (unsigned char*)pSubDecodeData;
+     const unsigned char* const end = (const unsigned char*)buf + subDecodeDataSize;
+     VkDecoderGlobalState* globalstate = VkDecoderGlobalState::get();
++    const bool veloxTrackColorBufferSets =
++        !this->m_vkEmulation->getFeatures().GuestVulkanOnly.enabled();
++    constexpr uint32_t kVeloxLocalSetsCap = 32;
++    VkDescriptorSet veloxLocalSets[kVeloxLocalSetsCap];
++    uint32_t veloxLocalSetsCount = 0;
++    std::vector<VkDescriptorSet> veloxLocalSetsOverflow;
++    VkDescriptorSet veloxLastSet = VK_NULL_HANDLE;
++    uint64_t veloxLastBoxedLayout = 0;
++    VkPipelineLayout veloxLastUnboxedLayout = VK_NULL_HANDLE;
++    const bool veloxSnapEnabled = snapshotsEnabled();
++    auto veloxRecordLocalSets = [&](uint32_t setCount, const VkDescriptorSet* sets) {
++        if (!veloxTrackColorBufferSets) return;
++        for (uint32_t k = 0; k < setCount; ++k) {
++            VkDescriptorSet ds = sets[k];
++            if (ds == VK_NULL_HANDLE || ds == veloxLastSet) continue;
++            veloxLastSet = ds;
++            bool dup = false;
++            for (uint32_t m = 0; m < veloxLocalSetsCount; ++m) {
++                if (veloxLocalSets[m] == ds) {
++                    dup = true;
++                    break;
++                }
++            }
++            if (dup) continue;
++            if (veloxLocalSetsCount < kVeloxLocalSetsCap) {
++                veloxLocalSets[veloxLocalSetsCount++] = ds;
++            } else {
++                veloxLocalSetsOverflow.push_back(ds);
++            }
++        }
++    };
++    auto veloxClearLocalSets = [&]() {
++        veloxLocalSetsCount = 0;
++        veloxLocalSetsOverflow.clear();
++        veloxLastSet = VK_NULL_HANDLE;
++    };
++    auto veloxFlushLocalSets = [&]() {
++        if (veloxLocalSetsCount == 0 && veloxLocalSetsOverflow.empty()) return;
++        std::lock_guard<std::mutex> lock(this->mMutex);
++        auto* cmdBufferInfo =
++            gfxstream::base::find(this->mCommandBufferInfo, (VkCommandBuffer)dispatchHandle);
++        if (cmdBufferInfo) {
++            if (veloxLocalSetsCount > 0) {
++                cmdBufferInfo->allDescriptorSets.insert(
++                    veloxLocalSets, veloxLocalSets + veloxLocalSetsCount);
++            }
++            if (!veloxLocalSetsOverflow.empty()) {
++                cmdBufferInfo->allDescriptorSets.insert(
++                    veloxLocalSetsOverflow.begin(), veloxLocalSetsOverflow.end());
++            }
++        }
++        veloxClearLocalSets();
++    };
++    struct VeloxLocalSetsGuard {
++        decltype(veloxFlushLocalSets)& fn;
++        ~VeloxLocalSetsGuard() { fn(); }
++    } veloxLocalSetsGuard{veloxFlushLocalSets};
+     while (end - ptr >= 8) {
+         uint32_t opcode;
+         uint32_t packetLen;
+@@ -75,6 +132,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 }
+                 VkResult vkBeginCommandBuffer_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+                 if (CC_LIKELY(vk)) {
++                    veloxClearLocalSets();
+                     vkBeginCommandBuffer_VkResult_return = this->on_vkBeginCommandBuffer(
+                         pool, snapshotApiCallHandle, (VkCommandBuffer)(boxed_dispatchHandle),
+                         pBeginInfo, context);
+@@ -116,6 +174,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 *readStreamPtrPtr += sizeof(VkCommandBufferResetFlags);
+                 VkResult vkResetCommandBuffer_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+                 if (CC_LIKELY(vk)) {
++                    veloxClearLocalSets();
+                     vkResetCommandBuffer_VkResult_return = this->on_vkResetCommandBuffer(
+                         pool, snapshotApiCallHandle, (VkCommandBuffer)(boxed_dispatchHandle),
+                         flags);
+@@ -728,10 +787,20 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                     *readStreamPtrPtr += dynamicOffsetCount * sizeof(const uint32_t);
+                 }
+                 if (CC_LIKELY(vk)) {
+-                    this->on_vkCmdBindDescriptorSets(
+-                        pool, snapshotApiCallHandle, (VkCommandBuffer)(boxed_dispatchHandle),
+-                        pipelineBindPoint, layout, firstSet, descriptorSetCount, pDescriptorSets,
+-                        dynamicOffsetCount, pDynamicOffsets);
++                    if (pipelineBindPoint != VK_PIPELINE_BIND_POINT_COMPUTE) {
++                        vk->vkCmdBindDescriptorSets((VkCommandBuffer)dispatchHandle,
++                                                    pipelineBindPoint, layout, firstSet,
++                                                    descriptorSetCount, pDescriptorSets,
++                                                    dynamicOffsetCount, pDynamicOffsets);
++                        if (descriptorSetCount) {
++                            veloxRecordLocalSets(descriptorSetCount, pDescriptorSets);
++                        }
++                    } else {
++                        this->on_vkCmdBindDescriptorSets(
++                            pool, snapshotApiCallHandle, (VkCommandBuffer)(boxed_dispatchHandle),
++                            pipelineBindPoint, layout, firstSet, descriptorSetCount, pDescriptorSets,
++                            dynamicOffsetCount, pDynamicOffsets);
++                    }
+                 }
+                 if (snapshotsEnabled()) {
+                     this->snapshot()->vkCmdBindDescriptorSets(
+@@ -1015,27 +1084,38 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                 memcpy((uint32_t*)&size, *readStreamPtrPtr, sizeof(uint32_t));
+                 *readStreamPtrPtr += sizeof(uint32_t);
+                 if (CC_UNLIKELY(size != packetLen - kHeaderSize || !size || (size | offset) % 4 ||
+-                                offset >= maxPushConstantsSize || size > maxPushConstantsSize - offset ||
+-                                BoxedHandleManager::Store::EM::getHandleType(cgen_var_0) !=
+-                                    Tag_VkPipelineLayout)) {
++                                offset >= maxPushConstantsSize || size > maxPushConstantsSize - offset)) {
+                     return ptr - buf;
+                 }
+-                layout = try_unbox_VkPipelineLayout((VkPipelineLayout)cgen_var_0);
+-                if (CC_UNLIKELY(!layout)) return ptr - buf;
+-                if (size <= sizeof(stack_pValues)) {
+-                    pValues = (void*)stack_pValues;
++                if (CC_LIKELY(cgen_var_0 == veloxLastBoxedLayout && veloxLastUnboxedLayout)) {
++                    layout = veloxLastUnboxedLayout;
+                 } else {
+-                    readStream->alloc((void**)&pValues, size * sizeof(const uint8_t));
+-                }
+-                if (size > 0) {
++                    if (CC_UNLIKELY(BoxedHandleManager::Store::EM::getHandleType(cgen_var_0) !=
++                                    Tag_VkPipelineLayout)) {
++                        return ptr - buf;
++                    }
++                    layout = try_unbox_VkPipelineLayout((VkPipelineLayout)cgen_var_0);
++                    if (CC_UNLIKELY(!layout)) return ptr - buf;
++                    veloxLastBoxedLayout = cgen_var_0;
++                    veloxLastUnboxedLayout = layout;
++                }
++                if ((reinterpret_cast<uintptr_t>(*readStreamPtrPtr) & 3u) == 0) {
++                    pValues = *readStreamPtrPtr;
++                    *readStreamPtrPtr += size;
++                } else {
++                    if (size <= sizeof(stack_pValues)) {
++                        pValues = (void*)stack_pValues;
++                    } else {
++                        readStream->alloc((void**)&pValues, size * sizeof(const uint8_t));
++                    }
+                     memcpy((void*)pValues, *readStreamPtrPtr, size * sizeof(const uint8_t));
+-                    *readStreamPtrPtr += size * sizeof(const uint8_t);
++                    *readStreamPtrPtr += size;
+                 }
+                 if (CC_LIKELY(vk)) {
+                     vk->vkCmdPushConstants((VkCommandBuffer)dispatchHandle, layout, stageFlags,
+                                            offset, size, pValues);
+                 }
+-                if (snapshotsEnabled()) {
++                if (CC_UNLIKELY(veloxSnapEnabled)) {
+                     this->snapshot()->vkCmdPushConstants(pool, snapshotApiCallHandle, nullptr, 0,
+                                                          (VkCommandBuffer)(boxed_dispatchHandle),
+                                                          layout, stageFlags, offset, size, pValues);
+@@ -1340,7 +1420,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+                     vk->vkCmdDraw((VkCommandBuffer)dispatchHandle, vertexCount, instanceCount,
+                                   firstVertex, firstInstance);
+                 }
+-                if (snapshotsEnabled()) {
++                if (CC_UNLIKELY(veloxSnapEnabled)) {
+                     this->snapshot()->vkCmdDraw(pool, snapshotApiCallHandle, nullptr, 0,
+                                                 (VkCommandBuffer)(boxed_dispatchHandle),
+                                                 vertexCount, instanceCount, firstVertex,
+@@ -5192,6 +5272,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+             }
+ #endif
+             default: {
++                veloxFlushLocalSets();
+                 GFXSTREAM_ERROR("Unrecognized subdecode opcode %" PRIu32, opcode);
+                 return ptr - buf;
+             }
+@@ -5202,6 +5283,7 @@ size_t subDecode(VulkanMemReadingStream* readStream, VulkanDispatch* vk,
+         };
+         ptr += packetLen;
+     }
++    veloxFlushLocalSets();
+     pool->freeAll();
+     return ptr - (unsigned char*)buf;
+     ;
+diff --git a/host/vulkan/vulkan_boxed_handles.h b/host/vulkan/vulkan_boxed_handles.h
+index 3c62758..86d20a1 100644
+--- a/host/vulkan/vulkan_boxed_handles.h
++++ b/host/vulkan/vulkan_boxed_handles.h
+@@ -76,7 +76,10 @@ class BoxedHandleManager {
+     // We use 16000 as the max number of live handles to track; we don't
+     // expect the system to go over 16000 total live handles, outside some
+     // dEQP object management tests.
+-    using Store = gfxstream::base::HybridEntityManager<16000, BoxedHandle, BoxedHandleInfo>;
++    // Velox: raise the SeqLock working set from 16,000 to 131,072 so heavy Vulkan/UE5
++    // scenes (AnTuTu 3D, ray tracing, large descriptor pools) never spill into the
++    // mutex-locked fallback map on unbox_*().
++    using Store = gfxstream::base::HybridEntityManager<131072, BoxedHandle, BoxedHandleInfo>;
+ 
+     BoxedHandle add(BoxedHandleInfo item, BoxedHandleTypeTag tag);
+ 
+-- 
+2.50.1.windows.1
+

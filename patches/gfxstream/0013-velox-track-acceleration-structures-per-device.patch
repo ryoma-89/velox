@@ -1,0 +1,256 @@
+From 25f8dd6b738ff2ba117e2a42eda6c11031639ad8 Mon Sep 17 00:00:00 2001
+From: ryoma-89 <ryoma-89@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 19:35:07 +0900
+Subject: [PATCH] velox: manage acceleration structure lifetime per device
+
+Change-Id: I7bdbb510050d714c915c427c1333a21419798a9f
+---
+ host/vulkan/vk_decoder.cpp                | 20 ++----
+ host/vulkan/vk_decoder_global_state.cpp   | 86 +++++++++++++++++------
+ host/vulkan/vk_decoder_global_state.h     |  2 +
+ host/vulkan/vk_decoder_internal_structs.h |  3 +
+ host/vulkan/vulkan_boxed_handles.cpp      |  9 ++-
+ 5 files changed, 83 insertions(+), 37 deletions(-)
+
+diff --git a/host/vulkan/vk_decoder.cpp b/host/vulkan/vk_decoder.cpp
+index 834fd40..aa688db 100644
+--- a/host/vulkan/vk_decoder.cpp
++++ b/host/vulkan/vk_decoder.cpp
+@@ -23441,24 +23441,17 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                 VkDevice device;
+                 VkAccelerationStructureKHR accelerationStructure;
+                 const VkAllocationCallbacks* pAllocator;
+-                // Begin non wrapped dispatchable handle unboxing for device;
++                // Keep both handles boxed until the owner is checked under the state lock.
+                 uint64_t cgen_var_0;
+                 memcpy((uint64_t*)&cgen_var_0, *readStreamPtrPtr, 1 * 8);
+                 *readStreamPtrPtr += 1 * 8;
+                 *(VkDevice*)&device = (VkDevice)(VkDevice)((VkDevice)(*&cgen_var_0));
+-                auto unboxed_device = unbox_VkDevice(device);
+-                auto vk = dispatch_VkDevice(device);
+-                // End manual dispatchable handle unboxing for device;
+-                // Begin manual non dispatchable handle destroy unboxing for accelerationStructure;
+-                VkAccelerationStructureKHR boxed_accelerationStructure_preserve;
+                 uint64_t cgen_var_1;
+                 memcpy((uint64_t*)&cgen_var_1, *readStreamPtrPtr, 1 * 8);
+                 *readStreamPtrPtr += 1 * 8;
+                 *(VkAccelerationStructureKHR*)&accelerationStructure =
+                     (VkAccelerationStructureKHR)(VkAccelerationStructureKHR)((
+                         VkAccelerationStructureKHR)(*&cgen_var_1));
+-                boxed_accelerationStructure_preserve = accelerationStructure;
+-                accelerationStructure = try_unbox_VkAccelerationStructureKHR(accelerationStructure);
+                 // WARNING PTR CHECK
+                 memcpy((VkAllocationCallbacks**)&pAllocator, (*readStreamPtrPtr), 8);
+                 gfxstream::Stream::fromBe64((uint8_t*)&pAllocator);
+@@ -23479,17 +23472,14 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
+                         ioStream, (unsigned long long)device,
+                         (unsigned long long)accelerationStructure, (unsigned long long)pAllocator);
+                 }
+-                if (CC_LIKELY(vk)) {
+-                    vk->vkDestroyAccelerationStructureKHR(unboxed_device, accelerationStructure,
+-                                                          pAllocator);
+-                }
++                const bool destroyed =
++                    m_state->on_vkDestroyAccelerationStructureKHR(device, accelerationStructure);
+                 vkStream->unsetHandleMapping();
+-                if (m_snapshotsEnabled) {
++                if (m_snapshotsEnabled && destroyed) {
+                     m_state->snapshot()->vkDestroyAccelerationStructureKHR(
+                         &m_pool, snapshotApiCallHandle, packet, packetLen, device,
+-                        boxed_accelerationStructure_preserve, pAllocator);
++                        accelerationStructure, pAllocator);
+                 }
+-                delete_VkAccelerationStructureKHR(boxed_accelerationStructure_preserve);
+                 vkReadStream->clearPool();
+                 if (m_queueSubmitWithCommandsEnabled)
+                     seqnoPtr->fetch_add(1, std::memory_order_seq_cst);
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index a75722e..48ad20b 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -35,6 +35,7 @@
+ #include <list>
+ #include <memory>
+ #include <mutex>
++#include <new>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -9206,8 +9207,6 @@ class VkDecoderGlobalState::Impl {
+         gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, VkDevice boxed_device,
+         const VkAccelerationStructureCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks*,
+         VkAccelerationStructureKHR* pAccelerationStructure) {
+-        auto device = unbox_VkDevice(boxed_device);
+-        auto vk = dispatch_VkDevice(boxed_device);
+         *pAccelerationStructure = VK_NULL_HANDLE;
+         if (pCreateInfo->createFlags != 0 || pCreateInfo->deviceAddress != 0) {
+             GFXSTREAM_ERROR("vkCreateAccelerationStructureKHR: unsupported flags 0x%x or capture "
+@@ -9221,28 +9220,60 @@ class VkDecoderGlobalState::Impl {
+                             (unsigned long long)pCreateInfo->offset);
+             return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+-        {
+-            std::lock_guard<std::mutex> lock(mMutex);
+-            auto* bufferInfo = gfxstream::base::find(mBufferInfo, pCreateInfo->buffer);
+-            if (!bufferInfo || bufferInfo->device != device ||
+-                pCreateInfo->offset > bufferInfo->size ||
+-                pCreateInfo->size > bufferInfo->size - pCreateInfo->offset) {
+-                GFXSTREAM_ERROR("vkCreateAccelerationStructureKHR: range [%llu, +%llu) is outside "
+-                                "the buffer",
+-                                (unsigned long long)pCreateInfo->offset,
+-                                (unsigned long long)pCreateInfo->size);
+-                return VK_ERROR_OUT_OF_HOST_MEMORY;
+-            }
++        std::lock_guard<std::mutex> lock(mMutex);
++        const auto device = try_unbox_VkDevice(boxed_device);
++        auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
++        if (!deviceInfo || deviceInfo->boxed != boxed_device) {
++            return VK_ERROR_INITIALIZATION_FAILED;
++        }
++        auto* bufferInfo = gfxstream::base::find(mBufferInfo, pCreateInfo->buffer);
++        if (!bufferInfo || bufferInfo->device != device ||
++            pCreateInfo->offset > bufferInfo->size ||
++            pCreateInfo->size > bufferInfo->size - pCreateInfo->offset) {
++            GFXSTREAM_ERROR("vkCreateAccelerationStructureKHR: range [%llu, +%llu) is outside "
++                            "the buffer",
++                            (unsigned long long)pCreateInfo->offset,
++                            (unsigned long long)pCreateInfo->size);
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+-        VkResult result = vk->vkCreateAccelerationStructureKHR(device, pCreateInfo, nullptr,
+-                                                               pAccelerationStructure);
++        auto* vk = dispatch_VkDevice(boxed_device);
++        VkAccelerationStructureKHR host = VK_NULL_HANDLE;
++        VkResult result = vk->vkCreateAccelerationStructureKHR(device, pCreateInfo, nullptr, &host);
+         if (result != VK_SUCCESS) {
+-            *pAccelerationStructure = VK_NULL_HANDLE;
+             return result;
+         }
+-        *pAccelerationStructure =
+-            new_boxed_non_dispatchable_VkAccelerationStructureKHR(*pAccelerationStructure);
+-        return result;
++        VkAccelerationStructureKHR boxed = VK_NULL_HANDLE;
++        try {
++            boxed = new_boxed_non_dispatchable_VkAccelerationStructureKHR(host);
++            deviceInfo->accelerationStructures.emplace(boxed, host);
++        } catch (const std::bad_alloc&) {
++            delete_VkAccelerationStructureKHR(boxed);
++            vk->vkDestroyAccelerationStructureKHR(device, host, nullptr);
++            return VK_ERROR_OUT_OF_HOST_MEMORY;
++        }
++        *pAccelerationStructure = boxed;
++        return VK_SUCCESS;
++    }
++
++    bool on_vkDestroyAccelerationStructureKHR(VkDevice boxed_device,
++                                               VkAccelerationStructureKHR boxed) {
++        if (boxed == VK_NULL_HANDLE) return true;
++
++        std::lock_guard<std::mutex> lock(mMutex);
++        const auto device = try_unbox_VkDevice(boxed_device);
++        auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
++        if (!deviceInfo || deviceInfo->boxed != boxed_device) return false;
++
++        auto& structures = deviceInfo->accelerationStructures;
++        const auto it = structures.find(boxed);
++        if (it == structures.end()) return false;
++
++        // Explicit destruction has Vulkan's usual externally synchronized lifetime contract.
++        auto* vk = dispatch_VkDevice(boxed_device);
++        vk->vkDestroyAccelerationStructureKHR(device, it->second, nullptr);
++        delete_VkAccelerationStructureKHR(boxed);
++        structures.erase(it);
++        return true;
+     }
+ 
+     // Reached only from the sub-decoder (command buffers); the range infos are never transferred
+@@ -11831,7 +11862,8 @@ class VkDecoderGlobalState::Impl {
+             // https://bugs.chromium.org/p/chromium/issues/detail?id=1074600
+             // it's important to idle the device before destroying it!
+             VkResult res = deviceDispatch->vkDeviceWaitIdle(device);
+-            if (res != VK_SUCCESS) {
++            // Vulkan treats device loss like successful completion for object lifetime.
++            if (res != VK_SUCCESS && res != VK_ERROR_DEVICE_LOST) {
+                 // Something went wrong.. Skip destroying the vulkan objects of the device
+                 // to avoid further issues.
+                 GFXSTREAM_ERROR(
+@@ -11860,6 +11892,13 @@ class VkDecoderGlobalState::Impl {
+                 delete_VkEvent(eventInfo.boxed);
+             }
+ 
++            // Retire leaked acceleration structures before destroying their backing buffers.
++            for (const auto& [boxed, host] : deviceInfo.accelerationStructures) {
++                deviceDispatch->vkDestroyAccelerationStructureKHR(device, host, nullptr);
++                delete_VkAccelerationStructureKHR(boxed);
++            }
++            deviceInfo.accelerationStructures.clear();
++
+             LOG_CALLS_VERBOSE("%s: %zu buffers.", __func__, deviceObjects.buffers.size());
+             for (auto& [buffer, bufferInfo] : deviceObjects.buffers) {
+                 destroyBufferWithExclusiveInfo(device, deviceDispatch, buffer, bufferInfo);
+@@ -13537,6 +13576,11 @@ VkResult VkDecoderGlobalState::on_vkCreateAccelerationStructureKHR(
+                                                       pAllocator, pAccelerationStructure);
+ }
+ 
++bool VkDecoderGlobalState::on_vkDestroyAccelerationStructureKHR(
++    VkDevice device, VkAccelerationStructureKHR accelerationStructure) {
++    return mImpl->on_vkDestroyAccelerationStructureKHR(device, accelerationStructure);
++}
++
+ void VkDecoderGlobalState::on_vkCmdBuildAccelerationStructuresFlatGOOGLE(
+     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
+     VkCommandBuffer commandBuffer, uint32_t infoCount,
+diff --git a/host/vulkan/vk_decoder_global_state.h b/host/vulkan/vk_decoder_global_state.h
+index 41c7b73..596f120 100644
+--- a/host/vulkan/vk_decoder_global_state.h
++++ b/host/vulkan/vk_decoder_global_state.h
+@@ -821,6 +821,8 @@ class VkDecoderGlobalState {
+         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+         const VkAccelerationStructureCreateInfoKHR* pCreateInfo,
+         const VkAllocationCallbacks* pAllocator, VkAccelerationStructureKHR* pAccelerationStructure);
++    bool on_vkDestroyAccelerationStructureKHR(VkDevice device,
++                                               VkAccelerationStructureKHR accelerationStructure);
+     void on_vkCmdBuildAccelerationStructuresFlatGOOGLE(
+         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
+         VkCommandBuffer commandBuffer, uint32_t infoCount,
+diff --git a/host/vulkan/vk_decoder_internal_structs.h b/host/vulkan/vk_decoder_internal_structs.h
+index 1e5a920..852bc83 100644
+--- a/host/vulkan/vk_decoder_internal_structs.h
++++ b/host/vulkan/vk_decoder_internal_structs.h
+@@ -219,6 +219,9 @@ struct ExternalFenceInfo {
+ 
+ struct DeviceInfo {
+     std::unordered_map<uint32_t, std::vector<VkQueue>> queues;
++    // Boxed handles are unique even when drivers reuse non-dispatchable handle values.
++    std::unordered_map<VkAccelerationStructureKHR, VkAccelerationStructureKHR>
++        accelerationStructures;
+     std::vector<std::string> enabledExtensionNames;
+     bool emulateTextureEtc2 = false;
+     bool emulateTextureAstc = false;
+diff --git a/host/vulkan/vulkan_boxed_handles.cpp b/host/vulkan/vulkan_boxed_handles.cpp
+index c430cc5..e71b335 100644
+--- a/host/vulkan/vulkan_boxed_handles.cpp
++++ b/host/vulkan/vulkan_boxed_handles.cpp
+@@ -14,6 +14,8 @@
+ 
+ #include "vulkan_boxed_handles.h"
+ 
++#include <new>
++
+ #include "vk_decoder_global_state.h"
+ #include "vk_decoder_internal_structs.h"
+ 
+@@ -58,7 +60,12 @@ BoxedHandle BoxedHandleManager::add(BoxedHandleInfo item, BoxedHandleTypeTag tag
+     // don't record one that could later be returned for getBoxedFromUnboxed(0).
+     if (underlying) {
+         std::lock_guard<std::mutex> lock(mMutex);
+-        mReverseMap[underlying] = handle;
++        try {
++            mReverseMap[underlying] = handle;
++        } catch (const std::bad_alloc&) {
++            mStore.remove(handle);
++            throw;
++        }
+     }
+     return handle;
+ }

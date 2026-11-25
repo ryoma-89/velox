@@ -1,0 +1,107 @@
+diff --git a/target/i386/whpx-all.c b/target/i386/whpx-all.c
+index 493b5eb4..1277b1a6 100644
+--- a/target/i386/whpx-all.c
++++ b/target/i386/whpx-all.c
+@@ -166,6 +166,13 @@ struct whpx_vcpu {
+     uint64_t tpr;
+     uint64_t apic_base;
+     bool interruption_pending;
++    /*
++     * Velox: write the TSC only after a reset, init or loadvm. Writing back the value read by
++     * whpx_get_registers() on every register sync loses the time between the read and the
++     * write, so each vCPU's TSC drifts and the guest cannot use the TSC clocksource. Upstream
++     * QEMU fixed this in "WHPX: TSC get and set should be dependent on VM state" (2020).
++     */
++    bool set_tsc;
+ 
+     /* Must be the last field as it may have a tail */
+     WHV_RUN_VP_EXIT_CONTEXT exit_ctx;
+@@ -174,6 +181,9 @@ struct whpx_vcpu {
+ static bool whpx_allowed;
+ static bool whp_dispatch_initialized = false;
+ static HMODULE hWinHvPlatform, hWinHvEmulation;
++/* Optional (Windows 10 1903+): keeps the TSC of all vCPUs in step while it is being set. */
++typedef HRESULT (WINAPI *whpx_suspend_partition_time_t)(WHV_PARTITION_HANDLE Partition);
++static whpx_suspend_partition_time_t whpx_suspend_partition_time;
+ static WHV_PROCESSOR_XSAVE_FEATURES whpx_xsave_cap;
+ 
+ struct whpx_state whpx_global;
+@@ -428,11 +438,40 @@ static void whpx_set_registers(CPUState *cpu)
+ 
+     assert(idx == RTL_NUMBER_OF(whpx_register_names));
+ 
+-    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+-        whpx->partition, cpu->cpu_index,
+-        whpx_register_names,
+-        RTL_NUMBER_OF(whpx_register_names),
+-        &vcxt.values[0]);
++    if (vcpu->set_tsc) {
++        /*
++         * Suspend partition time before setting the TSC so that the vCPUs set one after
++         * another get the same TSC. The partition resumes when the first vCPU runs again.
++         */
++        if (whpx_suspend_partition_time) {
++            HRESULT shr = whpx_suspend_partition_time(whpx->partition);
++            if (FAILED(shr)) {
++                warn_report("WHPX: Failed to suspend partition time, hr=%08lx", shr);
++            }
++        }
++        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
++            whpx->partition, cpu->cpu_index,
++            whpx_register_names,
++            RTL_NUMBER_OF(whpx_register_names),
++            &vcxt.values[0]);
++        vcpu->set_tsc = false;
++    } else {
++        /* Everything except the TSC, which keeps running in the hypervisor. */
++        int tsc_idx = 0;
++        while (whpx_register_names[tsc_idx] != WHvX64RegisterTsc) {
++            tsc_idx++;
++        }
++        hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
++            whpx->partition, cpu->cpu_index,
++            whpx_register_names, tsc_idx, &vcxt.values[0]);
++        if (SUCCEEDED(hr)) {
++            hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
++                whpx->partition, cpu->cpu_index,
++                whpx_register_names + tsc_idx + 1,
++                RTL_NUMBER_OF(whpx_register_names) - tsc_idx - 1,
++                &vcxt.values[tsc_idx + 1]);
++        }
++    }
+ 
+     if (FAILED(hr)) {
+         error_report("WHPX: Failed to set virtual processor context, hr=%08lx",
+@@ -1258,6 +1297,7 @@ static void do_whpx_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
+ static void do_whpx_cpu_synchronize_post_reset(CPUState *cpu,
+                                                run_on_cpu_data arg)
+ {
++    get_whpx_vcpu(cpu)->set_tsc = true;
+     whpx_set_registers(cpu);
+     cpu->vcpu_dirty = false;
+ }
+@@ -1265,6 +1305,7 @@ static void do_whpx_cpu_synchronize_post_reset(CPUState *cpu,
+ static void do_whpx_cpu_synchronize_post_init(CPUState *cpu,
+                                               run_on_cpu_data arg)
+ {
++    get_whpx_vcpu(cpu)->set_tsc = true;
+     whpx_set_registers(cpu);
+     cpu->vcpu_dirty = false;
+ }
+@@ -1272,6 +1313,7 @@ static void do_whpx_cpu_synchronize_post_init(CPUState *cpu,
+ static void do_whpx_cpu_synchronize_pre_loadvm(CPUState *cpu,
+                                                run_on_cpu_data arg)
+ {
++    get_whpx_vcpu(cpu)->set_tsc = true;
+     cpu->vcpu_dirty = true;
+ }
+ 
+@@ -1957,6 +1999,8 @@ bool init_whp_dispatch() {
+     }
+     hLib = hWinHvPlatform;
+     LIST_WINHVPLATFORM_FUNCTIONS(WHP_LOAD_FIELD)
++    whpx_suspend_partition_time = (whpx_suspend_partition_time_t)GetProcAddress(
++        hWinHvPlatform, "WHvSuspendPartitionTime");
+ 
+     lib_name = "WinHvEmulation.dll";
+     HMODULE hWinHvEmulation = LoadLibrary(lib_name);

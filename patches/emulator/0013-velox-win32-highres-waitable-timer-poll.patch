@@ -1,0 +1,72 @@
+diff --git a/util/qemu-timer.c b/util/qemu-timer.c
+index fbbca471..3a41fa40 100644
+--- a/util/qemu-timer.c
++++ b/util/qemu-timer.c
+@@ -43,6 +43,22 @@
+ #include <sys/prctl.h>
+ #endif
+ 
++#if defined(_WIN32) && !defined(CONFIG_PPOLL)
++#include <windows.h>
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++static int velox_highres_poll_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char *v = getenv("VELOX_HIGHRES_POLL");
++        enabled = (v && v[0] == '1') ? 1 : 0;
++    }
++    return enabled;
++}
++#endif
++
+ /***********************************************************/
+ /* timers */
+ 
+@@ -336,6 +352,44 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
+     }
+ #else
++#ifdef _WIN32
++    if (timeout > 0 && timeout < 60LL * 1000000000LL &&
++        nfds < MAXIMUM_WAIT_OBJECTS - 1 && velox_highres_poll_enabled()) {
++        static __declspec(thread) HANDLE tl_timer = NULL;
++        static __declspec(thread) int tl_timer_init = 0;
++        if (!tl_timer_init) {
++            tl_timer_init = 1;
++            tl_timer = CreateWaitableTimerExW(
++                NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++        }
++        if (tl_timer) {
++            int64_t ticks = (timeout + 99) / 100;
++            if (ticks < 1) {
++                ticks = 1;
++            }
++            LARGE_INTEGER due;
++            due.QuadPart = -ticks;
++            if (SetWaitableTimer(tl_timer, &due, 0, NULL, NULL, FALSE)) {
++                GPollFD local_fds[MAXIMUM_WAIT_OBJECTS];
++                if (nfds > 0) {
++                    memcpy(local_fds, fds, nfds * sizeof(GPollFD));
++                }
++                local_fds[nfds].fd = (gintptr)tl_timer;
++                local_fds[nfds].events = G_IO_IN;
++                local_fds[nfds].revents = 0;
++                int ret = g_poll(local_fds, nfds + 1, -1);
++                CancelWaitableTimer(tl_timer);
++                if (nfds > 0) {
++                    memcpy(fds, local_fds, nfds * sizeof(GPollFD));
++                }
++                if (ret > 0 && local_fds[nfds].revents) {
++                    ret--;
++                }
++                return ret;
++            }
++        }
++    }
++#endif
+     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+ #endif
+ }
