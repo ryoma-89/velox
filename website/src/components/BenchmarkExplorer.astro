@@ -1,0 +1,383 @@
+---
+import { CATEGORY_LABELS, TARGET_LABELS, dataset, publishableRecords } from '../data/benchmarks';
+import type { ComparisonTarget, Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const targets: ComparisonTarget[] = [
+  'official_sdk',
+  'velox_past',
+  'velox_latest',
+  'windows_native',
+  'mumu_player',
+];
+const categories = ['all', 'gpu', 'cpu', 'ram', 'storage', 'arm64', 'frame_time'] as const;
+
+const payload = {
+  locale,
+  targets: TARGET_LABELS,
+  groups: dataset.groups,
+  records: publishableRecords(),
+};
+---
+
+<div class="explorer" id="benchmark-explorer">
+  <div class="explorer-controls panel">
+    <div class="ctrl-group">
+      <div class="ctrl-label">
+        {locale === 'ja' ? '比較対象を選択（複数選択可）' : 'Comparison Targets (multi-select)'}
+      </div>
+      <div class="chip-row" role="group" aria-label={locale === 'ja' ? '比較対象フィルタ' : 'Comparison target filter'}>
+        {targets.map((t) => (
+          <button
+            type="button"
+            class="filter-chip active"
+            data-target-chip={t}
+            aria-pressed="true"
+          >
+            <i class="chip-dot" style={`background:${TARGET_LABELS[t].color};`}></i>
+            <span>{TARGET_LABELS[t][locale]}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+
+    <div class="ctrl-group">
+      <div class="ctrl-label">
+        {locale === 'ja' ? '性能カテゴリ' : 'Performance Category'}
+      </div>
+      <div class="chip-row" role="group" aria-label={locale === 'ja' ? '性能カテゴリフィルタ' : 'Performance category filter'}>
+        {categories.map((cat) => (
+          <button
+            type="button"
+            class={`cat-tab ${cat === 'all' ? 'active' : ''}`}
+            data-cat-tab={cat}
+            aria-pressed={cat === 'all' ? 'true' : 'false'}
+          >
+            {CATEGORY_LABELS[cat][locale]}
+          </button>
+        ))}
+      </div>
+    </div>
+
+    <div class="explorer-meta-bar">
+      <span id="explorer-count" class="mono" style="color:var(--text-muted);font-size:13px;"></span>
+      <span style="font-size:12.5px;color:var(--text-muted);">
+        {locale === 'ja'
+          ? '※ 選択した比較対象の間で実測データが存在する項目のみ表示します。条件が異なる項目には注記を付け、比較不能な場合は倍率を表示しません。'
+          : '* Only benchmarks with measured data for the selected targets are displayed. Differing conditions are annotated; ratios are omitted when not directly comparable.'}
+      </span>
+    </div>
+  </div>
+
+  <div id="explorer-results" class="explorer-grid" aria-live="polite"></div>
+</div>
+
+<script id="velox-bench-payload" type="application/json" set:html={JSON.stringify(payload)} />
+
+<script is:inline>
+  (function () {
+    const raw = document.getElementById('velox-bench-payload');
+    const container = document.getElementById('explorer-results');
+    const countEl = document.getElementById('explorer-count');
+    if (!raw || !container) return;
+
+    const data = JSON.parse(raw.textContent || '{}');
+    const locale = data.locale || 'ja';
+    const targetsMeta = data.targets || {};
+    const groups = data.groups || [];
+    const records = data.records || [];
+
+    const selectedTargets = new Set(Object.keys(targetsMeta));
+    let selectedCategory = 'all';
+
+    const STAT_MAP = {
+      median: { ja: '中央値', en: 'Median' },
+      mean: { ja: '平均', en: 'Mean' },
+      max: { ja: '最大', en: 'Max' },
+      single: { ja: '単回', en: 'Single' },
+      p50: { ja: 'P50', en: 'P50' },
+      p99: { ja: 'P99', en: 'P99' },
+    };
+
+    function fmtNum(v, unit) {
+      if (v === null || v === undefined) return '—';
+      if (unit === 'pts') return Math.round(v).toLocaleString('en-US');
+      if (Math.abs(v) >= 1000) return v.toLocaleString('en-US', { maximumFractionDigits: 1 });
+      if (Math.abs(v) >= 10) return v.toLocaleString('en-US', { maximumFractionDigits: 2 });
+      return v.toLocaleString('en-US', { maximumFractionDigits: 3 });
+    }
+
+    function esc(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function render() {
+      const filteredGroups = groups.filter((g) => {
+        if (selectedCategory !== 'all' && g.category !== selectedCategory) return false;
+        const recs = records.filter((r) => r.groupId === g.groupId && selectedTargets.has(r.target));
+        return recs.length >= 2;
+      });
+
+      if (countEl) {
+        countEl.textContent =
+          locale === 'ja'
+            ? `表示中の比較グループ: ${filteredGroups.length} 件 / 選択対象: ${selectedTargets.size} 件`
+            : `Showing ${filteredGroups.length} comparable groups / ${selectedTargets.size} selected targets`;
+      }
+
+      if (filteredGroups.length === 0) {
+        container.innerHTML = `<div class="panel" style="grid-column:1/-1;color:var(--text-muted);">${
+          locale === 'ja'
+            ? '選択された比較対象とカテゴリの組み合わせで直接比較可能な実測データがありません。比較対象を 2 つ以上選択するかカテゴリを切り替えてください。'
+            : 'No comparable measured dataset matches the selected targets and category. Select at least two targets or switch categories.'
+        }</div>`;
+        return;
+      }
+
+      container.innerHTML = filteredGroups
+        .map((g) => {
+          const recs = records.filter((r) => r.groupId === g.groupId && selectedTargets.has(r.target));
+          const numericVals = recs.map((r) => r.value).filter((v) => typeof v === 'number' && v > 0);
+          const maxVal = numericVals.length ? Math.max(...numericVals) : 1;
+
+          // Only show direct ratio badge when official_sdk or velox_past AND velox_latest are BOTH present and directlyComparable
+          const latestRec = recs.find((r) => r.target === 'velox_latest' && r.directlyComparable && typeof r.value === 'number' && r.value > 0);
+          const baseRec =
+            recs.find((r) => r.target === 'official_sdk' && r.directlyComparable && typeof r.value === 'number' && r.value > 0) ||
+            recs.find((r) => r.target === 'velox_past' && r.directlyComparable && typeof r.value === 'number' && r.value > 0);
+
+          let ratioBadge = '';
+          if (latestRec && baseRec) {
+            const ratio = g.direction === 'higher' ? latestRec.value / baseRec.value : baseRec.value / latestRec.value;
+            if (isFinite(ratio) && ratio > 1.04) {
+              const baseName = baseRec.target === 'official_sdk'
+                ? (locale === 'ja' ? '公式 SDK 比' : 'vs Official SDK')
+                : (locale === 'ja' ? '過去版比' : 'vs Earlier');
+              ratioBadge = `<span class="badge badge-blue mono">${baseName} ${ratio.toFixed(ratio >= 10 ? 1 : 2)}×</span>`;
+            }
+          }
+
+          const dirLabel =
+            g.direction === 'higher'
+              ? locale === 'ja' ? '高いほど高速' : 'Higher is better'
+              : locale === 'ja' ? '低いほど高速' : 'Lower is better';
+
+          const barsHtml = recs
+            .map((r) => {
+              const tm = targetsMeta[r.target] || { ja: r.target, en: r.target, color: '#3b82f6' };
+              const label = r.configLabel ? `${tm[locale]} — ${r.configLabel[locale]}` : tm[locale];
+              const statTxt = (STAT_MAP[r.statType] && STAT_MAP[r.statType][locale]) || r.statType;
+              const diffBadge = r.conditionDiffNote
+                ? `<span class="badge badge-amber" style="font-size:11px;padding:1px 7px;">${esc(r.conditionDiffNote[locale])}</span>`
+                : '';
+
+              if (r.value === null || r.value === undefined) {
+                return `
+                  <div class="exp-bar-item">
+                    <div class="exp-bar-head">
+                      <span>${esc(label)} ${diffBadge}</span>
+                      <span class="badge badge-slate">${esc((r.statusNote && r.statusNote[locale]) || 'N/A')}</span>
+                    </div>
+                    <div class="bar-meta">${esc(r.conditions[locale])} — <span class="mono">${esc(r.source)}</span></div>
+                  </div>
+                `;
+              }
+
+              const pct = Math.max(2, Math.min(100, (r.value / maxVal) * 100));
+              return `
+                <div class="exp-bar-item">
+                  <div class="exp-bar-head">
+                    <span>${esc(label)} ${diffBadge}</span>
+                    <span class="mono" style="color:#fff;font-weight:600;">${esc(fmtNum(r.value, r.unit))} ${esc(r.unit)}</span>
+                  </div>
+                  <div class="bar-track" style="height:11px;">
+                    <div class="bar-fill" style="width:${pct.toFixed(1)}%;background:${esc(tm.color)};"></div>
+                  </div>
+                  <div class="bar-meta">
+                    ${esc(r.phase)} · n=${esc(r.runs)} (${esc(statTxt)}) · ${esc(r.conditions[locale])} · <span class="mono">${esc(r.source)}</span>
+                  </div>
+                </div>
+              `;
+            })
+            .join('');
+
+          return `
+            <article class="panel exp-card">
+              <div class="exp-card-head">
+                <div>
+                  <h3 style="margin:0 0 4px;font-size:16.5px;">${esc(g.title[locale])}</h3>
+                  <div style="font-size:13px;color:var(--text-muted);">${esc(g.subtitle[locale])}</div>
+                </div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
+                  <span class="badge badge-slate">${esc(dirLabel)} (${esc(g.unit)})</span>
+                  ${ratioBadge}
+                </div>
+              </div>
+              <div class="exp-bars">${barsHtml}</div>
+              <div class="exp-scope">${esc(g.scopeNote[locale])}</div>
+            </article>
+          `;
+        })
+        .join('');
+    }
+
+    document.querySelectorAll('[data-target-chip]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-target-chip');
+        if (!t) return;
+        if (selectedTargets.has(t)) {
+          if (selectedTargets.size <= 1) return;
+          selectedTargets.delete(t);
+          btn.classList.remove('active');
+          btn.setAttribute('aria-pressed', 'false');
+        } else {
+          selectedTargets.add(t);
+          btn.classList.add('active');
+          btn.setAttribute('aria-pressed', 'true');
+        }
+        render();
+      });
+    });
+
+    document.querySelectorAll('[data-cat-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const cat = btn.getAttribute('data-cat-tab');
+        if (!cat) return;
+        selectedCategory = cat;
+        document.querySelectorAll('[data-cat-tab]').forEach((b) => {
+          const active = b.getAttribute('data-cat-tab') === cat;
+          b.classList.toggle('active', active);
+          b.setAttribute('aria-pressed', String(active));
+        });
+        render();
+      });
+    });
+
+    render();
+  })();
+</script>
+
+<style is:global>
+  .explorer-controls {
+    display: grid;
+    gap: 18px;
+    margin-bottom: 24px;
+  }
+  .ctrl-label {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 12px;
+    border-radius: var(--radius-sm);
+    background: #0a101e;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .filter-chip.active {
+    background: rgba(59, 130, 246, 0.14);
+    border-color: var(--accent);
+    color: #ffffff;
+  }
+  .chip-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .cat-tab {
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-muted);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .cat-tab.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #ffffff;
+  }
+  .explorer-meta-bar {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .explorer-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+    min-height: 480px;
+    contain: layout style;
+  }
+  .exp-card {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+  }
+  .exp-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .exp-bars {
+    display: grid;
+    gap: 12px;
+  }
+  .exp-bar-item {
+    display: grid;
+    gap: 5px;
+  }
+  .exp-bar-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 13.5px;
+  }
+  .exp-scope {
+    margin-top: auto;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    font-size: 12.5px;
+    color: var(--text-muted);
+  }
+  @media (max-width: 920px) {
+    .explorer-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

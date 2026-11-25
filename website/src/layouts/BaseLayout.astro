@@ -1,0 +1,224 @@
+---
+import '../styles/global.css';
+import VeloxLogo from '../components/VeloxLogo.astro';
+import {
+  GITHUB_REPO_URL,
+  NAV_ITEMS,
+  assetPath,
+  fullUrl,
+  localizedPath,
+  type RouteSlug,
+} from '../data/i18n';
+import { dataset } from '../data/benchmarks';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+  slug: RouteSlug;
+  title: string;
+  description: string;
+}
+
+const { locale, slug, title, description } = Astro.props;
+const jaHref = localizedPath(slug, 'ja');
+const enHref = localizedPath(slug, 'en');
+const canonical = fullUrl(slug, locale);
+const jaCanonical = fullUrl(slug, 'ja');
+const enCanonical = fullUrl(slug, 'en');
+const skipLabel = locale === 'ja' ? '本文へスキップ' : 'Skip to main content';
+const menuLabel = locale === 'ja' ? 'メニュー' : 'Menu';
+---
+
+<!doctype html>
+<html lang={locale}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/svg+xml" href={assetPath('favicon.svg')} />
+    <link rel="canonical" href={canonical} />
+    <link rel="alternate" hreflang="ja" href={jaCanonical} />
+    <link rel="alternate" hreflang="en" href={enCanonical} />
+    <link rel="alternate" hreflang="x-default" href={jaCanonical} />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Velox" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:locale" content={locale === 'ja' ? 'ja_JP' : 'en_US'} />
+    <meta name="theme-color" content="#070b14" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">{skipLabel}</a>
+    <header class="site-header">
+      <div class="container header-inner">
+        <a class="brand" href={localizedPath('', locale)} aria-label="Velox Home">
+          <VeloxLogo size={30} />
+          <span>VELOX</span>
+          <span class="brand-version">{dataset.latestVersion}</span>
+        </a>
+
+        <nav aria-label={locale === 'ja' ? 'メインナビゲーション' : 'Main Navigation'}>
+          <ul class="nav-links">
+            {NAV_ITEMS.map((item) => {
+              const href = localizedPath(item.slug, locale);
+              const isCurrent = item.slug === slug;
+              return (
+                <li>
+                  <a href={href} aria-current={isCurrent ? 'page' : undefined}>
+                    {item.label[locale]}
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </nav>
+
+        <div class="header-actions">
+          <div class="lang-switch" role="group" aria-label={locale === 'ja' ? '言語切替' : 'Language Switcher'}>
+            <a
+              href={jaHref}
+              class={locale === 'ja' ? 'active' : ''}
+              hreflang="ja"
+              data-lang-choice="ja"
+              aria-current={locale === 'ja' ? 'true' : undefined}
+            >
+              日本語
+            </a>
+            <a
+              href={enHref}
+              class={locale === 'en' ? 'active' : ''}
+              hreflang="en"
+              data-lang-choice="en"
+              aria-current={locale === 'en' ? 'true' : undefined}
+            >
+              English
+            </a>
+          </div>
+
+          <a class="gh-nav-btn" href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12 0.5C5.65 0.5 0.5 5.65 0.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.7-3.88-1.54-3.88-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.56-.29-5.25-1.28-5.25-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.69 5.41-5.26 5.69.41.36.78 1.06.78 2.14 0 1.54-.01 2.79-.01 3.17 0 .31.21.68.8.56A11.51 11.51 0 0 0 23.5 12C23.5 5.65 18.35 0.5 12 0.5Z" />
+            </svg>
+            <span>GitHub</span>
+          </a>
+
+          <button
+            type="button"
+            class="menu-toggle"
+            id="mobile-menu-toggle"
+            aria-expanded="false"
+            aria-controls="mobile-drawer"
+          >
+            {menuLabel}
+          </button>
+        </div>
+      </div>
+
+      <div class="mobile-drawer" id="mobile-drawer">
+        <ul>
+          {NAV_ITEMS.map((item) => {
+            const href = localizedPath(item.slug, locale);
+            const isCurrent = item.slug === slug;
+            return (
+              <li>
+                <a href={href} aria-current={isCurrent ? 'page' : undefined}>
+                  {item.label[locale]}
+                </a>
+              </li>
+            );
+          })}
+          <li>
+            <a href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">
+              GitHub (ryoma-89/velox) ↗
+            </a>
+          </li>
+        </ul>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <slot />
+    </main>
+
+    <footer class="site-footer">
+      <div class="container">
+        <div class="footer-grid">
+          <div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+              <VeloxLogo size={24} />
+              <strong style="color:#fff;letter-spacing:0.04em;">VELOX</strong>
+            </div>
+            <p style="margin:0 0 10px;max-width:420px;">
+              {locale === 'ja'
+                ? 'AOSP、QEMU、WHPX、gfxstream、Mesa を基盤に、Windows 上での Android 実行性能とデスクトップ操作性を追求するオープンソースプロジェクト。'
+                : 'An open-source project built on AOSP, QEMU, WHPX, gfxstream, and Mesa, pushing Android emulation performance and PC desktop usability on Windows.'}
+            </p>
+            <p style="margin:0;font-size:12.5px;color:var(--text-subtle);">
+              {locale === 'ja'
+                ? '広告・トラッキング・外部解析 SDK は一切含まれていません。'
+                : 'Zero ads, zero tracking, zero third-party analytics SDKs.'}
+            </p>
+          </div>
+
+          <div>
+            <h3 style="font-size:14px;margin-bottom:10px;">{locale === 'ja' ? 'サイトマップ' : 'Pages'}</h3>
+            <ul class="footer-links">
+              {NAV_ITEMS.map((item) => (
+                <li>
+                  <a href={localizedPath(item.slug, locale)}>{item.label[locale]}</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          <div>
+            <h3 style="font-size:14px;margin-bottom:10px;">{locale === 'ja' ? 'プロジェクト' : 'Project'}</h3>
+            <ul class="footer-links">
+              <li><a href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">GitHub (ryoma-89/velox)</a></li>
+              <li><a href={`${localizedPath('docs', locale)}#install`}>{locale === 'ja' ? 'ビルド・導入手順' : 'Install & Build'}</a></li>
+              <li><a href={`${localizedPath('docs', locale)}#limitations`}>{locale === 'ja' ? '既知の問題・制約' : 'Known Limitations'}</a></li>
+              <li><a href={`${localizedPath('docs', locale)}#license`}>{locale === 'ja' ? 'ライセンス (Apache-2.0 他)' : 'Licensing (Apache-2.0 + Upstream)'}</a></li>
+              <li><a href={`${localizedPath('docs', locale)}#contributing`}>{locale === 'ja' ? '開発への参加' : 'Contributing'}</a></li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="footer-bottom">
+          <span>
+            Velox {dataset.latestVersion} ({dataset.latestPhase}) — {locale === 'ja' ? 'Velox 独自コード: Apache License 2.0 / 上流パッチは各上流ライセンスに準拠' : 'Velox original code: Apache License 2.0 / Upstream patches follow respective upstream licenses'}
+          </span>
+          <span>
+            {locale === 'ja' ? '最終データ更新' : 'Data updated'}: {dataset.updatedAt}
+          </span>
+        </div>
+      </div>
+    </footer>
+
+    <script is:inline>
+      (function () {
+        const toggle = document.getElementById('mobile-menu-toggle');
+        const drawer = document.getElementById('mobile-drawer');
+        if (toggle && drawer) {
+          toggle.addEventListener('click', () => {
+            const isOpen = drawer.classList.toggle('open');
+            toggle.setAttribute('aria-expanded', String(isOpen));
+          });
+        }
+        // Persist explicit language choice only when the user clicks the toggle.
+        // Never auto-redirect first-time visitors based on browser language.
+        document.querySelectorAll('[data-lang-choice]').forEach((el) => {
+          el.addEventListener('click', () => {
+            const choice = el.getAttribute('data-lang-choice');
+            if (choice) {
+              try {
+                localStorage.setItem('velox_lang', choice);
+              } catch (_) {}
+            }
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>

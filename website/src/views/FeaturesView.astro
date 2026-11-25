@@ -1,0 +1,161 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { assetPath, localizedPath } from '../data/i18n';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+
+const title = ja
+  ? '特徴・PC向けAndroidデスクトップ環境 — Velox'
+  : 'Features & PC Android Desktop Environment — Velox';
+const description = ja
+  ? 'Velox Launcher、RDP/合成マウス入力修正、ゲームモード WASD 1:1 キーマップ、Freeform マルチウィンドウ、Android 12/17 対応、軽量 Windows GUI の実機画面と特徴を紹介。'
+  : 'Explore Velox Launcher, RDP/synthesized mouse input fixes, 1:1 WASD Game Mode, Freeform multi-window, Android 12/17 multi-version support, and the lightweight Windows GUI.';
+---
+
+<BaseLayout locale={locale} slug="features" title={title} description={description}>
+  <section class="page-hero">
+    <div class="container">
+      <div class="eyebrow">{ja ? 'PC デスクトップ体験 & 実用機能' : 'PC Desktop UX & Practical Features'}</div>
+      <h1>{ja ? '特徴・PC 向け Android デスクトップ' : 'Features & PC Android Desktop'}</h1>
+      <p class="lead">
+        {ja
+          ? 'ベンチマーク性能だけでなく、大画面・マウス・キーボード・リモートデスクトップで Android を快適に日常利用できるデスクトップ UI と Windows 管理ツールを一体化しています。'
+          : 'Beyond raw benchmarks, Velox pairs a native PC-first Android desktop launcher with a zero-dependency Windows manager for comfortable daily use with mouse, keyboard, and large displays.'}
+      </p>
+    </div>
+  </section>
+
+  <!-- Gallery of Real Verified Screenshots -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '実機スクリーンショットギャラリー（個人情報・アカウント情報なし）' : 'Real Captured Screenshots (Sanitized, Zero PII)'}</h2>
+        <p>
+          {ja
+            ? 'すべて実際の Velox Android 17 / Android 12 ゲストおよび Windows 管理 GUI から取得した実機画面です。架空のモック画面は一切使用していません。'
+            : 'All screenshots are real captures from live Velox Android 17 / Android 12 guests and the Windows management GUI — no mockups or synthetic renders.'}
+        </p>
+      </div>
+
+      <div class="grid-2">
+        <figure class="shot-frame" style="margin:0;">
+          <img src={assetPath('images/velox-desktop-home.png')} alt={ja ? 'Velox Launcher Android 17 ホーム画面' : 'Velox Launcher Android 17 Home'} width="1920" height="1080" loading="lazy" />
+          <figcaption class="shot-caption">
+            <strong style="color:#fff;">{ja ? 'Android 17 デスクトップホーム (240 dpi)' : 'Android 17 Desktop Home (240 dpi)'}</strong> —{' '}
+            {ja ? '独自ダークテーマ、下部タスクバー、V Apps ボタン、時計・システムトレイ。' : 'Custom dark theme, bottom taskbar, V Apps launcher button, clock & system tray.'}
+          </figcaption>
+        </figure>
+
+        <figure class="shot-frame" style="margin:0;">
+          <img src={assetPath('images/velox-desktop-appmenu.png')} alt={ja ? 'Velox Launcher アプリメニュー' : 'Velox Launcher App Menu'} width="1920" height="1080" loading="lazy" />
+          <figcaption class="shot-caption">
+            <strong style="color:#fff;">{ja ? '検索・カテゴリ分類付きアプリメニュー' : 'Searchable Categorized App Menu'}</strong> —{' '}
+            {ja ? 'All / Games / Tools / Media / System フィルタと Name / Recent / Category 並び替えに対応。' : 'Filter by All / Games / Tools / Media / System and sort by Name, Recent, or Category.'}
+          </figcaption>
+        </figure>
+
+        <figure class="shot-frame" style="margin:0;">
+          <img src={assetPath('images/velox-desktop-quicksettings.png')} alt={ja ? 'Velox Launcher クイック設定パネル' : 'Velox Launcher Quick Settings'} width="1920" height="1080" loading="lazy" />
+          <figcaption class="shot-caption">
+            <strong style="color:#fff;">{ja ? 'クイック設定パネル' : 'Quick Settings Drawer'}</strong> —{' '}
+            {ja ? 'ウィンドウモード切替・ダーク/ライト切替・壁紙・ネットワーク・ディスプレイ・デフォルトホーム切替へ即アクセス。' : 'Instant toggles for Windowed mode, Dark/Light theme, wallpaper, network, display, and default launcher switching.'}
+          </figcaption>
+        </figure>
+
+        <figure class="shot-frame" style="margin:0;">
+          <img src={assetPath('images/velox-desktop-a12.png')} alt={ja ? 'Android 12 互換環境での Velox Launcher' : 'Velox Launcher on Android 12'} width="1920" height="1080" loading="lazy" />
+          <figcaption class="shot-caption">
+            <strong style="color:#fff;">{ja ? 'Android 12 (API 31) 互換動作' : 'Android 12 (API 31) Compatibility'}</strong> —{' '}
+            {ja ? 'Android 17 に加え Android 12 でも Velox Launcher（36.7 MB PSS）と 20 vCPU・THP 構成が同一操作感で動作。' : 'Runs the same Velox Launcher (36.7 MB PSS) with 20 vCPU and THP on Android 12 alongside Android 17.'}
+          </figcaption>
+        </figure>
+      </div>
+
+      <figure class="shot-frame" style="margin:24px 0 0;">
+        <img src={assetPath('images/velox-windows-gui.png')} alt={ja ? 'Velox Windows 管理 GUI' : 'Velox Windows Management GUI'} width="1136" height="759" loading="lazy" />
+        <figcaption class="shot-caption">
+          <strong style="color:#fff;">{ja ? 'Velox Windows 管理 GUI (emu gui)' : 'Velox Windows Management GUI (emu gui)'}</strong> —{' '}
+          {ja
+            ? 'Python 3.12 標準 tkinter による軽量ダークテーマ UI。複数 Android 端末の一覧・起動/停止・GPU 診断・画面操作ショートカット・APK ドラッグ&ドロップを CLI と共通のバックエンドで提供。'
+            : 'Lightweight dark-theme GUI built solely on Python 3.12 stdlib tkinter, sharing the exact same backend as the CLI for multi-device control, GPU diagnostics, and drag-and-drop APK install.'}
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- Feature Matrix -->
+  <section class="alt-bg">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '主要機能一覧' : 'Key Capabilities'}</h2>
+      </div>
+
+      <div class="grid-3">
+        <div class="panel">
+          <h3>{ja ? 'Velox Launcher（超軽量設計）' : 'Velox Launcher (Ultra-Light)'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? '標準 NexusLauncher の 115.8 MB PSS に対し 19.6–65.5 MB PSS・アイドル CPU 0.0% を実現。Settings アプリ起動も 324 → 177 ms に短縮し、いつでも標準ランチャーへワンクリック復元できます。'
+              : 'Uses 19.6–65.5 MB PSS vs stock NexusLauncher’s 115.8 MB PSS with 0.0% idle CPU, cuts Settings launch from 324 to 177 ms, and supports 1-click restoration to stock home.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'PC 入力 & リモートデスクトップ対応' : 'PC Input & Remote Desktop (RDP)'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'QEMU Patch 0016 により、RDP 経由やタッチ→マウス変換で発生する合成マウス破棄バグ (KI-44) を解消。ネイティブタッチ/ペンとの重複入力を防ぎつつ、画面回転とも正確に座標連動します。'
+              : 'QEMU Patch 0016 resolves KI-44 where Qt 6 dropped synthesized mouse events over RDP/touch-to-mouse, preserving rotation sync and avoiding duplicate native touch/pen input.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'ゲームモード 1:1 WASD キーマップ' : 'Game Mode 1:1 WASD Keymap'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'QEMU Patch 0017 により F12 ホーム復帰とゲーム向け 1:1 キー→タッチ座標マッピングを実装。自動化マクロや連射等のチート機能は一切搭載していません。'
+              : 'QEMU Patch 0017 provides F12 Home hotkey and clean 1:1 keyboard-to-touch coordinate mapping for gaming, with zero macros or automation cheats.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'ハードウェア自動推奨 (emu recommend)' : 'Hardware Auto-Recommend'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'CPU の型番決め打ちを行わず Win32 EfficiencyClass から P/E コア構成・RAM・GPU を自動検出し、Phase 20 検証済みの最適プロファイルを自動生成します。'
+              : 'Detects hybrid P/E topology, RAM, and GPU generically via Win32 EfficiencyClass and generates Phase 20-verified optimal profiles automatically.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'Freeform マルチウィンドウ & 動的 DPI' : 'Freeform Multi-Window & Live DPI'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? '1920×1080 (240/160 dpi)、WQHD、4K、縦スマホ表示を再起動なしで即時切替可能。Android 標準 Freeform による複数アプリのウィンドウ配置にも対応します。'
+              : 'Switch live between 1080p (240/160 dpi), WQHD, 4K, and portrait phone layouts without rebooting, plus standard Android Freeform windowing.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'VBS / セキュリティ無改変・安全設計' : 'Security-First Design (VBS Intact)'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'Windows Defender / VBS / HVCI の無効化、BIOS 変更、cache=unsafe、端末情報偽装、Google Play / DRM 回避を一切行いません。'
+              : 'Never disables Windows Defender, VBS, or HVCI; never uses unsafe write caches, device spoofing, or Play/DRM bypasses.'}
+          </p>
+        </div>
+      </div>
+
+      <div style="margin-top:24px;text-align:right;">
+        <a class="btn btn-primary" href={`${localizedPath('docs', locale)}#install`}>
+          {ja ? '導入・ビルド手順へ進む →' : 'Go to Install & Build Guide →'}
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

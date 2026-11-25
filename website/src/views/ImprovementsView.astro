@@ -1,0 +1,230 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import OfficialDeltaChart from '../components/OfficialDeltaChart.astro';
+import { BREAKTHROUGH_CARDS, OFFICIAL_VS_VELOX_20_ITEMS } from '../data/content';
+import { localizedPath } from '../data/i18n';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+
+const title = ja
+  ? 'Google公式Android Emulatorからの改善・開発成果 — Velox'
+  : 'Improvements over Google Official Android Emulator — Velox';
+const description = ja
+  ? 'Google公式Android Emulator (SDK 37.3.10) と Velox 第20段階の同条件実測比較、代表的な技術的改善成果、制約事項を一次データに基づき公開。'
+  : 'Direct same-condition comparison between Google Official Android Emulator (SDK 37.3.10) and Velox Phase 20 across 20 metrics, with complete technical mechanisms and scope constraints.';
+---
+
+<BaseLayout locale={locale} slug="improvements" title={title} description={description}>
+  <section class="page-hero">
+    <div class="container">
+      <div class="eyebrow">{ja ? '最重要トピック · 一次データ検証済' : 'Flagship Comparison · Primary Data Verified'}</div>
+      <h1>{ja ? 'Google公式 Android Emulator からの改善' : 'Improvements Over Google Official Android Emulator'}</h1>
+      <p class="lead">
+        {ja
+          ? 'Velox は公式 SDK の単純なラッパーではありません。公式 SDK 標準構成（SDK 37.3.10・6 vCPU）、Velox 開発初期、中間最適化段階、そして第 20 段階最新構成を厳密に区別した上で、83 本の上流パッチがもたらした実測改善を公開します。'
+          : 'Velox is not a wrapper around the stock emulator. Below we strictly distinguish Official SDK 37.3.10 (6 vCPU), Early Velox, intermediate optimization phases, and Phase 20 latest — backed by 83 upstream patches and primary measurements.'}
+      </p>
+
+      <div class="grid-4" style="margin-top:24px;">
+        <div class="stat-tile">
+          <div class="stat-label">{ja ? '比較区分 ①' : 'Baseline 1'}</div>
+          <div style="font-weight:700;color:#fff;">{ja ? '公式 SDK 37.3.10 標準' : 'Official SDK 37.3.10 Stock'}</div>
+          <div class="stat-note">{ja ? '6 vCPU 上限 / pipe / HPET / 標準 HAL / パッチなし' : '6 vCPU cap / pipe / HPET / stock HAL / unpatched'}</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">{ja ? '比較区分 ②' : 'Baseline 2'}</div>
+          <div style="font-weight:700;color:#fff;">{ja ? 'Velox 開発初期 (Phase 1–2)' : 'Early Velox (Phase 1–2)'}</div>
+          <div class="stat-note">{ja ? '20 vCPU 検証・Pre-Batched (AnTuTu GPU 235,973)。公式標準と明確に分離' : '20 vCPU pre-Batched (AnTuTu GPU 235,973) — kept distinct from stock SDK'}</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">{ja ? '比較区分 ③' : 'Baseline 3'}</div>
+          <div style="font-weight:700;color:#fff;">{ja ? '中間段階 (Phase 4–19)' : 'Intermediate (Phase 4–19)'}</div>
+          <div class="stat-note">{ja ? 'ASG / RT / Fence 共有表 / 適応スピン / Cached Upload / GLES 0028' : 'ASG / RT / Shared Fence / Adaptive Spin / Cached Upload / GLES 0028'}</div>
+        </div>
+        <div class="stat-tile" style="border-color:var(--accent);">
+          <div class="stat-label">{ja ? '比較区分 ④ (最新)' : 'Baseline 4 (Latest)'}</div>
+          <div style="font-weight:700;color:#fff;">{ja ? 'Velox 第 20 段階 (v0.3.0)' : 'Velox Phase 20 (v0.3.0)'}</div>
+          <div class="stat-note">{ja ? '同 6 vCPU 直接比較 + 20 vCPU パレート最適 20_PE_rpe の両方を実測' : 'Measured both at equal 6 vCPU and full 20 vCPU (20_PE_rpe)'}</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Visual Summary -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '同一条件ダイレクト比較ハイライト（各 3 回中央値）' : 'Same-Condition Direct Comparison Highlights (n=3 Medians)'}</h2>
+        <p>
+          {ja
+            ? '同一 PC・同一 Android 17 API 37 イメージ・同一 16 GiB RAM・同一 900×1600 120Hz 表示・隔離クローン AVD 上で、公式 SDK 37.3.10 と Velox 第 20 段階を同一ベンチマークバイナリで連続実測した結果です（出典: benchmarks/results/phase20/sdk_vs_velox_direct.json）。'
+            : 'Measured on the same PC, same Android 17 API 37 image, same 16 GiB RAM, and same 900x1600 120Hz display on an isolated clone AVD using identical benchmark binaries (source: sdk_vs_velox_direct.json).'}
+        </p>
+      </div>
+
+      <OfficialDeltaChart locale={locale} />
+    </div>
+  </section>
+
+  <!-- Representative Breakthroughs with Scope Caveats -->
+  <section class="alt-bg">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '代表的な開発成果（比較対象・条件・制約を明示）' : 'Representative Breakthroughs (Targets, Conditions & Scope Constraints)'}</h2>
+        <p>
+          {ja
+            ? 'マイクロベンチマーク特有の大幅な改善倍率（例: 特定経路での 41.5–45.6倍や特定競合での 134.2倍）を、GPU 全体やエミュレーター全体の速度向上と混同しないよう、すべての成果に適用範囲と制約を明記しています。'
+            : 'Large microbenchmark speedups (such as 41.5–45.6x on a specific upload path or 134.2x on a specific fence contention bug) are never presented as whole-emulator speedups. Every card explicitly states its scope and constraints.'}
+        </p>
+      </div>
+
+      <div class="grid-2">
+        {BREAKTHROUGH_CARDS.map((card) => (
+          <article class="panel bt-card">
+            <div class="bt-metric">{card.metric[locale]}</div>
+            <h3 class="bt-headline">{card.headline[locale]}</h3>
+
+            <dl class="bt-dl">
+              <div>
+                <dt>{ja ? '改善前' : 'Before'}</dt>
+                <dd>{card.before[locale]}</dd>
+              </div>
+              <div>
+                <dt>{ja ? '改善後' : 'After'}</dt>
+                <dd style="color:#fff;font-weight:600;">{card.after[locale]}</dd>
+              </div>
+              <div>
+                <dt>{ja ? '比較対象' : 'Target'}</dt>
+                <dd>{card.target[locale]}</dd>
+              </div>
+              <div>
+                <dt>{ja ? '測定条件' : 'Conditions'}</dt>
+                <dd>{card.conditions[locale]}</dd>
+              </div>
+              <div>
+                <dt>{ja ? '改善内容' : 'Mechanism'}</dt>
+                <dd>{card.mechanism[locale]}</dd>
+              </div>
+            </dl>
+
+            <div class="callout callout-warn" style="margin-top:auto;font-size:13px;padding:10px 12px;">
+              <strong>{ja ? '制約・適用範囲:' : 'Scope & Constraints:'}</strong> {card.constraint[locale]}
+            </div>
+            <div class="mono" style="font-size:11.5px;color:var(--text-subtle);margin-top:8px;">
+              {ja ? '出典' : 'Source'}: {card.source}
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- Complete 20-Item Direct Comparison Table -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '全 20 項目：公式 SDK 37.3.10 vs Velox 第 20 段階 完全比較表' : 'Complete 20-Item Comparison: Official SDK 37.3.10 vs Velox Phase 20'}</h2>
+        <p>
+          {ja
+            ? '同コア数（6 vCPU 同士）の純粋なソフトウェア改善と、20 vCPU 解放（Patch 0001）を含むフル構成の両方を並べて掲載しています。同等項目やトレードオフ（アイドル CPU・Flush 保証有無）も隠さず記載しています。'
+            : 'Displays both exact same-core (6 vCPU vs 6 vCPU) software improvements and full 20 vCPU unlocked performance side by side, including parity metrics and honest trade-offs (idle CPU, flush durability).'}
+        </p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>{ja ? '評価項目' : 'Metric'}</th>
+              <th>{ja ? '公式 SDK 37.3.10 (6 vCPU)' : 'Official SDK 37.3.10 (6 vCPU)'}</th>
+              <th>{ja ? 'Velox 第 20 段階 (同 6 vCPU)' : 'Velox Phase 20 (Same 6 vCPU)'}</th>
+              <th>{ja ? 'Velox 第 20 段階 (20 vCPU)' : 'Velox Phase 20 (20 vCPU)'}</th>
+              <th>{ja ? '改善・評価 / 出典' : 'Delta / Source'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {OFFICIAL_VS_VELOX_20_ITEMS.map((row) => (
+              <tr>
+                <td>
+                  <strong style="color:#fff;">{row.item[locale]}</strong>
+                  {row.honestCaveat && (
+                    <div style="font-size:12px;color:#fbbf24;margin-top:4px;">
+                      ※ {row.honestCaveat[locale]}
+                    </div>
+                  )}
+                </td>
+                <td class="mono" style="color:var(--text-muted);">{row.officialSdk[locale]}</td>
+                <td class="mono" style="color:#dbeafe;">{row.veloxSame6[locale]}</td>
+                <td class="mono" style="color:#fff;font-weight:600;">{row.veloxFull20[locale]}</td>
+                <td>
+                  <div style="font-size:13.5px;color:#fff;">{row.deltaNote[locale]}</div>
+                  <div class="mono" style="font-size:11.5px;color:var(--text-subtle);margin-top:4px;">{row.source}</div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:24px;display:flex;flex-wrap:wrap;gap:12px;justify-content:flex-end;">
+        <a class="btn btn-primary" href={localizedPath('benchmarks', locale)}>
+          {ja ? 'インタラクティブ性能比較へ進む →' : 'Open Interactive Benchmark Explorer →'}
+        </a>
+        <a class="btn btn-secondary" href={localizedPath('architecture', locale)}>
+          {ja ? '技術アーキテクチャ解説を見る →' : 'Read Technical Architecture →'}
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .bt-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .bt-metric {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--accent-light);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .bt-headline {
+    font-size: 21px;
+    color: #ffffff;
+    margin: 0 0 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .bt-dl {
+    margin: 0;
+    display: grid;
+    gap: 8px;
+    font-size: 13.5px;
+  }
+  .bt-dl > div {
+    display: grid;
+    grid-template-columns: 82px 1fr;
+    gap: 10px;
+  }
+  .bt-dl dt {
+    color: var(--text-subtle);
+    font-weight: 600;
+  }
+  .bt-dl dd {
+    margin: 0;
+    color: var(--text-muted);
+  }
+  @media (max-width: 520px) {
+    .bt-dl > div {
+      grid-template-columns: 1fr;
+      gap: 2px;
+    }
+  }
+</style>

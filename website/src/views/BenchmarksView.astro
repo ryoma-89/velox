@@ -1,0 +1,214 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import BenchmarkExplorer from '../components/BenchmarkExplorer.astro';
+import NativeChart from '../components/NativeChart.astro';
+import { TARGET_LABELS, formatStatType, publishableRecords } from '../data/benchmarks';
+import { assetPath } from '../data/i18n';
+import { MUMU_COMPARISON_ROWS } from '../data/content';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+const records = publishableRecords();
+
+const title = ja
+  ? '性能・ベンチマーク & インタラクティブ比較 — Velox'
+  : 'Performance Benchmarks & Interactive Explorer — Velox';
+const description = ja
+  ? 'Google公式Android Emulator、Velox過去版・最新版、Windowsネイティブ、MuMuPlayer 12.0をカテゴリ別に比較できるインタラクティブ性能比較と構造化オープンデータセット。'
+  : 'Interactive benchmark explorer comparing Google Official Android Emulator, earlier & latest Velox, Windows Native, and MuMuPlayer 12.0, backed by a 13-field structured open dataset.';
+---
+
+<BaseLayout locale={locale} slug="benchmarks" title={title} description={description}>
+  <section class="page-hero">
+    <div class="container">
+      <div class="eyebrow">{ja ? 'インタラクティブ性能比較 · 構造化データ駆動' : 'Interactive Explorer · Structured Data Driven'}</div>
+      <h1>{ja ? '性能・ベンチマーク' : 'Performance & Benchmarks'}</h1>
+      <p class="lead">
+        {ja
+          ? 'すべての数値は構造化データ（benchmarks.json）から日本語版・英語版で共通描画されています。比較対象とカテゴリを自由に切り替え、測定条件・回数・制約・一次出典をその場で確認できます。'
+          : 'All numbers render identically in Japanese and English from a single structured dataset (benchmarks.json). Toggle targets and categories to inspect conditions, sample counts, constraints, and primary sources.'}
+      </p>
+    </div>
+  </section>
+
+  <!-- Interactive Explorer (§9) -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? 'インタラクティブ性能比較エクスプローラー' : 'Interactive Benchmark Explorer'}</h2>
+        <p>
+          {ja
+            ? '比較可能な実測データが存在する組み合わせのみを描画します。条件差のある組み合わせには注記を付与し、比較不能な場合は倍率を算出しません。'
+            : 'Renders only valid measured combinations. Differing conditions are explicitly annotated and multipliers are omitted whenever measurements are not directly comparable.'}
+        </p>
+      </div>
+
+      <BenchmarkExplorer locale={locale} />
+    </div>
+  </section>
+
+  <!-- Windows Native = 100% (§6) -->
+  <section class="alt-bg" id="native">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? 'Windows ネイティブとの性能比較（ネイティブ = 100%）' : 'Windows Native Comparison (Native = 100%)'}</h2>
+        <p>
+          {ja
+            ? '第 20 段階の代表値。Windows ネイティブと同一ソースを Android NDK でビルドし、エミュレーター停止中/稼働中で直列測定しています。'
+            : 'Representative Phase 20 measurements built from identical C/Vulkan source code and executed serially against Windows Native.'}
+        </p>
+      </div>
+
+      <NativeChart locale={locale} />
+    </div>
+  </section>
+
+  <!-- Commercial Emulator Comparison: MuMuPlayer 12.0 (§7) -->
+  <section id="commercial">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '商用エミュレーター（MuMuPlayer 12.0）との同一 PC 誠実比較' : 'Honest Same-PC Comparison vs Commercial Emulator (MuMuPlayer 12.0)'}</h2>
+        <p>
+          {ja
+            ? '第 19 段階で同一 PC（Core Ultra 7 265KF / RTX 5070 Ti / 20 vCPU / 16 GiB RAM）上に導入済みの MuMuPlayer 12.0（Android 12 API 32・Hyper-V）を読み取り専用で単独起動し、同一未改変ベンチマークを実行した結果です。Velox が優位な項目と MuMuPlayer が優位な項目の双方を掲載しています。'
+            : 'Measured on the exact same PC (Core Ultra 7 265KF / RTX 5070 Ti / 20 vCPU / 16 GiB RAM) against MuMuPlayer 12.0 (Android 12 API 32, Hyper-V) using identical unmodified benchmark binaries. Both Velox strengths and MuMuPlayer strengths are shown transparently.'}
+        </p>
+      </div>
+
+      <div class="callout callout-warn" style="margin-bottom:20px;">
+        <strong>{ja ? '公正な比較のための 2 つの前提:' : 'Two Fairness Rules:'}</strong>{' '}
+        {ja
+          ? '(1) Velox の Host GLES（既定）と GuestAngle（GLES 3.2 on Vulkan・実験）は別経路であり、それぞれの最高値を単一構成で同時達成するものとして扱いません。(2) 実ゲーム全般で商用エミュレーターを上回っているといった未実証の主張は行いません。'
+          : '(1) Velox Host GLES (default) and GuestAngle (experimental GLES 3.2 on Vulkan) are distinct backends — their peak numbers are never combined into one configuration. (2) We make no unproven claims of universal superiority across all commercial games.'}
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>{ja ? '比較項目' : 'Benchmark / Feature'}</th>
+              <th>{ja ? 'Velox (Host GLES 既定)' : 'Velox (Host GLES default)'}</th>
+              <th>{ja ? 'Velox (GuestAngle 別経路)' : 'Velox (GuestAngle separate)'}</th>
+              <th>MuMuPlayer 12.0</th>
+              <th>{ja ? '優位・注記' : 'Lead & Notes'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {MUMU_COMPARISON_ROWS.map((row) => (
+              <tr>
+                <td><strong style="color:#fff;">{row.metric[locale]}</strong></td>
+                <td class="mono" style="color:#dbeafe;">{row.veloxHost}</td>
+                <td class="mono" style="color:var(--text-muted);">{row.veloxGa}</td>
+                <td class="mono" style="color:#fde68a;">{row.mumu}</td>
+                <td>
+                  <span class={`badge ${row.winner === 'velox' ? 'badge-blue' : row.winner === 'mumu' ? 'badge-amber' : 'badge-slate'}`} style="margin-bottom:4px;">
+                    {row.winner === 'velox'
+                      ? (ja ? 'Velox 優位' : 'Velox leads')
+                      : row.winner === 'mumu'
+                        ? (ja ? 'MuMu 優位' : 'MuMu leads')
+                        : (ja ? '経路により分岐' : 'Depends on backend')}
+                  </span>
+                  <div style="font-size:12.5px;color:var(--text-muted);">{row.note[locale]}</div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Structured Open Dataset Inspector & Methodology (§13) -->
+  <section class="alt-bg" id="dataset">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '公開ベンチマークデータセット & 測定方法' : 'Structured Open Dataset & Methodology'}</h2>
+        <p>
+          {ja
+            ? '全レコードは 13 の必須メタデータ項目（ベンチマーク名・開発段階・バージョン・比較対象・測定値・単位・測定回数・統計種別・測定環境・測定条件・出典・制約・公開可否）を備えた JSON スキーマで管理されており、第 21 段階以降のデータ追記だけで全グラフと表が自動更新されます。'
+            : 'Every record follows a 13-field JSON schema (benchmark, phase, version, target, value, unit, runs, statType, environment, conditions, source, constraints, publishable). Phase 21+ results can be appended without rebuilding the site.'}
+        </p>
+      </div>
+
+      <div class="grid-3" style="margin-bottom:24px;">
+        <div class="panel">
+          <h3>{ja ? '直列実測・交互 A/B' : 'Serial Execution & Alternating A/B'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? '測定中はビルドや他プロセスを並列実行せず、原則 3 回以上（A1/B1/A2/B2/A3/B3 交互）で中央値を評価。起動後 15 秒ウォームアップ (KI-36) を徹底。'
+              : 'Zero concurrent builds during benchmarking. Evaluates n≥3 medians (alternating A1/B1/A2/B2/A3/B3) with 15s post-boot warmup (KI-36).'}
+          </p>
+        </div>
+        <div class="panel">
+          <h3>{ja ? '結果チェックサム検算・偽装ゼロ' : 'Checksum Verification & Zero Spoofing'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? '描画・計算・転送・強制終了耐久のすべてで FNV-1a / SHA-256 検算を実施。端末情報偽装・スコア改変・VBS 無効化・cache=unsafe は一切禁止。'
+              : 'Every render, compute, upload, and crash-durability test verifies FNV-1a / SHA-256 checksums. Zero spoofing, zero VBS bypass, zero unsafe cache.'}
+          </p>
+        </div>
+        <div class="panel">
+          <h3>{ja ? '不採用の誠実な記録' : 'Honest Rejection Tracking'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? '効果未確認の変更（例: Host GLES Patch 0032 の -0.16%）や未完走（例: 公式 SDK 6 vCPU の AnTuTu）も隠さずリバート・記録しています。'
+              : 'Ineffective hypotheses (e.g. Host GLES Patch 0032 at -0.16%) and incomplete runs (e.g. stock SDK AnTuTu timeout) are honestly reverted and documented.'}
+          </p>
+        </div>
+      </div>
+
+      <div style="margin-bottom:16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;">
+        <a class="btn btn-secondary" href={assetPath('data/benchmarks.json')} target="_blank" rel="noopener noreferrer">
+          {ja ? '構造化 JSON を開く (benchmarks.json)' : 'Open Raw Structured JSON (benchmarks.json)'}
+        </a>
+        <span class="mono" style="font-size:12.5px;color:var(--text-subtle);">
+          schemaVersion: 1 · {records.length} {ja ? 'レコード公開中' : 'publishable records'}
+        </span>
+      </div>
+
+      <details class="panel" style="padding:18px 20px;">
+        <summary style="cursor:pointer;font-weight:700;color:#fff;font-size:15px;">
+          {ja
+            ? `構造化データセット全 ${records.length} レコードを一覧表示（13 フィールド完全開示）`
+            : `Inspect all ${records.length} structured benchmark records (full 13-field schema)`}
+        </summary>
+        <div class="table-wrap" style="margin-top:16px;">
+          <table>
+            <thead>
+              <tr>
+                <th>{ja ? 'ベンチマーク名' : 'Benchmark'}</th>
+                <th>{ja ? '段階 / 版' : 'Phase / Version'}</th>
+                <th>{ja ? '比較対象' : 'Target'}</th>
+                <th>{ja ? '測定値' : 'Value'}</th>
+                <th>{ja ? '回数 / 統計' : 'Runs / Stat'}</th>
+                <th>{ja ? '条件・制約・出典' : 'Conditions, Constraints & Source'}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {records.map((r) => (
+                <tr>
+                  <td><strong style="color:#fff;">{r.benchmark[locale]}</strong></td>
+                  <td style="font-size:12.5px;">{r.phase}<br /><span style="color:var(--text-muted);">{r.version}</span></td>
+                  <td style="font-size:12.5px;">{TARGET_LABELS[r.target][locale]}</td>
+                  <td class="mono" style="color:#fff;white-space:nowrap;">
+                    {r.value === null ? (r.statusNote?.[locale] ?? 'N/A') : `${r.value} ${r.unit}`}
+                  </td>
+                  <td class="mono" style="font-size:12.5px;white-space:nowrap;">n={r.runs} / {formatStatType(r.statType, locale)}</td>
+                  <td style="font-size:12.5px;color:var(--text-muted);">
+                    <div><strong>{ja ? '条件:' : 'Cond:'}</strong> {r.conditions[locale]}</div>
+                    <div><strong>{ja ? '制約:' : 'Limit:'}</strong> {r.constraints[locale]}</div>
+                    <div class="mono" style="color:var(--text-subtle);">{r.source} · {r.environment}</div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+  </section>
+</BaseLayout>

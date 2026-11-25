@@ -1,0 +1,150 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import ArchDiagram from '../components/ArchDiagram.astro';
+import { TECH_PILLARS } from '../data/content';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+
+const title = ja
+  ? 'アーキテクチャ・独自最適化技術 — Velox'
+  : 'Architecture & Optimization Technologies — Velox';
+const description = ja
+  ? 'WHPX、QEMU、gfxstream、Mesa、THP、Win32 AIO、Velox Launcher のシステム構造と、「従来の実装 → Velox での変更 → 実測された効果」を技術解説。'
+  : 'Deep dive into Velox virtualization architecture across WHPX, QEMU, gfxstream, Mesa, THP, Win32 AIO, and Velox Launcher, contrasting upstream foundations with Velox changes and measured effects.';
+---
+
+<BaseLayout locale={locale} slug="architecture" title={title} description={description}>
+  <section class="page-hero">
+    <div class="container">
+      <div class="eyebrow">{ja ? 'システム構造 · 上流と独自の明確な区分' : 'System Design · Upstream vs Velox Original'}</div>
+      <h1>{ja ? 'アーキテクチャ・技術解説' : 'Architecture & Technical Deep-Dive'}</h1>
+      <p class="lead">
+        {ja
+          ? '上流プロジェクト（AOSP Android Emulator / QEMU / gfxstream / Mesa / Android Google APIs）が元から提供する基盤と、Velox が独自に実装・最適化した 83 パッチおよび管理基盤を明確に区別して解説します。'
+          : 'Clearly separates capabilities inherited from upstream projects (AOSP Emulator, QEMU, gfxstream, Mesa, Google APIs) from Velox’s 83 patches, zero-dependency management core, and native launcher.'}
+      </p>
+    </div>
+  </section>
+
+  <!-- SVG Architecture Diagram -->
+  <section>
+    <div class="container">
+      <ArchDiagram locale={locale} />
+    </div>
+  </section>
+
+  <!-- 4 Technical Pillars -->
+  {TECH_PILLARS.map((pillar, idx) => (
+    <section class={idx % 2 === 0 ? 'alt-bg' : ''} id={pillar.id}>
+      <div class="container">
+        <div class="section-head">
+          <div class="eyebrow">0{idx + 1} / 04</div>
+          <h2>{pillar.title[locale]}</h2>
+          <p>{pillar.summary[locale]}</p>
+        </div>
+
+        <div class="tech-list">
+          {pillar.items.map((item) => {
+            const originLabel =
+              item.origin === 'upstream'
+                ? ja ? '上流基盤 + Velox 統合' : 'Upstream + Velox Integration'
+                : item.origin === 'velox_original'
+                  ? ja ? 'Velox 独自実装' : 'Velox Original'
+                  : ja ? 'Velox 独自パッチ' : 'Velox Patch';
+            const badgeClass =
+              item.origin === 'upstream'
+                ? 'badge-slate'
+                : item.origin === 'velox_original'
+                  ? 'badge-green'
+                  : 'badge-blue';
+            return (
+              <article class="panel tech-card">
+                <div class="tech-card-head">
+                  <h3 style="margin:0;">{item.name[locale]}</h3>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                    <span class={`badge ${badgeClass}`}>{originLabel}</span>
+                    {item.patchRef && <span class="mono" style="font-size:12px;color:var(--text-subtle);">{item.patchRef}</span>}
+                  </div>
+                </div>
+
+                <div class="trio-grid">
+                  <div class="trio-box">
+                    <div class="trio-label">{ja ? '従来の実装（課題）' : 'Conventional Implementation'}</div>
+                    <p>{item.conventional[locale]}</p>
+                  </div>
+                  <div class="trio-box trio-change">
+                    <div class="trio-label" style="color:var(--accent-light);">{ja ? 'Velox での変更' : 'Velox Change'}</div>
+                    <p>{item.veloxChange[locale]}</p>
+                  </div>
+                  <div class="trio-box trio-effect">
+                    <div class="trio-label" style="color:#34d399;">{ja ? '実測された効果' : 'Measured Effect'}</div>
+                    <p style="color:#fff;">{item.measuredEffect[locale]}</p>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  ))}
+</BaseLayout>
+
+<style>
+  .tech-list {
+    display: grid;
+    gap: 18px;
+  }
+  .tech-card {
+    display: grid;
+    gap: 14px;
+  }
+  .tech-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .trio-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .trio-box {
+    background: #080e1c;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+  }
+  .trio-change {
+    border-color: rgba(59, 130, 246, 0.35);
+  }
+  .trio-effect {
+    border-color: rgba(16, 185, 129, 0.35);
+  }
+  .trio-label {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--text-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 6px;
+  }
+  .trio-box p {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }
+  @media (max-width: 860px) {
+    .trio-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

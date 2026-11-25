@@ -1,0 +1,139 @@
+---
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+---
+
+<div class="panel" style="padding:20px;overflow-x:auto;">
+  <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;">
+    <strong style="color:#fff;">
+      {ja ? 'Velox システムアーキテクチャ（上流基盤 vs Velox 独自最適化の区分）' : 'Velox System Architecture (Upstream Foundation vs Velox Optimizations)'}
+    </strong>
+    <div style="display:flex;gap:14px;font-size:12px;color:var(--text-muted);flex-wrap:wrap;">
+      <span style="display:inline-flex;align-items:center;gap:6px;">
+        <i style="width:10px;height:10px;border-radius:2px;background:#1e3a8a;border:1px solid #3b82f6;display:inline-block;"></i>
+        {ja ? 'Velox 独自実装 / パッチ (計 83 本)' : 'Velox Original / Patches (83 total)'}
+      </span>
+      <span style="display:inline-flex;align-items:center;gap:6px;">
+        <i style="width:10px;height:10px;border-radius:2px;background:#1e293b;border:1px solid #475569;display:inline-block;"></i>
+        {ja ? '上流 OSS / 公式イメージ' : 'Upstream OSS / Official Image'}
+      </span>
+    </div>
+  </div>
+
+  <svg
+    viewBox="0 0 1120 426"
+    fill="none"
+    xmlns="http://www.w3.org/2000/svg"
+    role="img"
+    aria-label={ja ? 'Velox のホストとゲストの仮想化アーキテクチャ図' : 'Velox host and guest virtualization architecture diagram'}
+    style="width:100%;height:auto;"
+  >
+    <!-- Guest Android Box -->
+    <rect x="12" y="12" width="510" height="402" rx="12" fill="#0b1222" stroke="#2d3e5a" stroke-width="1.5" />
+    <text x="32" y="40" fill="#93c5fd" font-size="13" font-weight="700" font-family="sans-serif">
+      {ja ? 'ANDROID 12 / 17 ゲスト（公式 Google APIs 無改変イメージ）' : 'ANDROID 12 / 17 GUEST (Unmodified Official Google APIs)'}
+    </text>
+
+    <!-- Velox Launcher -->
+    <rect x="32" y="58" width="470" height="62" rx="8" fill="#132347" stroke="#3b82f6" stroke-width="1.5" />
+    <text x="48" y="83" fill="#ffffff" font-size="13.5" font-weight="700" font-family="sans-serif">
+      Velox Launcher (Kotlin / Java) — {ja ? '独自実装' : 'Velox Original'}
+    </text>
+    <text x="48" y="104" fill="#cbd5e1" font-size="11.5" font-family="sans-serif">
+      {ja ? 'タスクバー・アプリ検索・Freeform・19.6–65.5 MB PSS・アイドル CPU 0%' : 'Taskbar, App Menu, Freeform, 19.6–65.5 MB PSS, 0% Idle CPU'}
+    </text>
+
+    <!-- Apps + ARM64 -->
+    <rect x="32" y="134" width="470" height="58" rx="8" fill="#111a2e" stroke="#475569" stroke-width="1.2" />
+    <text x="48" y="159" fill="#e2e8f0" font-size="13" font-weight="600" font-family="sans-serif">
+      Android Apps · x86_64 + ARM64 (Berberis libndk_translation)
+    </text>
+    <text x="48" y="179" fill="#94a3b8" font-size="11.5" font-family="sans-serif">
+      {ja ? '上流 Android 12/17 基盤（NEON 98.8%・4T Atomic 83.5 Mops）' : 'Upstream Android 12/17 runtime (NEON 98.8%, 4T Atomic 83.5 Mops)'}
+    </text>
+
+    <!-- Mesa Guest Vulkan HAL -->
+    <rect x="32" y="206" width="470" height="86" rx="8" fill="#132347" stroke="#3b82f6" stroke-width="1.5" />
+    <text x="48" y="231" fill="#ffffff" font-size="13.5" font-weight="700" font-family="sans-serif">
+      Mesa Vulkan Guest HAL — {ja ? '30 パッチ適用' : '30 Patches'}
+    </text>
+    <text x="48" y="253" fill="#bfdbfe" font-size="11.5" font-family="sans-serif">
+      • {ja ? 'コマンド先送りランプ (2→128 KiB)・ゲスト内 Descriptor Pool リセット' : 'Stream Ramp (2→128 KiB) & Local Descriptor Pool Reset'}
+    </text>
+    <text x="48" y="274" fill="#bfdbfe" font-size="11.5" font-family="sans-serif">
+      • {ja ? 'Fence 共有メモリ照会・Ray Query / RT Pipeline / CoopMat / VK 1.4' : 'Shared Fence Table · Ray Query / RT Pipeline / CoopMat / VK 1.4'}
+    </text>
+
+    <!-- Guest Linux Kernel -->
+    <rect x="32" y="306" width="470" height="86" rx="8" fill="#111a2e" stroke="#475569" stroke-width="1.2" />
+    <text x="48" y="331" fill="#e2e8f0" font-size="13" font-weight="600" font-family="sans-serif">
+      Guest Linux Kernel (20 vCPU · TSC · Guest THP · virtio-blk mq4)
+    </text>
+    <text x="48" y="353" fill="#94a3b8" font-size="11.5" font-family="sans-serif">
+      • {ja ? 'WHPX TSC 14.5 ns (逆行 0)・THP always_nodefrag (RAM 1T +24%)' : 'WHPX TSC 14.5 ns (0 regressions) · THP always_nodefrag (+24%)'}
+    </text>
+    <text x="48" y="374" fill="#94a3b8" font-size="11.5" font-family="sans-serif">
+      • {ja ? 'ASG 共有メモリリング・ext4 永続 Flush（実験構成 F2FS 検証済）' : 'ASG Shared Ring · Crash-Safe ext4 Flush (Experimental F2FS)'}
+    </text>
+
+    <!-- Middle Transport Arrows -->
+    <line x1="524" y1="250" x2="596" y2="250" stroke="#38bdf8" stroke-width="2.5" />
+    <polygon points="596,250 587,245 587,255" fill="#38bdf8" />
+    <polygon points="524,250 533,245 533,255" fill="#38bdf8" />
+    <text x="560" y="234" text-anchor="middle" fill="#38bdf8" font-size="12" font-weight="700" font-family="monospace">ASG</text>
+    <text x="560" y="269" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">0.80 µs</text>
+
+    <line x1="524" y1="348" x2="596" y2="348" stroke="#60a5fa" stroke-width="2" stroke-dasharray="4 3" />
+    <text x="560" y="336" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">WHPX</text>
+
+    <!-- Host Windows Box -->
+    <rect x="598" y="12" width="510" height="402" rx="12" fill="#0b1222" stroke="#2d3e5a" stroke-width="1.5" />
+    <text x="618" y="40" fill="#93c5fd" font-size="13" font-weight="700" font-family="sans-serif">
+      {ja ? 'WINDOWS 11 ホスト（Hyper-V / WHPX / VBS 有効のまま動作）' : 'WINDOWS 11 HOST (Hyper-V / WHPX / VBS Enabled)'}
+    </text>
+
+    <!-- Velox GUI / CLI -->
+    <rect x="618" y="58" width="470" height="62" rx="8" fill="#132347" stroke="#3b82f6" stroke-width="1.5" />
+    <text x="634" y="83" fill="#ffffff" font-size="13.5" font-weight="700" font-family="sans-serif">
+      Velox Management Core (GUI / CLI) — {ja ? '独自実装' : 'Velox Original'}
+    </text>
+    <text x="634" y="104" fill="#cbd5e1" font-size="11.5" font-family="sans-serif">
+      {ja ? 'Python 3.12 標準ライブラリのみ・P/E 自動推奨・テレメトリー管理' : 'Zero-dep Python 3.12 · Auto P/E Recommend · Telemetry & Profiles'}
+    </text>
+
+    <!-- QEMU / WHPX -->
+    <rect x="618" y="134" width="470" height="86" rx="8" fill="#132347" stroke="#3b82f6" stroke-width="1.5" />
+    <text x="634" y="159" fill="#ffffff" font-size="13.5" font-weight="700" font-family="sans-serif">
+      AOSP QEMU / WHPX — {ja ? '19 パッチ適用' : '19 Patches'}
+    </text>
+    <text x="634" y="181" fill="#bfdbfe" font-size="11.5" font-family="sans-serif">
+      • {ja ? '20 vCPU 解放・TSC 修正・ロックレス pre_run (0018)・高精度タイマー' : '20 vCPU Unlock · TSC Fix · Lockless pre_run (0018) · High-Res Poll'}
+    </text>
+    <text x="634" y="202" fill="#bfdbfe" font-size="11.5" font-family="sans-serif">
+      • {ja ? 'Win32 AIO プール (0019)・RDP 入力修正 (0016)・WASD キーマップ' : 'Win32 AIO Pool (0019) · RDP Input Fix (0016) · WASD Keymap'}
+    </text>
+
+    <!-- gfxstream + aemu -->
+    <rect x="618" y="234" width="470" height="88" rx="8" fill="#132347" stroke="#3b82f6" stroke-width="1.5" />
+    <text x="634" y="259" fill="#ffffff" font-size="13.5" font-weight="700" font-family="sans-serif">
+      gfxstream + aemu — {ja ? '31 + 3 パッチ適用' : '31 + 3 Patches'}
+    </text>
+    <text x="634" y="281" fill="#bfdbfe" font-size="11.5" font-family="sans-serif">
+      • {ja ? '受信先読み・500 µs Adaptive Spin・3 段階 MT Fence 待機 (0024)' : 'Prefetch Thread · 500 µs Adaptive Spin · 3-Tier MT Fence (0024)'}
+    </text>
+    <text x="634" y="302" fill="#bfdbfe" font-size="11.5" font-family="sans-serif">
+      • {ja ? 'HybridEntityManager (0031)・Cached Upload (0010)・GLES (0028)' : 'HybridEntityManager (0031) · Cached Upload (0010) · GLES (0028)'}
+    </text>
+
+    <!-- Host GPU & Hardware -->
+    <rect x="618" y="336" width="470" height="56" rx="8" fill="#0f241f" stroke="#10b981" stroke-width="1.2" />
+    <text x="634" y="369" fill="#a7f3d0" font-size="13" font-weight="600" font-family="sans-serif">
+      Host GPU Vulkan 1.4 / OpenGL + NVMe SSD + Intel P/E Hybrid CPU
+    </text>
+  </svg>
+</div>

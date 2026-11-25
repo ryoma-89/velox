@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://ryoma-89.github.io/velox/sitemap-index.xml

@@ -1,0 +1,64 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { DEVELOPMENT_TIMELINE } from '../data/content';
+import { localizedPath } from '../data/i18n';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+
+const title = ja
+  ? '開発の歴史（Phase 1 → Phase 20 & OSS 公開）— Velox'
+  : 'Development History (Phase 1 → Phase 20 & OSS Release) — Velox';
+const description = ja
+  ? 'AOSP Android Emulator の採用から GPU 同期ボトルネック発見、Ray Tracing 実装、134倍 MT Fence 解消、Velox Launcher、Phase 20 Extreme Performance、GitHub OSS 公開までの開発履歴。'
+  : 'Chronological engineering timeline of Velox from AOSP Emulator adoption through GPU sync discovery, hardware Ray Tracing, 134x MT fence fix, Velox Launcher, Phase 20 Extreme Performance, and GitHub OSS release.';
+---
+
+<BaseLayout locale={locale} slug="history" title={title} description={description}>
+  <section class="page-hero">
+    <div class="container">
+      <div class="eyebrow">{ja ? '20 段階の反復開発と検証ログ' : '20 Iterative Engineering Phases'}</div>
+      <h1>{ja ? '開発の歴史' : 'Development History'}</h1>
+      <p class="lead">
+        {ja
+          ? '推測ではなく、プロファイリング・ソース解析・パッチ実装・交互 A/B 実測・チェックサム検算・dEQP 退行試験を 20 段階にわたり積み上げてきた開発の歩みです。'
+          : 'Twenty phases of evidence-driven engineering: profiling, source analysis, numbered patches, alternating A/B runs, checksum verification, and dEQP conformance suites.'}
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <div class="timeline">
+        {DEVELOPMENT_TIMELINE.map((entry) => (
+          <article class="timeline-item">
+            <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
+              <span class="badge badge-blue">{entry.phase}</span>
+              <span class="mono" style="font-size:12.5px;color:var(--text-subtle);">{entry.date}</span>
+            </div>
+            <h2 style="font-size:20px;margin-bottom:8px;">{entry.title[locale]}</h2>
+            <p style="margin:0 0 12px;color:var(--text-muted);font-size:14.5px;">{entry.summary[locale]}</p>
+            <ul style="margin:0;padding-left:18px;display:grid;gap:4px;font-size:13.5px;color:#dbeafe;">
+              {entry.metrics.map((m) => (
+                <li>{m[locale]}</li>
+              ))}
+            </ul>
+          </article>
+        ))}
+      </div>
+
+      <div style="margin-top:28px;display:flex;flex-wrap:wrap;gap:12px;justify-content:flex-end;">
+        <a class="btn btn-primary" href={localizedPath('improvements', locale)}>
+          {ja ? '公式 SDK からの改善まとめを見る →' : 'See Summary of Official SDK Improvements →'}
+        </a>
+        <a class="btn btn-secondary" href={`${localizedPath('docs', locale)}#roadmap`}>
+          {ja ? '今後のロードマップ (Phase 21+) →' : 'View Roadmap (Phase 21+) →'}
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

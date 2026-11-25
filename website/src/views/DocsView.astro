@@ -1,0 +1,273 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import { dataset } from '../data/benchmarks';
+import { GITHUB_REPO_URL } from '../data/i18n';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+
+const title = ja
+  ? '導入方法・ビルド・ドキュメント・ライセンス — Velox'
+  : 'Install, Build from Source, Docs & Licensing — Velox';
+const description = ja
+  ? 'Velox のソースからの導入・ビルド手順、既知の制約、ロードマップ、更新履歴、Apache-2.0 および上流パッチライセンス構成、コントリビューションガイド。'
+  : 'Source installation & build instructions, known limitations, roadmap, changelog, multi-license details (Apache-2.0 + upstream), and contribution guide for Velox.';
+---
+
+<BaseLayout locale={locale} slug="docs" title={title} description={description}>
+  <section class="page-hero">
+    <div class="container">
+      <div class="eyebrow">{ja ? '導入・技術ドキュメント・OSS ガバナンス' : 'Installation, Docs & OSS Governance'}</div>
+      <h1>{ja ? '導入方法・ドキュメント' : 'Install & Documentation'}</h1>
+      <p class="lead">
+        {ja
+          ? 'ソースコードからの導入・ビルド手順、既知の問題と制約、ロードマップ、更新履歴、マルチライセンス構成、および開発への参加方法をまとめています。'
+          : 'Complete guide to installing and building Velox from source, known limitations, roadmap, changelog, licensing structure, and contributing.'}
+      </p>
+
+      <div class="btn-row" style="margin-top:20px;">
+        <a class="btn btn-secondary" href="#install">{ja ? '導入・ビルド' : 'Install & Build'}</a>
+        <a class="btn btn-secondary" href="#limitations">{ja ? '既知の問題' : 'Known Limitations'}</a>
+        <a class="btn btn-secondary" href="#roadmap">{ja ? 'ロードマップ' : 'Roadmap'}</a>
+        <a class="btn btn-secondary" href="#changelog">{ja ? '更新履歴' : 'Changelog'}</a>
+        <a class="btn btn-secondary" href="#license">{ja ? 'ライセンス' : 'License'}</a>
+        <a class="btn btn-secondary" href="#contributing">{ja ? '開発への参加' : 'Contributing'}</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Install & Build (§14: no fake binary Download button) -->
+  <section id="install">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '1. 導入方法 & ソースからのビルド' : '1. Installation & Building from Source'}</h2>
+        <p>
+          {ja
+            ? '現在、配布用のプリビルド実行ファイル（インストーラー / ZIP）は公開していません。公開 GitHub リポジトリからソースコードとパッチを取得し、手元の Android SDK と組み合わせて利用・ビルドできます。'
+            : 'Prebuilt binary installers are not distributed yet. Clone the public GitHub repository to run the zero-dependency Python 3.12 management core alongside your local Android SDK, and optionally build the patched QEMU / gfxstream / Mesa runtime from source.'}
+        </p>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3>{ja ? '前提環境' : 'Prerequisites'}</h3>
+          <ul style="margin:0;padding-left:18px;display:grid;gap:6px;font-size:14px;color:var(--text-muted);">
+            <li>Windows 11 (x64) + Windows Hypervisor Platform (WHPX) {ja ? '有効（VBS 無効化不要）' : 'enabled (VBS stays on)'}</li>
+            <li>Python 3.12（{ja ? '管理基盤は標準ライブラリのみ・追加 pip パッケージ不要' : 'stdlib only — zero external pip dependencies'}）</li>
+            <li>Android SDK（<code>emulator</code>、<code>platform-tools</code>、Google APIs x86_64 Android 12 / 17 {ja ? 'システムイメージ' : 'system image'}）</li>
+            <li>{ja ? 'フルランタイム自前ビルド時: Visual Studio 2022 (MSVC)、Clang/LLVM、CMake、Ninja、Android NDK、JDK 17+' : 'For building patched native runtime: Visual Studio 2022 (MSVC), Clang/LLVM, CMake, Ninja, Android NDK, JDK 17+'}</li>
+          </ul>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'クイックスタート（CLI / GUI）' : 'Quickstart (CLI / GUI)'}</h3>
+          <pre><code>git clone https://github.com/ryoma-89/velox.git
+cd velox
+
+# 1. {ja ? 'ホスト環境・ハードウェア診断' : 'Diagnose host CPU/GPU/WHPX'}
+.\emu.cmd diagnose
+
+# 2. {ja ? 'ハードウェア自動推奨プロファイル生成' : 'Generate hardware-recommended profile'}
+.\emu.cmd recommend
+
+# 3. {ja ? '軽量ダークテーマ GUI 起動 / テスト実行' : 'Launch lightweight dark GUI / run tests'}
+.\emu.cmd gui
+python -m unittest discover -s tests</code></pre>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:20px;">
+        <h3>{ja ? 'パッチ済みランタイム（QEMU / gfxstream / Mesa / Velox Launcher）のビルド' : 'Building the Patched Runtime (QEMU / gfxstream / Mesa / Velox Launcher)'}</h3>
+        <p style="font-size:14px;color:var(--text-muted);margin:0 0 10px;">
+          {ja
+            ? 'リポジトリ内の patches/ に 83 本の番号付きパッチ（emulator 19 / gfxstream 31 / mesa3d 30 / aemu 3）とビルドスクリプトを収録しています。詳細手順は公開リポジトリの docs/BUILD_FROM_SOURCE.md を参照してください。'
+            : 'All 83 numbered patches (emulator 19, gfxstream 31, mesa3d 30, aemu 3) and build scripts live under patches/ and scripts/. See docs/BUILD_FROM_SOURCE.md in the repository for complete instructions.'}
+        </p>
+        <pre><code># Host gfxstream &amp; QEMU (AOSP source tree + patches/gfxstream, patches/emulator, patches/aemu)
+pwsh -File scripts/build_host_gfxstream.ps1
+pwsh -File scripts/build_emulator.ps1
+
+# Guest Vulkan HAL (Mesa 3D + patches/mesa3d) &amp; Velox Launcher APK
+python scripts/guest/build_guest_vulkan.py
+python scripts/build_velox_launcher.py</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Known Limitations -->
+  <section class="alt-bg" id="limitations">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '2. 既知の問題・制約' : '2. Known Limitations & Transparency'}</h2>
+        <p>
+          {ja
+            ? 'Velox は検証済みの制約や未解決課題を隠さず明示しています。'
+            : 'Velox documents verified limitations and unresolved upstream behaviors transparently.'}
+        </p>
+      </div>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h3>{ja ? 'AnTuTu V11 異常判定 & 3DBench Lite (KI-16)' : 'AnTuTu V11 Abnormal Flag & 3DBench Lite (KI-16)'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'AnTuTu V11 Standard では GPU (655,918) と UX (1,315,277) は正常判定ですが、総合・CPU・MEM には異常判定が付くため参考値扱いです。また 3DBench Lite (V11/V12 共通) は同梱 libunity.so が Android Scudo ガードページを 4 B 超過読込するアプリ側バグ (KI-16) を全 9/9 条件で確定しています。偽装や Scudo 緩和は行いません。'
+              : 'In AnTuTu V11 Standard, GPU (655,918) and UX (1,315,277) pass normal verification, whereas Total/CPU/MEM carry abnormal flags (reference only). 3DBench Lite crashes across 9/9 configs due to an upstream libunity.so 4-byte out-of-bounds read into Android Scudo guard pages (KI-16). We never spoof devices or weaken Scudo.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'ReBAR 直接書込 & F2FS の標準適用制約' : 'ReBAR Direct Write & Standard F2FS Constraint'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'WHPX SLAT/EPT 下では ReBAR (Type 5) への直接書込が 0.18 GB/s に制限されるため、Cached Staging→VRAM DMA (14.1 GB/s) を推奨経路としています。また F2FS は隔離実験で永続 tx 2.00倍を実証しましたが、公式 Google APIs の /vendor/etc/fstab は AVB/dm-verity 保護のため既定 ext4 を維持します。'
+              : 'Under WHPX SLAT/EPT, ReBAR (Type 5) direct writes cap at 0.18 GB/s, making Cached Staging→VRAM DMA (14.1 GB/s) the recommended path. Experimental F2FS doubles durable TPS, but standard Google APIs AVDs keep ext4 to respect AVB/dm-verity.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'スナップショット + 受信先読みの安全ガード (D-037)' : 'Snapshot + Prefetch Safety Guard (D-037)'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'Phase 18–19 でスナップショット関連の 7 欠陥を修正し 20 サイクル無クラッシュを確認しましたが、間欠的 GLES コンテキストエラーと Vulkan 稼働中 savevm 拒否が残るため、スナップショット有効構成では受信先読みを自動無効化する安全ガードを維持しています。'
+              : 'Phases 18–19 fixed 7 snapshot bugs with 20 crash-free stress cycles, but intermittent GLES context warnings remain. Therefore Velox conservatively disables ASG prefetch whenever snapshots are enabled.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <h3>{ja ? 'Vulkan 1.4 実験オプション & 単一環境測定' : 'Experimental Vulkan 1.4 & Single-Rig Verification'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'Vulkan 1.4 はオプトイン（分割 CTS 20–21 Pass / hostImageCopy=VK_FALSE 仕様適合）であり既定は Vulkan 1.3.0 です。また掲載ベンチマークはすべて Intel Core Ultra 7 265KF + RTX 5070 Ti 環境での実測であり、AMD CPU や他社 GPU での実機検証は今後の課題です。'
+              : 'Vulkan 1.4 is opt-in (20–21 CTS Pass, hostImageCopy=VK_FALSE per spec); Vulkan 1.3.0 remains default. All published benchmarks were measured on Intel Core Ultra 7 265KF + RTX 5070 Ti; AMD/Intel GPU validation is planned next.'}
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Roadmap & Changelog -->
+  <section id="roadmap">
+    <div class="container">
+      <div class="grid-2">
+        <div class="panel">
+          <div class="eyebrow" style="margin-bottom:8px;">Roadmap (Phase 21+)</div>
+          <h2 style="font-size:22px;">{ja ? '3. 今後のロードマップ' : '3. Roadmap'}</h2>
+          <ul style="margin:0;padding-left:18px;display:grid;gap:8px;font-size:14px;color:var(--text-muted);">
+            <li>{ja ? 'マルチハードウェア実機検証（AMD Ryzen CPU / AMD Radeon・Intel Arc GPU）' : 'Multi-hardware validation (AMD Ryzen CPUs, AMD Radeon & Intel Arc GPUs)'}</li>
+            <li>{ja ? 'GLES 120 fps ペーシング 1% Low の 119 fps 級引き上げおよびコールドブート短縮 (<10s 目標)' : 'Improve GLES 120 fps 1% Low toward 119+ fps and reduce cold boot time (<10s target)'}</li>
+            <li>{ja ? 'Linux + KVM 向けハードウェア・バックエンド抽象化の実装' : 'Linux + KVM hardware topology and backend support'}</li>
+            <li>{ja ? 'ARM64 スカラー浮動小数点変換および GuestAngle (API 34+) の安定性向上' : 'Investigate ARM64 scalar FP translation and GuestAngle stability on API 34+'}</li>
+            <li>{ja ? 'CI 再現ビルドと署名済みリリース配布フローの整備' : 'Reproducible CI build artifacts and signed release distribution'}</li>
+          </ul>
+        </div>
+
+        <div class="panel" id="changelog">
+          <div class="eyebrow" style="margin-bottom:8px;">Changelog</div>
+          <h2 style="font-size:22px;">{ja ? '4. 更新履歴' : '4. Changelog'}</h2>
+          <ul style="margin:0;padding-left:18px;display:grid;gap:10px;font-size:14px;color:var(--text-muted);">
+            <li>
+              <strong style="color:#fff;">{dataset.latestVersion} (Phase 20 / Preview 0.3 — 2026-11-26)</strong>:
+              {ja
+                ? 'gfxstream Patch 0031、WHPX Patch 0018、Win32 AIO Patch 0019、20_PE_rpe パレート最適解統合、dEQP 23,262 Pass、GitHub OSS 公開および公式サイト公開準備。'
+                : 'Integrated gfxstream Patch 0031, WHPX Patch 0018, Win32 AIO Patch 0019, Pareto-optimal 20_PE_rpe, 23,262 dEQP Pass, GitHub OSS release, and official website.'}
+            </li>
+            <li>
+              <strong style="color:#fff;">Preview 0.2 (2026-11-25)</strong>:
+              {ja
+                ? '独自 Velox Launcher (Android 12/17)、Freeform マルチウィンドウ、WASD ゲームキーマップ (Patch 0017)、軽量 Windows GUI 拡張。'
+                : 'Native Velox Launcher (Android 12/17), Freeform multi-window, 1:1 WASD game keymap (Patch 0017), and expanded Windows GUI.'}
+            </li>
+            <li>
+              <strong style="color:#fff;">Preview 0.1.1 &amp; Phase 19 (2026-11-25)</strong>:
+              {ja
+                ? 'RDP/合成マウス入力修正 (Patch 0016)、Host GLES Patch 0028、Android 12 互換、ARM64 変換検証、MuMuPlayer 12.0 比較。'
+                : 'RDP/synthesized mouse fix (Patch 0016), Host GLES Patch 0028, Android 12 support, ARM64 evaluation, and MuMuPlayer 12.0 comparison.'}
+            </li>
+            <li>
+              <strong style="color:#fff;">Phase 1–18 (2026-11-20–24)</strong>:
+              {ja
+                ? '20 vCPU 解放、WHPX TSC 修正、ASG 転送・受信先読み、Ray Query/RT Pipeline/CoopMat、Fence 共有表、MT 134倍解消、Cached Upload、高精度タイマー、Guest THP、F2FS 実証。'
+                : '20 vCPU unlock, WHPX TSC fix, ASG prefetch, Ray Query/RT Pipeline/CoopMat, shared Fence table, 134x MT fix, Cached Upload, High-Res timer, Guest THP, and F2FS study.'}
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Licensing & Contributing -->
+  <section class="alt-bg" id="license">
+    <div class="container">
+      <div class="section-head">
+        <h2>{ja ? '5. ライセンス構成（マルチライセンス透明性）' : '5. Multi-License Structure'}</h2>
+        <p>
+          {ja
+            ? 'Velox は上流オープンソースプロジェクトのライセンス・著作権・著作者情報を厳格に尊重し、第三者製バイナリや再配布禁止ファイルは一切同梱しません。'
+            : 'Velox strictly respects upstream OSS licenses, copyrights, and attribution, redistributing zero proprietary third-party binaries.'}
+        </p>
+      </div>
+
+      <div class="table-wrap" style="margin-bottom:32px;">
+        <table>
+          <thead>
+            <tr>
+              <th>{ja ? 'コンポーネント / ディレクトリ' : 'Component / Path'}</th>
+              <th>{ja ? 'ライセンス' : 'License'}</th>
+              <th>{ja ? '区分' : 'Origin'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono">velox/ · android/velox-launcher/ · benchmarks/ · scripts/ · website/</td>
+              <td><span class="badge badge-green">Apache License 2.0</span></td>
+              <td>{ja ? 'Velox オリジナルコード' : 'Velox original code'}</td>
+            </tr>
+            <tr>
+              <td class="mono">patches/emulator/*.patch (19 patches)</td>
+              <td><span class="badge badge-slate">GPL-2.0-only / GPL-2.0-or-later</span></td>
+              <td>{ja ? '上流 QEMU / AOSP Android Emulator 準拠' : 'Follows upstream QEMU / AOSP Android Emulator'}</td>
+            </tr>
+            <tr>
+              <td class="mono">patches/gfxstream/*.patch (31) · patches/aemu/*.patch (3)</td>
+              <td><span class="badge badge-blue">Apache License 2.0</span></td>
+              <td>{ja ? '上流 AOSP gfxstream / aemu 準拠' : 'Follows upstream AOSP gfxstream / aemu'}</td>
+            </tr>
+            <tr>
+              <td class="mono">patches/mesa3d/*.patch (30 patches)</td>
+              <td><span class="badge badge-blue">MIT License</span></td>
+              <td>{ja ? '上流 Mesa 3D 準拠' : 'Follows upstream Mesa 3D'}</td>
+            </tr>
+            <tr>
+              <td class="mono">ANGLE ({ja ? '参照・非再配布' : 'referenced, not redistributed'})</td>
+              <td><span class="badge badge-slate">BSD-3-Clause</span></td>
+              <td>{ja ? '上流 ANGLE 準拠' : 'Follows upstream ANGLE'}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel" id="contributing">
+        <div class="eyebrow" style="margin-bottom:8px;">Contributing</div>
+        <h2 style="font-size:22px;margin-bottom:10px;">{ja ? '6. 開発への参加・性能データの追加方法' : '6. Contributing & Extending Benchmark Data'}</h2>
+        <p style="font-size:14px;color:var(--text-muted);margin:0 0 12px;">
+          {ja
+            ? '公開リポジトリ（ryoma-89/velox）にて Issue・Pull Request を受け付けています。性能改善 PR では必ず再現手順・n≥3 交互 A/B 実測・チェックサム検算・ユニットテスト通過を添付してください。また、第 21 段階以降の新しい性能データは website/src/data/benchmarks.json に 13 項目スキーマで追記するだけで、日英両言語のインタラクティブ比較・表が自動更新されます。'
+            : 'Issues and Pull Requests are welcome at github.com/ryoma-89/velox. Performance PRs should include reproduction steps, n≥3 alternating A/B runs, checksum verification, and unit test results. Future Phase 21+ results can be appended directly to website/src/data/benchmarks.json using the 13-field schema to update both JA and EN charts automatically.'}
+        </p>
+        <div class="btn-row">
+          <a class="btn btn-primary" href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">
+            {ja ? 'GitHub リポジトリを開く' : 'Open GitHub Repository'}
+          </a>
+          <a class="btn btn-secondary" href={`${GITHUB_REPO_URL}/issues`} target="_blank" rel="noopener noreferrer">
+            {ja ? 'Issue を報告・閲覧する' : 'Browse / File Issues'}
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

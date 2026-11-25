@@ -34,13 +34,16 @@ PROHIBITED_NAMES = {
 SKIP_DIRS = {
     ".git", ".velox", "third_party", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".ruff_cache", ".venv", "venv", "build", "dist", "out",
+    "node_modules", ".astro",
 }
 
 TEXT_EXTS = {
     ".py", ".c", ".h", ".cpp", ".hpp", ".java", ".xml", ".json", ".jsonl",
     ".md", ".txt", ".ps1", ".cmd", ".sh", ".patch", ".yml", ".yaml",
     ".ini", ".cfg", ".rc", ".comp", ".vert", ".frag", ".rgen", ".rchit", ".rmiss",
-    ".manifest", ".options", "",
+    ".manifest", ".options",
+    ".astro", ".ts", ".mjs", ".js", ".css", ".html", ".svg",
+    "",
 }
 
 SECRET_PATTERNS: list[tuple[str, re.Pattern[bytes]]] = [
@@ -183,6 +186,37 @@ def audit_repository(root: Path, mode: str = "public", max_file_mb: float = 5.0)
             for must in ("GPL-2.0", "Apache", "MIT", "BSD-3-Clause", "QEMU", "gfxstream", "Mesa"):
                 if must not in tpn_txt:
                     violations.append({"check": "license_notice", "path": "THIRD_PARTY_NOTICES.md", "detail": f"必須ライセンス記載欠落: {must}"})
+
+    # 7. Website structured benchmark dataset validation (if website/ exists)
+    bench_json = root / "website" / "src" / "data" / "benchmarks.json"
+    if bench_json.is_file():
+        required_record_fields = (
+            "benchmark", "phase", "version", "target", "value", "unit",
+            "runs", "statType", "environment", "conditions", "source",
+            "constraints", "publishable",
+        )
+        try:
+            bdata = json.loads(bench_json.read_text(encoding="utf-8"))
+            recs = bdata.get("records")
+            if not isinstance(recs, list) or not recs:
+                violations.append({"check": "website_data", "path": "website/src/data/benchmarks.json", "detail": "records が空または不正です"})
+            else:
+                for idx, rec in enumerate(recs):
+                    missing = [f for f in required_record_fields if f not in rec]
+                    if missing:
+                        violations.append({
+                            "check": "website_data",
+                            "path": "website/src/data/benchmarks.json",
+                            "detail": f"record[{idx}] 必須フィールド欠落: {missing}",
+                        })
+                    if mode == "public" and rec.get("publishable") is not True:
+                        violations.append({
+                            "check": "website_data",
+                            "path": "website/src/data/benchmarks.json",
+                            "detail": f"公開データに publishable!=true のレコードが含まれています: {rec.get('id', idx)}",
+                        })
+        except Exception as exc:
+            violations.append({"check": "website_data", "path": "website/src/data/benchmarks.json", "detail": f"JSON 解析失敗: {exc}"})
 
     return {
         "root": str(root),

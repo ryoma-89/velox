@@ -1,0 +1,340 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import NativeChart from '../components/NativeChart.astro';
+import OfficialDeltaChart from '../components/OfficialDeltaChart.astro';
+import VeloxLogo from '../components/VeloxLogo.astro';
+import { dataset } from '../data/benchmarks';
+import { GITHUB_REPO_URL, assetPath, localizedPath } from '../data/i18n';
+import type { Locale } from '../data/schema';
+
+interface Props {
+  locale: Locale;
+}
+const { locale } = Astro.props;
+const ja = locale === 'ja';
+
+const title = ja
+  ? 'Velox — Androidエミュレーションの限界を、超えていく。'
+  : 'Velox — Pushing Beyond the Limits of Android Emulation';
+const description = ja
+  ? 'Veloxは、AOSP、QEMU、WHPX、gfxstream、Mesaを基盤に、Windows上でのAndroid実行性能を徹底的に追求するオープンソースエミュレーターです。'
+  : 'Velox is an open-source Android emulator built on AOSP, QEMU, WHPX, gfxstream, and Mesa, engineered for peak Android performance and PC desktop usability on Windows.';
+---
+
+<BaseLayout locale={locale} slug="" title={title} description={description}>
+  <!-- Hero -->
+  <section class="page-hero hero-home">
+    <div class="container">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow">
+            <span class="badge badge-blue">{dataset.latestVersion} / {dataset.latestPhase}</span>
+            <span>Open Source · Apache-2.0 + Upstream Patches</span>
+          </div>
+          <h1>
+            {ja ? 'Androidエミュレーションの限界を、超えていく。' : 'Pushing Beyond the Limits of Android Emulation.'}
+          </h1>
+          <p class="lead">
+            {ja
+              ? 'Veloxは、AOSP、QEMU、WHPX、gfxstream、Mesaを基盤に、Windows上でのAndroid実行性能を徹底的に追求するオープンソースエミュレーターです。'
+              : 'Velox is an open-source Android emulator built on AOSP, QEMU, WHPX, gfxstream, and Mesa, engineered to maximize Android performance and PC desktop usability on Windows.'}
+          </p>
+
+          <div class="btn-row">
+            <a class="btn btn-primary" href={`${localizedPath('docs', locale)}#install`}>
+              {ja ? 'ソースビルド・導入手順を見る' : 'Install & Build from Source'}
+            </a>
+            <a class="btn btn-secondary" href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">
+              {ja ? 'GitHub リポジトリ (ryoma-89/velox)' : 'View on GitHub (ryoma-89/velox)'}
+            </a>
+            <a class="btn btn-secondary" href={localizedPath('improvements', locale)}>
+              {ja ? '公式エミュレーターからの改善' : 'Improvements vs Official SDK'}
+            </a>
+          </div>
+
+          <p style="margin:14px 0 0;font-size:12.5px;color:var(--text-subtle);">
+            {ja
+              ? '※ 現在配布用の単体バイナリリリースはなく、ソースコードとビルド手順を公開しています。VBS / Hyper-V を無効化せず WHPX 上で動作します。'
+              : '* No prebuilt binary release yet; full source code, 83 numbered upstream patches, and build instructions are provided. Runs on WHPX with VBS/Hyper-V enabled.'}
+          </p>
+        </div>
+
+        <div class="hero-card">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+            <div style="display:flex;align-items:center;gap:10px;">
+              <VeloxLogo size={32} />
+              <div>
+                <div style="font-weight:700;color:#fff;font-size:15px;">Velox {dataset.latestVersion}</div>
+                <div style="font-size:12px;color:var(--text-muted);">Windows 11 + WHPX · Android 12 &amp; 17</div>
+              </div>
+            </div>
+            <span class="badge badge-green">dEQP 23,262 Pass</span>
+          </div>
+
+          <div class="hero-metrics">
+            <div class="hm">
+              <div class="hm-val">5.35×</div>
+              <div class="hm-lbl">{ja ? 'Vulkan Draw Call (同 6 vCPU 公式 SDK 比)' : 'Vulkan Draw Call (same 6 vCPU vs SDK)'}</div>
+            </div>
+            <div class="hm">
+              <div class="hm-val">93.9%</div>
+              <div class="hm-lbl">{ja ? 'Vulkan Draw Call 対ネイティブ比' : 'Vulkan Draw Call vs Windows Native'}</div>
+            </div>
+            <div class="hm">
+              <div class="hm-val">97.7%</div>
+              <div class="hm-lbl">{ja ? 'CPU 整数 1T 対ネイティブ比' : 'CPU Integer 1T vs Windows Native'}</div>
+            </div>
+            <div class="hm">
+              <div class="hm-val">119.1 fps</div>
+              <div class="hm-lbl">{ja ? '120 fps Vulkan 1% Low (stutter 0)' : '120 fps Vulkan 1% Low (0 stutter)'}</div>
+            </div>
+          </div>
+
+          <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-size:12px;color:var(--text-muted);">
+            {ja
+              ? '計 83 本の独立パッチ（emulator 19 / gfxstream 31 / mesa3d 30 / aemu 3）と Python 3.12 ゼロ依存管理基盤・独自 Velox Launcher で構成。'
+              : '83 numbered patches (emulator 19 / gfxstream 31 / mesa3d 30 / aemu 3) + zero-dep Python 3.12 core + native Velox Launcher.'}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Official Android Emulator Improvements Highlight -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <div class="eyebrow">{ja ? 'Google公式 Android Emulator からの飛躍' : 'Beyond Stock Google Android Emulator'}</div>
+        <h2>{ja ? '単なる再パッケージではない、83 パッチの基盤刷新' : 'Not a Repackage — 83 Patches Re-Engineering the Stack'}</h2>
+        <p>
+          {ja
+            ? 'Google 公式 Android Emulator (SDK 37.3.10) と同一 PC・同一 Android 17 イメージ・同一 6 vCPU 条件で 3 回実測し、通信・同期・デコード・フレームペーシングのボトルネックを数値で証明しています。'
+            : 'Directly benchmarked (n=3 medians, checksum verified) against Google Official Android Emulator 37.3.10 on the same PC, same Android 17 image, and identical 6 vCPU configuration.'}
+        </p>
+      </div>
+
+      <OfficialDeltaChart locale={locale} />
+
+      <div style="margin-top:20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;">
+        <p style="margin:0;font-size:13.5px;color:var(--text-muted);">
+          {ja
+            ? '※ 全 20 項目の詳細比較・開発初期 Velox と公式 SDK の厳密区分・制約条件は専用ページに掲載しています。'
+            : '* See the dedicated Improvements page for all 20 metrics, Official SDK vs early Velox separation, and full scope constraints.'}
+        </p>
+        <a class="btn btn-primary" href={localizedPath('improvements', locale)}>
+          {ja ? '公式エミュレーターからの改善詳細を見る →' : 'Explore All 20 Improvements →'}
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Real Screenshots Showcase -->
+  <section class="alt-bg">
+    <div class="container">
+      <div class="section-head">
+        <div class="eyebrow">{ja ? '実機スクリーンショット' : 'Real Captured Screenshots'}</div>
+        <h2>{ja ? 'PC 向け Android デスクトップ環境と軽量管理 GUI' : 'PC-First Android Desktop & Lightweight Windows GUI'}</h2>
+        <p>
+          {ja
+            ? '公式 Google APIs システムイメージを無改変で維持したまま、ネイティブ Android PC ランチャー「Velox Launcher」とゼロ依存 Windows 管理 GUI を統合しています（実機取得画像・アカウント情報なし）。'
+            : 'Preserves unmodified official Google APIs images while pairing the native Velox Launcher with a lightweight dark-theme Windows GUI (real captured screenshots, zero account/personal data).'}
+        </p>
+      </div>
+
+      <div class="grid-2">
+        <figure class="shot-frame" style="margin:0;">
+          <img
+            src={assetPath('images/velox-desktop-home.png')}
+            alt={ja ? 'Velox Launcher Android 17 PC デスクトップホーム画面' : 'Velox Launcher Android 17 PC Desktop Home Screen'}
+            width="1920"
+            height="1080"
+            loading="lazy"
+          />
+          <figcaption class="shot-caption">
+            <strong style="color:#fff;">Velox Launcher (Android 17)</strong> —{' '}
+            {ja
+              ? 'タスクバー・ピン留め・時計・システムトレイを備えた PC 向けホーム。常駐メモリ 19.6–65.5 MB PSS・アイドル CPU 0.0%。'
+              : 'Desktop taskbar, pinned apps, clock, and tray. 19.6–65.5 MB PSS memory footprint and 0.0% idle CPU.'}
+          </figcaption>
+        </figure>
+
+        <figure class="shot-frame" style="margin:0;">
+          <img
+            src={assetPath('images/velox-windows-gui.png')}
+            alt={ja ? 'Velox Windows 管理 GUI ホーム画面' : 'Velox Windows Management GUI Home Screen'}
+            width="1136"
+            height="759"
+            loading="lazy"
+          />
+          <figcaption class="shot-caption">
+            <strong style="color:#fff;">Velox Windows GUI (emu gui)</strong> —{' '}
+            {ja
+              ? 'Python 3.12 標準ライブラリのみで動作するダークテーマ管理 UI。Android 12/17 複数端末管理・GPU 診断・APK ドラッグ&ドロップ対応。'
+              : 'Zero-dependency Python 3.12 dark-theme manager for Android 12/17 devices, GPU diagnostics, and drag-and-drop APK install.'}
+          </figcaption>
+        </figure>
+      </div>
+
+      <div style="margin-top:20px;text-align:right;">
+        <a href={localizedPath('features', locale)}>
+          {ja ? 'アプリメニュー・クイック設定・Android 12 互換画面を見る →' : 'View App Menu, Quick Settings & Android 12 Screenshots →'}
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Windows Native Comparison -->
+  <section>
+    <div class="container">
+      <div class="section-head">
+        <div class="eyebrow">{ja ? 'Windows ネイティブ比性能' : 'Comparison Against Windows Native'}</div>
+        <h2>{ja ? 'Windows ネイティブを 100% とした到達点（第 20 段階）' : 'Phase 20 Reach vs Windows Native (100% Baseline)'}</h2>
+        <p>
+          {ja
+            ? 'WHPX・Hyper-V・VBS を有効化した標準 Windows 11 上で、同一ソースの独立ベンチマークを直列実測・チェックサム検算した結果です。'
+            : 'Measured serially on standard Windows 11 with WHPX, Hyper-V, and VBS enabled, verifying identical outputs across Windows Native and Android guest.'}
+        </p>
+      </div>
+
+      <NativeChart locale={locale} compact={true} />
+
+      <div style="margin-top:18px;display:flex;justify-content:flex-end;gap:12px;">
+        <a class="btn btn-secondary" href={localizedPath('benchmarks', locale)}>
+          {ja ? 'インタラクティブ性能比較・MuMu 比較を開く →' : 'Open Interactive Benchmark Explorer & MuMu Comparison →'}
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Core Technology Pillars -->
+  <section class="alt-bg">
+    <div class="container">
+      <div class="section-head">
+        <div class="eyebrow">{ja ? '独自の最適化技術' : 'Core Optimization Architecture'}</div>
+        <h2>{ja ? '4 つのレイヤーで仮想化オーバーヘッドを極小化' : 'Four Layers Eliminating Virtualization Overhead'}</h2>
+      </div>
+
+      <div class="grid-4">
+        <div class="panel">
+          <div class="badge badge-blue" style="margin-bottom:10px;">emulator · 19 patches</div>
+          <h3>{ja ? 'CPU・WHPX 仮想化' : 'CPU & WHPX'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? '6 vCPU 上限解放、WHPX TSC 同期、ロックレス pre_run (Patch 0018)、Intel P/E 20_PE_rpe スケジューリング、高精度タイマー待機。'
+              : '20 vCPU unlock, WHPX TSC sync, lockless pre_run (Patch 0018), Intel P/E 20_PE_rpe placement, and high-res timer wait.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <div class="badge badge-blue" style="margin-bottom:10px;">gfxstream 31 + mesa3d 30</div>
+          <h3>{ja ? 'GPU・Vulkan / GLES' : 'GPU & Vulkan / GLES'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'ASG 先読み・ランプ、Fence 共有表、HybridEntityManager 高速デコード (0031)、Cached Upload、Ray Query/RT Pipeline/CoopMat。'
+              : 'ASG prefetch & ramp, shared Fence table, HybridEntityManager decode (0031), Cached Upload, Ray Query/RT Pipeline/CoopMat.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <div class="badge badge-blue" style="margin-bottom:10px;">THP · Win32 AIO</div>
+          <h3>{ja ? 'メモリ・永続ストレージ' : 'Memory & Storage'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'Guest THP 自動適用 (RAM 1T +24%)、Win32 AIO バウンスプール (0019)、Flush 保証のクラッシュ耐性、F2FS 実験検証。'
+              : 'Auto Guest THP (RAM 1T +24%), Win32 AIO bounce pool (0019), crash-safe host flushes, and experimental F2FS study.'}
+          </p>
+        </div>
+
+        <div class="panel">
+          <div class="badge badge-green" style="margin-bottom:10px;">PC Desktop UX</div>
+          <h3>{ja ? 'Android デスクトップ' : 'Android Desktop'}</h3>
+          <p style="font-size:13.5px;color:var(--text-muted);margin:0;">
+            {ja
+              ? 'Velox Launcher、RDP/合成マウス入力修正 (0016)、WASD 1:1 ゲームモード (0017)、Freeform マルチウィンドウ、Android 12/17 両対応。'
+              : 'Velox Launcher, RDP/synthesized mouse fix (0016), 1:1 WASD Game Mode (0017), Freeform multi-window, Android 12 & 17.'}
+          </p>
+        </div>
+      </div>
+
+      <div style="margin-top:20px;text-align:right;">
+        <a href={localizedPath('architecture', locale)}>
+          {ja ? 'アーキテクチャ図と「従来 → Velox → 効果」詳細を見る →' : 'See Architecture Diagram & Technical Breakdown →'}
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Open Source CTA -->
+  <section>
+    <div class="container">
+      <div class="panel" style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:24px;padding:30px;">
+        <div style="max-width:680px;">
+          <div class="eyebrow" style="margin-bottom:8px;">Open Source Community</div>
+          <h2 style="margin-bottom:8px;">
+            {ja ? '透明な測定とパッチで、オープンソース開発に参加しませんか' : 'Join Transparent, Reproducible Open-Source Emulation'}
+          </h2>
+          <p style="margin:0;color:var(--text-muted);font-size:14.5px;">
+            {ja
+              ? 'Velox 独自コードは Apache License 2.0 で公開し、上流コンポーネントへの 83 パッチも各上流ライセンスに準拠して公開しています。他ハードウェア（AMD CPU / AMD・Intel GPU）での検証、バグ報告、Pull Request を歓迎します。'
+              : 'Velox original code is licensed under Apache-2.0, with all 83 upstream patches following their respective upstream licenses. Multi-hardware testing (AMD/Intel), bug reports, and Pull Requests are welcome.'}
+          </p>
+        </div>
+        <div class="btn-row">
+          <a class="btn btn-primary" href={GITHUB_REPO_URL} target="_blank" rel="noopener noreferrer">
+            {ja ? 'GitHub でコードを見る' : 'Browse Source on GitHub'}
+          </a>
+          <a class="btn btn-secondary" href={`${localizedPath('docs', locale)}#contributing`}>
+            {ja ? 'コントリビューションガイド' : 'Contributing Guide'}
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .hero-home {
+    padding: 64px 0 56px;
+  }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1.25fr 0.95fr;
+    gap: 36px;
+    align-items: center;
+  }
+  .hero-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 22px;
+  }
+  .hero-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .hm {
+    background: #080e1c;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 13px 14px;
+  }
+  .hm-val {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--accent-light);
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+  }
+  .hm-lbl {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+  @media (max-width: 960px) {
+    .hero-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>
